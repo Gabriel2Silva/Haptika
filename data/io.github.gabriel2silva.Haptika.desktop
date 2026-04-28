@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Haptika
+Comment=Test game controllers
+Exec=haptika
+Icon=io.github.gabriel2silva.Haptika
+Terminal=false
+Type=Application
+StartupNotify=true
+Categories=Game;Utility;
+Keywords=gamepad;controller;joystick;input;test;
+StartupWMClass=haptika

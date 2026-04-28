@@ -1,0 +1,13 @@
+src/main.c
+src/window.c
+src/selector_view.c
+src/input_viewer.c
+src/battery.c
+src/ds3_info.c
+src/ds4_info.c
+src/ds5_info.c
+src/speaker_test.c
+src/controller_info_utils.c
+data/io.github.gabriel2silva.Haptika.desktop
+data/io.github.gabriel2silva.Haptika.metainfo.xml
+data/io.github.gabriel2silva.Haptika.gschema.xml

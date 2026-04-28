@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/gabriel2silva/Haptika">
+    <file>style.css</file>
+    <file>icons/atari-2600.svg</file>
+    <file>icons/atari-jaguar.svg</file>
+    <file>icons/haptika-backend-symbolic.svg</file>
+    <file>icons/haptika-bluetooth-symbolic.svg</file>
+    <file>icons/haptika-usb-symbolic.svg</file>
+    <file>icons/haptika-help-about-symbolic.svg</file>
+    <file>icons/open-menu-symbolic.svg</file>
+    <file>icons/hicolor/scalable/apps/io.github.gabriel2silva.Haptika.svg</file>
+    <file>icons/hicolor/symbolic/apps/io.github.gabriel2silva.Haptika-symbolic.svg</file>
+    <file>icons/dreamcast.svg</file>
+    <file>icons/gamecube.svg</file>
+    <file>icons/joy-con-l.svg</file>
+    <file>icons/joy-con-r.svg</file>
+    <file>icons/joy-cons.svg</file>
+    <file>icons/master-system.svg</file>
+    <file>icons/mega-drive.svg</file>
+    <file>icons/n64.svg</file>
+    <file>icons/nes.svg</file>
+    <file>icons/psp.svg</file>
+    <file>icons/ps1.svg</file>
+    <file>icons/ps2.svg</file>
+    <file>icons/ps3.svg</file>
+    <file>icons/ps4.svg</file>
+    <file>icons/ps5.svg</file>
+    <file>icons/sega-saturn.svg</file>
+    <file>icons/snes.svg</file>
+    <file>icons/stadia.svg</file>
+    <file>icons/switch-pro.svg</file>
+    <file>icons/virtual-boy.svg</file>
+    <file>icons/wii-classic.svg</file>
+    <file>icons/wii-u-pro.svg</file>
+    <file>icons/wii-u.svg</file>
+    <file>icons/wii.svg</file>
+    <file>icons/xbox-360.svg</file>
+    <file>icons/xbox-controller-s.svg</file>
+    <file>icons/xbox-one.svg</file>
+    <file>icons/xbox-series-x.svg</file>
+    <file>icons/xbox.svg</file>
+  </gresource>
+</gresources>

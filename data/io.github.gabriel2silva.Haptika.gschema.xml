@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.github.gabriel2silva.Haptika" path="/io/github/gabriel2silva/Haptika/">
+    <key name="style" type="s">
+      <default>'follow'</default>
+      <summary>Color scheme preference</summary>
+      <description>The preferred color scheme: 'follow' for system default, 'light' for force light, 'dark' for force dark.</description>
+    </key>
+  </schema>
+</schemalist>

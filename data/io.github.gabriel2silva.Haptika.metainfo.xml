@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gabriel2silva.Haptika</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Haptika</name>
+  <summary>Test game controllers</summary>
+
+  <description>
+    <p>
+      Haptika is a gamepad testing application for Linux. Quickly and
+      interactively test buttons, analog sticks, triggers, touchpads,
+      motion sensors, vibration, and speakers on virtually any controller.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Support for both SDL3 and evdev backends with one-click switching</li>
+      <li>Battery level and charging status display</li>
+      <li>Bluetooth vs USB connection detection</li>
+      <li>DualShock 3 pressure-sensitive button readout</li>
+      <li>DualShock 4, DualSense, and DualSense Edge hardware info and authenticity checks</li>
+      <li>DualSense speaker testing via PipeWire</li>
+      <li>Motion sensor (accelerometer and gyroscope) visualization</li>
+      <li>Touchpad finger tracking for DualShock 4 and DualSense</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.gabriel2silva.Haptika.desktop</launchable>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#99c1f1</color>
+    <color type="primary" scheme_preference="dark">#1a5fb4</color>
+  </branding>
+
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>gamepad</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <url type="homepage">https://github.com/Gabriel2Silva/Haptika</url>
+  <url type="bugtracker">https://github.com/Gabriel2Silva/Haptika/issues</url>
+  <url type="vcs-browser">https://github.com/Gabriel2Silva/Haptika</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/01-controller-list.png</image>
+      <caption>Controller selection screen</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/02-input-viewer.png</image>
+      <caption>Real-time input testing</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/03-controller-info.png</image>
+      <caption>Controller hardware information</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/04-vibration-test.png</image>
+      <caption>Vibration and speaker testing</caption>
+    </screenshot>
+  </screenshots>
+
+  <developer id="io.github.gabriel2silva">
+    <name>Gabriel Limieri</name>
+  </developer>
+
+  <translation type="gettext">haptika</translation>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="1.0.0" date="2026-04-26">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

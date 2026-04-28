@@ -64,7 +64,7 @@
             "name": "haptika",
             "buildsystem": "meson",
             "post-install": [
-                "install -Dm0644 LICENSE.txt -t $FLATPAK_DEST/share/licenses/$FLATPAK_ID/haptika"
+                "install -Dm0644 LICENSE -t $FLATPAK_DEST/share/licenses/$FLATPAK_ID/haptika"
             ],
             "sources": [
                 {

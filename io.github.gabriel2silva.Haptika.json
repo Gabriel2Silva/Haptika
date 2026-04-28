@@ -70,7 +70,7 @@
                 {
                     "type": "archive",
                     "url": "https://github.com/Gabriel2Silva/Haptika/archive/refs/tags/v1.0.0.tar.gz",
-                    "sha256": "REPLACE_WITH_SHA256_AFTER_TAGGING"
+                    "sha256": "9c3e2189f7d7c41f82ca554b11ed4d55bd3098370d5f0498ab72bda914996467"
                 }
             ]
         }

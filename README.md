@@ -9,11 +9,6 @@
   Built with pure C, GTK 4, and Libadwaita.
 </p>
 
-<p align="center">
-  <a href="https://github.com/Gabriel2Silva/Haptika/issues">Report a Bug</a> ·
-  <a href="https://github.com/Gabriel2Silva/Haptika/issues">Request a Feature</a>
-</p>
-
 ---
 
 Haptika is a native Linux application for testing and inspecting game controllers. It lets you verify that every button, stick, trigger, touchpad, and sensor on your gamepad is working correctly, with real-time visual feedback and sub-millisecond input latency.

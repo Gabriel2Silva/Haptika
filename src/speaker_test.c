@@ -12,15 +12,23 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/audio/raw-types.h>
+#include <spa/param/props.h>
 #include <spa/support/system.h>
 #include <string.h>
 #include <time.h>
 
 #define SAMPLE_RATE          48000
-#define TONE_HZ              440.0
+#define TONE_HZ              880.0
+#define TONE_GAIN            0.5f
 #define TONE_SECONDS         1.0
 #define CONNECT_TIMEOUT_SEC  3
 #define PLAYBACK_TIMEOUT_SEC 5
+
+/* Plausible range for a controller audio endpoint. PipeWire's negotiated rate
+ * is used for the tone math, so reject nonsensical values instead of letting
+ * them reach an out-of-range floating-point-to-integer conversion. */
+#define TONE_RATE_MIN        8000u
+#define TONE_RATE_MAX        192000u
 
 static const double CONTTEST_TWO_PI = 6.283185307179586476925286766559;
 
@@ -302,6 +310,23 @@ static SinkProbe *find_probe_by_id(DiscoveryCtx *disc, uint32_t node_id) {
     return NULL;
 }
 
+static const struct spa_pod *build_stream_volume_props_pod(struct spa_pod_builder *b,
+                                                           uint32_t channels) {
+    uint32_t n_ch = CLAMP(channels, 1u, (uint32_t)SPA_AUDIO_MAX_CHANNELS);
+    float vols[SPA_AUDIO_MAX_CHANNELS];
+    for (uint32_t i = 0; i < n_ch; i++)
+        vols[i] = 1.0f;
+
+    struct spa_pod_frame f;
+    spa_pod_builder_push_object(b, &f, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+    spa_pod_builder_add(
+        b,
+        SPA_PROP_mute,           SPA_POD_Bool(false),
+        SPA_PROP_channelVolumes, SPA_POD_Array(sizeof(float), SPA_TYPE_Float, n_ch, vols),
+        0);
+    return spa_pod_builder_pop(b, &f);
+}
+
 static void on_core_done(void *userdata, uint32_t id, int seq) {
     DiscoveryCtx *disc = userdata;
     if (id != PW_ID_CORE || seq != disc->sync_seq)
@@ -546,9 +571,25 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
     }
 
     if (info.rate > 0 && !ctx->started_streaming) {
+        if (info.rate < TONE_RATE_MIN || info.rate > TONE_RATE_MAX) {
+            if (!ctx->error)
+                ctx->error = g_strdup_printf(
+                    _("Unsupported PipeWire sample rate: %u Hz"), info.rate);
+            pw_main_loop_quit(ctx->loop);
+            return;
+        }
+
         ctx->rate = info.rate;
         ctx->omega = CONTTEST_TWO_PI * TONE_HZ / (double)ctx->rate;
+        /* Range-validated above, so total_frames is always representable. */
         ctx->total_frames = (int)((double)ctx->rate * TONE_SECONDS);
+
+        uint8_t prop_buf[512];
+        struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(prop_buf, sizeof(prop_buf));
+        const struct spa_pod *prop_param =
+            build_stream_volume_props_pod(&pb, ctx->channels > 0 ? ctx->channels : 1u);
+        if (prop_param)
+            pw_stream_set_param(ctx->stream, SPA_PARAM_Props, prop_param);
     }
 }
 
@@ -631,13 +672,13 @@ static void on_process(void *userdata) {
 
     float *dst = buf->datas[0].data;
     if (channels == 1) {
-        conttest_dsp_generate_sine(dst, n, &ctx->phase, ctx->omega, 1.0f);
+        conttest_dsp_generate_sine(dst, n, &ctx->phase, ctx->omega, TONE_GAIN);
     } else {
         float mono[1024];
         uint32_t done = 0;
         while (done < n) {
             uint32_t chunk = MIN(n - done, (uint32_t)G_N_ELEMENTS(mono));
-            conttest_dsp_generate_sine(mono, chunk, &ctx->phase, ctx->omega, 1.0f);
+            conttest_dsp_generate_sine(mono, chunk, &ctx->phase, ctx->omega, TONE_GAIN);
             for (uint32_t i = 0; i < chunk; i++) {
                 float s = mono[i];
                 for (uint32_t ch = 0; ch < channels; ch++)

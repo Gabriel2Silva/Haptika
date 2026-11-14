@@ -543,16 +543,24 @@ static ConttestDevice *find_device_by_hardware_for_sdl(
   }
 
   /* Second pass: symmetric VID/PID fallback for SDL devices without a /dev/
-   * devnode path (e.g. HIDAPI DS3 when evdev attached before SDL). */
+   * devnode path (e.g. HIDAPI DS3 when evdev attached before SDL). Only merge
+   * with a single unambiguous physical evdev candidate so identical pads or
+   * virtual controllers are never cross-merged. */
   if ((!sdl_path || !g_str_has_prefix(sdl_path, "/dev/")) &&
       sdl_vid != 0 && sdl_pid != 0) {
+    ConttestDevice *match = NULL;
+    guint match_count = 0;
     for (guint i = 0; i < self->devices->len; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
-      if (d->has_evdev && !d->has_sdl &&
+      if (d->has_evdev && !d->has_sdl && !d->evdev_meta.is_virtual &&
+          d->virtual_kind == CONTTEST_VIRTUAL_NONE &&
           d->vendor_id == sdl_vid && d->product_id == sdl_pid) {
-        return d;
+        match = d;
+        match_count++;
       }
     }
+    if (match_count == 1)
+      return match;
   }
 
   return NULL;
@@ -564,7 +572,8 @@ static ConttestDevice *find_device_by_hardware_for_evdev(
     const char *evdev_own_syspath,
     const char *const *evdev_hw_keys,
     uint16_t udev_vid,
-    uint16_t udev_pid) {
+    uint16_t udev_pid,
+    gboolean udev_is_virtual) {
   /* Fast path in memory: SDL devnode matches this evdev devnode directly. */
   if (evdev_devnode) {
     for (guint i = 0; i < self->devices->len; i++) {
@@ -590,20 +599,28 @@ static ConttestDevice *find_device_by_hardware_for_evdev(
   }
 
   /* Second pass: for SDL devices without a devnode path (e.g. HIDAPI-backed
-   * controllers like DS3), fall back to VID/PID matching. */
-  if (udev_vid != 0 && udev_pid != 0) {
+   * controllers like DS3), fall back to VID/PID matching only for a single
+   * unambiguous non-virtual candidate. */
+  if (udev_vid != 0 && udev_pid != 0 && !udev_is_virtual) {
+    ConttestDevice *match = NULL;
+    guint match_count = 0;
     for (guint i = 0; i < self->devices->len; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
-      if (d->has_sdl && !d->has_evdev &&
+      if (d->has_sdl && !d->has_evdev && !d->sdl_meta.is_virtual &&
+          d->virtual_kind == CONTTEST_VIRTUAL_NONE &&
           (!d->sdl_path || !g_str_has_prefix(d->sdl_path, "/dev/"))) {
         uint16_t sdl_vid = d->vendor_id ? d->vendor_id
                                         : SDL_GetGamepadVendorForID(d->sdl_id);
         uint16_t sdl_pid = d->product_id ? d->product_id
                                          : SDL_GetGamepadProductForID(d->sdl_id);
-        if (sdl_vid == udev_vid && sdl_pid == udev_pid)
-          return d;
+        if (sdl_vid == udev_vid && sdl_pid == udev_pid) {
+          match = d;
+          match_count++;
+        }
       }
     }
+    if (match_count == 1)
+      return match;
   }
 
   return NULL;
@@ -1429,6 +1446,14 @@ static void on_sdl_udev_probe_done(GObject *source, GAsyncResult *res,
       d->sdl_udev_seq != ctx->seq)
     return;
 
+  if (d->sdl_gamepad && !SDL_GamepadConnected(d->sdl_gamepad)) {
+    device_detach_sdl(d);
+    check_empty_and_remove(self, d);
+    if (!self->disposed)
+      schedule_sdl_sync(self);
+    return;
+  }
+
   gboolean was_pending = d->sdl_probe_pending;
   d->sdl_probe_pending = FALSE;
 
@@ -1619,7 +1644,8 @@ static void apply_probed_evdev_meta(ConttestDeviceManager *self,
 
   ConttestDevice *d = find_device_by_hardware_for_evdev(
       self, m->devnode, m->meta.own_syspath,
-      (const char *const *)m->meta.hw_keys, m->vendor_id, m->product_id);
+      (const char *const *)m->meta.hw_keys, m->vendor_id, m->product_id,
+      m->meta.is_virtual);
 
   gboolean is_new = FALSE;
   gboolean was_hidden = FALSE;
@@ -1636,6 +1662,7 @@ static void apply_probed_evdev_meta(ConttestDeviceManager *self,
       device_set_name(d, m->name);
     if (d->sdl_probe_pending) {
       d->sdl_probe_pending = FALSE;
+      d->sdl_udev_seq++;
     }
   }
 
@@ -2063,6 +2090,16 @@ static void handle_evdev_syspath_remove(ConttestDeviceManager *self,
     check_empty_and_remove(self, d);
     if (still_has_sdl && !self->disposed)
       schedule_sdl_sync(self);
+  } else if (!self->disposed) {
+    /* An SDL placeholder still probing udev may belong to this vanishing node;
+     * force an SDL sync so disconnect state is reflected promptly. */
+    for (guint i = 0; i < self->devices->len; i++) {
+      ConttestDevice *cand = g_ptr_array_index(self->devices, i);
+      if (cand->has_sdl && cand->sdl_probe_pending) {
+        schedule_sdl_sync(self);
+        break;
+      }
+    }
   }
 }
 

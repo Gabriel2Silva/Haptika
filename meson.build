@@ -65,12 +65,6 @@ src_files = [
   'src/widgets/trigger_bar.c'
 ]
 
-dsp_files = ['src/dsp_oscillator.c']
-if host_machine.cpu_family() == 'x86_64' and cc.sizeof('void*') == 8
-  src_files += 'src/dsp_oscillator_x86_64.S'
-  dsp_files += 'src/dsp_oscillator_x86_64.S'
-endif
-
 haptika_deps = [adw_dep, gtk_dep, sdl3_dep, evdev_dep, udev_dep, threads_dep, m_dep]
 if pipewire_dep.found()
   haptika_deps += pipewire_dep
@@ -128,7 +122,7 @@ endif
 unit_inc = include_directories('src', '.')
 
 test_dsp_exe = executable('unit_test_dsp',
-  ['tests/test_dsp.c'] + dsp_files,
+  ['tests/test_dsp.c', 'src/dsp_oscillator.c'],
   dependencies: [glib_dep, m_dep],
   include_directories: unit_inc,
   install: false,

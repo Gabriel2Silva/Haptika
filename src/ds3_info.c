@@ -94,6 +94,14 @@ static void on_ds3_fetch_done(GObject *source, GAsyncResult *result, gpointer us
 
 void ds3_info_show(GtkWidget *parent, const ConttestDevice *device) {
     const char *evdev_syspath = conttest_device_get_evdev_syspath(device);
+    if (!evdev_syspath) {
+        controller_info_show_error_alert(
+            parent,
+            _("DualShock 3 Info"),
+            _("DualShock 3 info requires kernel evdev and hidraw device access, which is unavailable for this controller."));
+        return;
+    }
+
     controller_info_present_async_dialog(parent, _("DualShock 3 Info"), 480, 280,
                                          evdev_syspath, FALSE, FALSE,
                                          fetch_ds3_info, ds3_info_data_free,

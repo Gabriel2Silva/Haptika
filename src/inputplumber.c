@@ -376,12 +376,21 @@ static void on_get_objects_done(GObject *source, GAsyncResult *res, gpointer use
         self->pending_objects_ok = TRUE;
         g_variant_unref(reply);
     } else {
+        gboolean no_owner = err &&
+            (g_error_matches(err, G_DBUS_ERROR, G_DBUS_ERROR_NAME_HAS_NO_OWNER) ||
+             g_error_matches(err, G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN));
         g_clear_error(&err);
-        if (self->pending_candidates) {
-            g_ptr_array_free(self->pending_candidates, TRUE);
-            self->pending_candidates = NULL;
-        }
+        g_clear_pointer(&self->pending_candidates, g_ptr_array_unref);
         g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
+        if (no_owner) {
+            self->refresh_seq++;
+            self->pending_calls = 0;
+            self->pending_version_ok = FALSE;
+            self->pending_objects_ok = FALSE;
+            g_clear_pointer(&self->pending_version, g_free);
+            clear_snapshot(self);
+            return;
+        }
     }
 
     if (self->pending_calls > 0) self->pending_calls--;

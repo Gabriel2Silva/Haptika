@@ -4,8 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-static void verify_sine_case(ConttestDspImpl impl,
-                             size_t n,
+static void verify_sine_case(size_t n,
                              size_t misalign,
                              double phase0,
                              double omega,
@@ -18,7 +17,7 @@ static void verify_sine_case(ConttestDspImpl impl,
 
     float *dst = raw + 1 + misalign;
     double phase = phase0;
-    conttest_dsp_generate_sine_impl(dst, n, &phase, omega, gain, impl);
+    conttest_dsp_generate_sine(dst, n, &phase, omega, gain);
 
     /* Guard sentinels before and after dst must remain untouched. */
     g_assert_cmpfloat(raw[misalign], ==, sentinel);
@@ -29,9 +28,9 @@ static void verify_sine_case(ConttestDspImpl impl,
         double angle = fmod(phase0 + (double)i * omega, two_pi);
         if (angle < 0.0)
             angle += two_pi;
-        float expected = gain * (float)sin(angle);
+        float expected = (float)((double)gain * sin(angle));
         float err = fabsf(dst[i] - expected);
-        g_assert_cmpfloat(err, <=, 2e-5f);
+        g_assert_cmpfloat(err, <=, 1e-6f);
     }
 
     if (n > 0) {
@@ -51,41 +50,22 @@ static void verify_sine_case(ConttestDspImpl impl,
     g_free(raw);
 }
 
-static void test_dsp_active_impl(void) {
-    ConttestDspImpl active = conttest_dsp_active_impl();
-    g_assert_true(active == CONTTEST_DSP_IMPL_C ||
-                  active == CONTTEST_DSP_IMPL_SSE2 ||
-                  active == CONTTEST_DSP_IMPL_AVX2_FMA);
-}
-
 static void test_dsp_accuracy_and_sizes(void) {
     static const size_t sizes[] = {
-        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 63, 255, 1024, 48000
-    };
-    static const ConttestDspImpl impls[] = {
-        CONTTEST_DSP_IMPL_C,
-        CONTTEST_DSP_IMPL_SSE2,
-        CONTTEST_DSP_IMPL_AVX2_FMA,
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 63, 255, 1024, 4096, 4097, 48000
     };
 
     const double omega = (2.0 * G_PI * 440.0) / 48000.0;
 
-    for (size_t k = 0; k < G_N_ELEMENTS(impls); k++) {
-        for (size_t s = 0; s < G_N_ELEMENTS(sizes); s++) {
-            for (size_t align = 0; align < 4; align++) {
-                verify_sine_case(impls[k], sizes[s], align, 0.0, omega, 0.25f);
-            }
+    for (size_t s = 0; s < G_N_ELEMENTS(sizes); s++) {
+        for (size_t align = 0; align < 4; align++) {
+            verify_sine_case(sizes[s], align, 0.0, omega, 0.25f);
         }
-        verify_sine_case(impls[k], 1025, 1, 5.9, omega, 0.5f);
     }
+    verify_sine_case(1025, 1, 5.9, omega, 0.5f);
 }
 
 static void test_dsp_chunk_continuity(void) {
-    static const ConttestDspImpl impls[] = {
-        CONTTEST_DSP_IMPL_C,
-        CONTTEST_DSP_IMPL_SSE2,
-        CONTTEST_DSP_IMPL_AVX2_FMA,
-    };
     static const size_t chunks[] = { 3, 7, 17, 1, 8, 63, 925 };
 
     const size_t total = 1024;
@@ -93,24 +73,22 @@ static void test_dsp_chunk_continuity(void) {
     float *single = g_new0(float, total);
     float *chunked = g_new0(float, total);
 
-    for (size_t k = 0; k < G_N_ELEMENTS(impls); k++) {
-        double phase_single = 0.75;
-        conttest_dsp_generate_sine_impl(single, total, &phase_single, omega, 0.2f, impls[k]);
+    double phase_single = 0.75;
+    conttest_dsp_generate_sine(single, total, &phase_single, omega, 0.2f);
 
-        double phase_chunk = 0.75;
-        size_t offset = 0;
-        for (size_t c = 0; c < G_N_ELEMENTS(chunks); c++) {
-            conttest_dsp_generate_sine_impl(chunked + offset, chunks[c],
-                                            &phase_chunk, omega, 0.2f, impls[k]);
-            offset += chunks[c];
-        }
-        g_assert_cmpuint(offset, ==, total);
-
-        for (size_t i = 0; i < total; i++) {
-            g_assert_cmpfloat(fabsf(single[i] - chunked[i]), <=, 1e-5f);
-        }
-        g_assert_cmpfloat(fabs(phase_single - phase_chunk), <=, 1e-11);
+    double phase_chunk = 0.75;
+    size_t offset = 0;
+    for (size_t c = 0; c < G_N_ELEMENTS(chunks); c++) {
+        conttest_dsp_generate_sine(chunked + offset, chunks[c],
+                                   &phase_chunk, omega, 0.2f);
+        offset += chunks[c];
     }
+    g_assert_cmpuint(offset, ==, total);
+
+    for (size_t i = 0; i < total; i++) {
+        g_assert_cmpfloat(fabsf(single[i] - chunked[i]), <=, 1e-6f);
+    }
+    g_assert_cmpfloat(fabs(phase_single - phase_chunk), <=, 1e-11);
 
     g_free(single);
     g_free(chunked);
@@ -143,7 +121,6 @@ static void test_dsp_edge_cases(void) {
 
 int main(int argc, char *argv[]) {
     g_test_init(&argc, &argv, NULL);
-    g_test_add_func("/dsp/active_impl", test_dsp_active_impl);
     g_test_add_func("/dsp/accuracy_and_sizes", test_dsp_accuracy_and_sizes);
     g_test_add_func("/dsp/chunk_continuity", test_dsp_chunk_continuity);
     g_test_add_func("/dsp/edge_cases", test_dsp_edge_cases);

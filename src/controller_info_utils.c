@@ -140,30 +140,11 @@ out_evdev:
     return result;
 }
 
-char *controller_info_resolve_hidraw(GtkWidget *parent,
-                                     const char *evdev_syspath,
-                                     const char *alert_heading,
-                                     const char *no_evdev_body) {
-    if (!evdev_syspath) {
-        controller_info_show_error_alert(parent, alert_heading, no_evdev_body);
-        return NULL;
-    }
-
-    struct udev *udev = udev_new();
-    char *hidraw_node = udev ? controller_info_find_hidraw_node(udev, evdev_syspath) : NULL;
-    if (udev) udev_unref(udev);
-    if (!hidraw_node) {
-        controller_info_show_error_alert(
-            parent, alert_heading,
-            _("Could not find hidraw device. You may need to add a udev rule to allow access."));
-        return NULL;
-    }
-
-    return hidraw_node;
-}
-
 guint8 *controller_info_hidraw_get_feature(int fd, guint8 report_id,
-                                           gsize buf_size, gsize min_len) {
+                                           gsize buf_size, gsize min_len,
+                                           gsize *out_len) {
+    if (out_len)
+        *out_len = 0;
     if (fd < 0 || buf_size == 0 || min_len > buf_size)
         return NULL;
 
@@ -174,6 +155,8 @@ guint8 *controller_info_hidraw_get_feature(int fd, guint8 report_id,
         g_free(buf);
         return NULL;
     }
+    if (out_len)
+        *out_len = (gsize)ret;
     return buf;
 }
 
@@ -239,7 +222,8 @@ void controller_info_format(char *dst, gsize dst_size, const char *fmt, ...) {
 }
 
 typedef struct {
-    char *hidraw_node;
+    char *evdev_syspath;
+    gboolean resolve_hidraw;
     gboolean is_bt;
     ControllerInfoFetchFunc fetch_func;
     GDestroyNotify result_free_func;
@@ -259,7 +243,7 @@ static void cancel_and_unref(gpointer p) {
 
 static void async_fetch_data_free(gpointer p) {
     AsyncFetchData *d = p;
-    g_free(d->hidraw_node);
+    g_free(d->evdev_syspath);
     g_free(d);
 }
 
@@ -271,7 +255,32 @@ static void async_fetch_thread(GTask *task, gpointer source,
         g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Cancelled");
         return;
     }
-    gpointer res = d->fetch_func(d->hidraw_node, d->is_bt, cancellable);
+
+    char *resolved_hidraw = NULL;
+    const char *path_arg = d->evdev_syspath;
+    if (d->resolve_hidraw) {
+        struct udev *udev = udev_new();
+        resolved_hidraw = (udev && d->evdev_syspath)
+            ? controller_info_find_hidraw_node(udev, d->evdev_syspath)
+            : NULL;
+        if (udev) udev_unref(udev);
+
+        if (g_cancellable_is_cancelled(cancellable)) {
+            g_free(resolved_hidraw);
+            g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Cancelled");
+            return;
+        }
+        if (!resolved_hidraw) {
+            g_task_return_new_error(
+                task, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "%s",
+                _("Could not find hidraw device. You may need to add a udev rule to allow access."));
+            return;
+        }
+        path_arg = resolved_hidraw;
+    }
+
+    gpointer res = d->fetch_func(path_arg, d->is_bt, cancellable);
+    g_free(resolved_hidraw);
     g_task_return_pointer(task, res, d->result_free_func);
 }
 
@@ -289,7 +298,8 @@ void controller_info_present_async_dialog(GtkWidget *parent,
                                           const char *title,
                                           int width,
                                           int height,
-                                          const char *hidraw_node,
+                                          const char *evdev_syspath,
+                                          gboolean resolve_hidraw,
                                           gboolean is_bt,
                                           ControllerInfoFetchFunc fetch_func,
                                           GDestroyNotify result_free_func,
@@ -303,7 +313,8 @@ void controller_info_present_async_dialog(GtkWidget *parent,
     adw_dialog_present(dialog, parent);
 
     AsyncFetchData *td = g_new(AsyncFetchData, 1);
-    td->hidraw_node = g_strdup(hidraw_node);
+    td->evdev_syspath = g_strdup(evdev_syspath);
+    td->resolve_hidraw = resolve_hidraw;
     td->is_bt = is_bt;
     td->fetch_func = fetch_func;
     td->result_free_func = result_free_func;

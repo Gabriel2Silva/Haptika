@@ -69,6 +69,8 @@ void conttest_captioned_widget_set_caption(GtkWidget *widget,
     } else {
         gtk_label_set_text(GTK_LABEL(label), "");
         gtk_widget_set_visible(label, FALSE);
+        gtk_accessible_reset_property(GTK_ACCESSIBLE(widget),
+                                      GTK_ACCESSIBLE_PROPERTY_LABEL);
     }
 }
 
@@ -205,12 +207,23 @@ void conttest_snapshot_circular_indicator(GtkWidget *widget,
     /* Moving dot clamped cleanly within the boundary rim */
     float dot_r = radius * 0.15f;
     float travel = radius - dot_r;
-    float nx = isnan(x) ? 0.0f : x;
-    float ny = isnan(y) ? 0.0f : y;
+    float nx = isfinite(x) ? x : 0.0f;
+    float ny = isfinite(y) ? y : 0.0f;
     float dx = nx * travel;
     float dy = ny * travel;
     float dist = hypotf(dx, dy);
-    if (dist > travel && dist > 0.0f) {
+    if (!isfinite(dist)) {
+        float n_dist = hypotf(nx, ny);
+        if (isfinite(n_dist) && n_dist > 0.0f) {
+            dx = (nx / n_dist) * travel;
+            dy = (ny / n_dist) * travel;
+            dist = travel;
+        } else {
+            dx = 0.0f;
+            dy = 0.0f;
+            dist = 0.0f;
+        }
+    } else if (dist > travel && dist > 0.0f) {
         dx *= travel / dist;
         dy *= travel / dist;
     }

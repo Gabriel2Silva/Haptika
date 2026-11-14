@@ -161,7 +161,20 @@ struct _ConttestInputPlumberMonitor {
     char *daemon_version;
     GPtrArray *candidates; /* element-type: ConttestInputPlumberInfo* */
     GHashTable *source_devnodes; /* set of active CompositeDevice SourceDevicePaths */
+    gboolean disposed;
 };
+
+static GWeakRef *monitor_weak_ref_new(ConttestInputPlumberMonitor *self) {
+    GWeakRef *wr = g_new0(GWeakRef, 1);
+    g_weak_ref_init(wr, self);
+    return wr;
+}
+
+static void monitor_weak_ref_free(gpointer data) {
+    GWeakRef *wr = data;
+    g_weak_ref_clear(wr);
+    g_free(wr);
+}
 
 enum {
     SIGNAL_CHANGED,
@@ -175,19 +188,26 @@ G_DEFINE_TYPE(ConttestInputPlumberMonitor, conttest_inputplumber_monitor, G_TYPE
 static void start_refresh(ConttestInputPlumberMonitor *self);
 
 static gboolean on_debounce_timeout(gpointer user_data) {
-    ConttestInputPlumberMonitor *self = CONTTEST_INPUTPLUMBER_MONITOR(user_data);
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
+    if (!self || self->disposed) {
+        return G_SOURCE_REMOVE;
+    }
     self->refresh_debounce_id = 0;
     start_refresh(self);
     return G_SOURCE_REMOVE;
 }
 
 static void schedule_refresh(ConttestInputPlumberMonitor *self) {
-    if (!self->bus) return;
+    if (!self || self->disposed || !self->bus) return;
     if (self->refresh_debounce_id) return;
-    self->refresh_debounce_id = g_timeout_add(50, on_debounce_timeout, self);
+    self->refresh_debounce_id = g_timeout_add_full(
+        G_PRIORITY_DEFAULT, 50, on_debounce_timeout,
+        monitor_weak_ref_new(self), monitor_weak_ref_free);
 }
 
 static void clear_snapshot(ConttestInputPlumberMonitor *self) {
+    if (!self || self->disposed) return;
     gboolean had_data = (self->daemon_version != NULL) ||
                         (self->candidates && self->candidates->len > 0) ||
                         (self->source_devnodes && g_hash_table_size(self->source_devnodes) > 0);
@@ -204,12 +224,49 @@ static void clear_snapshot(ConttestInputPlumberMonitor *self) {
 }
 
 typedef struct {
-    ConttestInputPlumberMonitor *monitor;
+    GWeakRef monitor_ref;
     guint seq;
 } RefreshCallCtx;
 
+static void backfill_daemon_version(GPtrArray *candidates, const char *version) {
+    if (!version || !candidates) return;
+    for (guint i = 0; i < candidates->len; i++) {
+        ConttestInputPlumberInfo *info = g_ptr_array_index(candidates, i);
+        if (g_strcmp0(info->daemon_version, version) != 0) {
+            g_free(info->daemon_version);
+            info->daemon_version = g_strdup(version);
+        }
+    }
+}
+
+static gboolean candidates_equal(const GPtrArray *a, const GPtrArray *b) {
+    guint len_a = a ? a->len : 0;
+    guint len_b = b ? b->len : 0;
+    if (len_a != len_b) return FALSE;
+    for (guint i = 0; i < len_a; i++) {
+        const ConttestInputPlumberInfo *ia = g_ptr_array_index((GPtrArray *)a, i);
+        const ConttestInputPlumberInfo *ib = g_ptr_array_index((GPtrArray *)b, i);
+        if (!conttest_inputplumber_info_equal(ia, ib)) return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean str_set_equal(GHashTable *a, GHashTable *b) {
+    guint size_a = a ? g_hash_table_size(a) : 0;
+    guint size_b = b ? g_hash_table_size(b) : 0;
+    if (size_a != size_b) return FALSE;
+    if (size_a == 0) return TRUE;
+    GHashTableIter iter;
+    gpointer key = NULL;
+    g_hash_table_iter_init(&iter, a);
+    while (g_hash_table_iter_next(&iter, &key, NULL)) {
+        if (!g_hash_table_contains(b, key)) return FALSE;
+    }
+    return TRUE;
+}
+
 static void finish_refresh_if_complete(ConttestInputPlumberMonitor *self) {
-    if (self->pending_calls > 0) return;
+    if (!self || self->disposed || self->pending_calls > 0) return;
 
     gboolean changed = FALSE;
 
@@ -225,32 +282,37 @@ static void finish_refresh_if_complete(ConttestInputPlumberMonitor *self) {
     }
 
     if (self->pending_objects_ok) {
+        if (!self->pending_candidates) {
+            self->pending_candidates = g_ptr_array_new_with_free_func(
+                (GDestroyNotify)conttest_inputplumber_info_free);
+        }
+        if (!self->pending_source_devnodes) {
+            self->pending_source_devnodes = g_hash_table_new_full(
+                g_str_hash, g_str_equal, g_free, NULL);
+        }
+
+        /* Populate daemon_version before comparing so arrival order between
+         * Get("Version") and GetManagedObjects never triggers spurious diffs. */
+        backfill_daemon_version(self->pending_candidates, self->daemon_version);
+
+        if (!candidates_equal(self->candidates, self->pending_candidates) ||
+            !str_set_equal(self->source_devnodes, self->pending_source_devnodes)) {
+            changed = TRUE;
+        }
+
         if (self->candidates) g_ptr_array_free(self->candidates, TRUE);
-        self->candidates = self->pending_candidates ? self->pending_candidates
-                           : g_ptr_array_new_with_free_func((GDestroyNotify)conttest_inputplumber_info_free);
+        self->candidates = self->pending_candidates;
         self->pending_candidates = NULL;
 
         if (self->source_devnodes) g_hash_table_destroy(self->source_devnodes);
-        self->source_devnodes = self->pending_source_devnodes
-                                ? self->pending_source_devnodes
-                                : g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        self->source_devnodes = self->pending_source_devnodes;
         self->pending_source_devnodes = NULL;
-        changed = TRUE;
     } else {
         /* Preserve cached candidates and source_devnodes across transient D-Bus errors;
          * daemon exit is handled explicitly by NameOwnerChanged -> clear_snapshot(). */
         g_clear_pointer(&self->pending_candidates, g_ptr_array_unref);
         g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
-    }
-
-    /* Populate daemon_version uniformly regardless of GetManagedObjects vs Get("Version") arrival order. */
-    if (self->daemon_version && self->candidates) {
-        for (guint i = 0; i < self->candidates->len; i++) {
-            ConttestInputPlumberInfo *info = g_ptr_array_index(self->candidates, i);
-            if (!info->daemon_version) {
-                info->daemon_version = g_strdup(self->daemon_version);
-            }
-        }
+        backfill_daemon_version(self->candidates, self->daemon_version);
     }
 
     if (changed) {
@@ -260,16 +322,16 @@ static void finish_refresh_if_complete(ConttestInputPlumberMonitor *self) {
 
 static void on_get_version_done(GObject *source, GAsyncResult *res, gpointer user_data) {
     RefreshCallCtx *ctx = user_data;
-    ConttestInputPlumberMonitor *self = ctx->monitor;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(&ctx->monitor_ref);
     guint seq = ctx->seq;
+    g_weak_ref_clear(&ctx->monitor_ref);
     g_free(ctx);
 
     GError *err = NULL;
     GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &err);
-    if (seq != self->refresh_seq) {
+    if (!self || self->disposed || seq != self->refresh_seq) {
         if (reply) g_variant_unref(reply);
         g_clear_error(&err);
-        g_object_unref(self);
         return;
     }
 
@@ -289,21 +351,20 @@ static void on_get_version_done(GObject *source, GAsyncResult *res, gpointer use
 
     if (self->pending_calls > 0) self->pending_calls--;
     finish_refresh_if_complete(self);
-    g_object_unref(self);
 }
 
 static void on_get_objects_done(GObject *source, GAsyncResult *res, gpointer user_data) {
     RefreshCallCtx *ctx = user_data;
-    ConttestInputPlumberMonitor *self = ctx->monitor;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(&ctx->monitor_ref);
     guint seq = ctx->seq;
+    g_weak_ref_clear(&ctx->monitor_ref);
     g_free(ctx);
 
     GError *err = NULL;
     GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &err);
-    if (seq != self->refresh_seq) {
+    if (!self || self->disposed || seq != self->refresh_seq) {
         if (reply) g_variant_unref(reply);
         g_clear_error(&err);
-        g_object_unref(self);
         return;
     }
 
@@ -325,11 +386,10 @@ static void on_get_objects_done(GObject *source, GAsyncResult *res, gpointer use
 
     if (self->pending_calls > 0) self->pending_calls--;
     finish_refresh_if_complete(self);
-    g_object_unref(self);
 }
 
 static void start_refresh(ConttestInputPlumberMonitor *self) {
-    if (!self->bus) return;
+    if (!self || self->disposed || !self->bus || !self->cancellable) return;
 
     self->refresh_seq++;
     self->pending_calls = 2;
@@ -340,7 +400,7 @@ static void start_refresh(ConttestInputPlumberMonitor *self) {
     g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
 
     RefreshCallCtx *vctx = g_new0(RefreshCallCtx, 1);
-    vctx->monitor = g_object_ref(self);
+    g_weak_ref_init(&vctx->monitor_ref, self);
     vctx->seq = self->refresh_seq;
     g_dbus_connection_call(
         self->bus,
@@ -357,7 +417,7 @@ static void start_refresh(ConttestInputPlumberMonitor *self) {
         vctx);
 
     RefreshCallCtx *octx = g_new0(RefreshCallCtx, 1);
-    octx->monitor = g_object_ref(self);
+    g_weak_ref_init(&octx->monitor_ref, self);
     octx->seq = self->refresh_seq;
     g_dbus_connection_call(
         self->bus,
@@ -382,7 +442,10 @@ static void on_name_owner_changed(GDBusConnection *conn,
                                   GVariant *parameters,
                                   gpointer user_data) {
     (void)conn; (void)sender_name; (void)object_path; (void)interface_name; (void)signal_name;
-    ConttestInputPlumberMonitor *self = CONTTEST_INPUTPLUMBER_MONITOR(user_data);
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
+    if (!self || self->disposed) return;
+
     const char *name = NULL, *old_owner = NULL, *new_owner = NULL;
     g_variant_get(parameters, "(&s&s&s)", &name, &old_owner, &new_owner);
     if (new_owner && *new_owner) {
@@ -403,19 +466,24 @@ static void on_ip_dbus_signal(GDBusConnection *conn,
                               gpointer user_data) {
     (void)conn; (void)sender_name; (void)object_path;
     (void)interface_name; (void)signal_name; (void)parameters;
-    ConttestInputPlumberMonitor *self = CONTTEST_INPUTPLUMBER_MONITOR(user_data);
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
+    if (!self || self->disposed) return;
+
     schedule_refresh(self);
 }
 
 static void on_bus_ready(GObject *source, GAsyncResult *res, gpointer user_data) {
     (void)source;
-    ConttestInputPlumberMonitor *self = CONTTEST_INPUTPLUMBER_MONITOR(user_data);
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
+    monitor_weak_ref_free(wr);
 
     GError *err = NULL;
     GDBusConnection *bus = g_bus_get_finish(res, &err);
-    if (!bus) {
+    if (!self || self->disposed || !bus) {
+        if (bus) g_object_unref(bus);
         g_clear_error(&err);
-        g_object_unref(self);
         return;
     }
 
@@ -430,8 +498,8 @@ static void on_bus_ready(GObject *source, GAsyncResult *res, gpointer user_data)
         IP_BUS_NAME,
         G_DBUS_SIGNAL_FLAGS_NONE,
         on_name_owner_changed,
-        self,
-        NULL);
+        monitor_weak_ref_new(self),
+        monitor_weak_ref_free);
 
     self->sub_iface_added = g_dbus_connection_signal_subscribe(
         bus,
@@ -442,8 +510,8 @@ static void on_bus_ready(GObject *source, GAsyncResult *res, gpointer user_data)
         NULL,
         G_DBUS_SIGNAL_FLAGS_NONE,
         on_ip_dbus_signal,
-        self,
-        NULL);
+        monitor_weak_ref_new(self),
+        monitor_weak_ref_free);
 
     self->sub_iface_removed = g_dbus_connection_signal_subscribe(
         bus,
@@ -454,8 +522,8 @@ static void on_bus_ready(GObject *source, GAsyncResult *res, gpointer user_data)
         NULL,
         G_DBUS_SIGNAL_FLAGS_NONE,
         on_ip_dbus_signal,
-        self,
-        NULL);
+        monitor_weak_ref_new(self),
+        monitor_weak_ref_free);
 
     self->sub_props_changed = g_dbus_connection_signal_subscribe(
         bus,
@@ -466,15 +534,20 @@ static void on_bus_ready(GObject *source, GAsyncResult *res, gpointer user_data)
         NULL,
         G_DBUS_SIGNAL_FLAGS_NONE,
         on_ip_dbus_signal,
-        self,
-        NULL);
+        monitor_weak_ref_new(self),
+        monitor_weak_ref_free);
 
     start_refresh(self);
-    g_object_unref(self);
 }
 
 static void conttest_inputplumber_monitor_dispose(GObject *object) {
     ConttestInputPlumberMonitor *self = CONTTEST_INPUTPLUMBER_MONITOR(object);
+
+    self->disposed = TRUE;
+    self->refresh_seq++;
+    self->pending_calls = 0;
+    self->pending_version_ok = FALSE;
+    self->pending_objects_ok = FALSE;
 
     if (self->cancellable) {
         g_cancellable_cancel(self->cancellable);
@@ -520,7 +593,7 @@ static void conttest_inputplumber_monitor_init(ConttestInputPlumberMonitor *self
     self->cancellable = g_cancellable_new();
     self->candidates = g_ptr_array_new_with_free_func((GDestroyNotify)conttest_inputplumber_info_free);
     self->source_devnodes = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    g_bus_get(G_BUS_TYPE_SYSTEM, self->cancellable, on_bus_ready, g_object_ref(self));
+    g_bus_get(G_BUS_TYPE_SYSTEM, self->cancellable, on_bus_ready, monitor_weak_ref_new(self));
 }
 
 ConttestInputPlumberMonitor *conttest_inputplumber_monitor_new(void) {
@@ -534,7 +607,7 @@ ConttestInputPlumberInfo *conttest_inputplumber_monitor_match(
     uint16_t product_id,
     const char *uniq,
     const char *virtual_bus) {
-    if (!self) return NULL;
+    if (!self || self->disposed || !self->candidates) return NULL;
     return conttest_inputplumber_match_candidates(self->candidates, self->daemon_version,
                                                   name, vendor_id, product_id,
                                                   uniq, virtual_bus);
@@ -543,6 +616,6 @@ ConttestInputPlumberInfo *conttest_inputplumber_monitor_match(
 gboolean conttest_inputplumber_monitor_is_source_devnode(
     ConttestInputPlumberMonitor *self,
     const char *devnode) {
-    if (!self || !self->source_devnodes || !devnode || !*devnode) return FALSE;
+    if (!self || self->disposed || !self->source_devnodes || !devnode || !*devnode) return FALSE;
     return g_hash_table_contains(self->source_devnodes, devnode);
 }

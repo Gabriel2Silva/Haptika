@@ -234,7 +234,7 @@ gboolean conttest_ds5_parse_report_20(const guint8 *buf, gsize len,
 char *conttest_ds5_parse_system_info_response(const guint8 *resp, gsize resp_len,
                                               guint8 base, guint8 num,
                                               gsize length, gboolean as_hex) {
-    if (!resp || resp_len < 4 + length)
+    if (!resp || resp_len < 4 || length > resp_len - 4 || length > (gsize)G_MAXSSIZE)
         return NULL;
     if (resp[0] != 0x81 || resp[1] != base || resp[2] != num || resp[3] != 2)
         return NULL;

@@ -11,6 +11,7 @@ typedef void (*SpeakerTestCallback)(const char *error, gpointer user_data);
 void speaker_test_play(const char *evdev_syspath,
                        GCancellable *cancellable,
                        SpeakerTestCallback callback,
-                       gpointer user_data);
+                       gpointer user_data,
+                       GDestroyNotify destroy_notify);
 
 G_END_DECLS

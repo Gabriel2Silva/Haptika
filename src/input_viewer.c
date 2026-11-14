@@ -181,8 +181,23 @@ static void sync_action_controls(ConttestInputViewer *self) {
     gtk_widget_set_visible(self->actions_box, TRUE);
 }
 
+static GWeakRef *viewer_weak_ref_new(ConttestInputViewer *self) {
+    GWeakRef *wr = g_new0(GWeakRef, 1);
+    g_weak_ref_init(wr, self);
+    return wr;
+}
+
+static void viewer_weak_ref_free(gpointer data) {
+    GWeakRef *wr = data;
+    g_weak_ref_clear(wr);
+    g_free(wr);
+}
+
 static void on_speaker_test_done(const char *error, gpointer user_data) {
-    ConttestInputViewer *self = CONTTEST_INPUT_VIEWER(user_data);
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputViewer) self = g_weak_ref_get(wr);
+    if (!self)
+        return;
     g_clear_object(&self->speaker_cancellable);
     sync_action_controls(self);
     if (error)
@@ -198,7 +213,8 @@ static void on_speaker_test_clicked(GtkButton *btn, gpointer user_data) {
     self->speaker_cancellable = g_cancellable_new();
     sync_action_controls(self);
     speaker_test_play(self->evdev_syspath, self->speaker_cancellable,
-                      on_speaker_test_done, self);
+                      on_speaker_test_done, viewer_weak_ref_new(self),
+                      viewer_weak_ref_free);
 }
 
 static GtkWidget *create_wrap_section(int child_spacing, int line_spacing) {

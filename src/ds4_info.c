@@ -41,8 +41,9 @@ static gpointer fetch_ds4_info(const char *hidraw_node,
     }
 
     /* Feature report 0xa3: build date, HW/SW version (49 bytes, reads through 0x2a). */
-    guint8 *r = controller_info_hidraw_get_feature(fd, 0xa3, 49, 0x2b);
-    if (!conttest_ds4_parse_report_a3(r, 0x2b, &info->a3)) {
+    gsize r_len = 0;
+    guint8 *r = controller_info_hidraw_get_feature(fd, 0xa3, 49, 0x2b, &r_len);
+    if (!conttest_ds4_parse_report_a3(r, r_len, &info->a3)) {
         g_free(r);
         info->is_clone = TRUE;
         controller_info_copy_utf8(info->error_msg, sizeof(info->error_msg),
@@ -54,7 +55,7 @@ static gpointer fetch_ds4_info(const char *hidraw_node,
         if (is_bt) {
             info->is_clone = FALSE;
         } else if (!g_cancellable_is_cancelled(cancellable)) {
-            guint8 *r81 = controller_info_hidraw_get_feature(fd, 0x81, 7, 7);
+            guint8 *r81 = controller_info_hidraw_get_feature(fd, 0x81, 7, 7, NULL);
             info->is_clone = (r81 == NULL || r81[0] != 0x81);
             g_free(r81);
         }
@@ -64,8 +65,9 @@ static gpointer fetch_ds4_info(const char *hidraw_node,
 
     /* Feature report 0x12: Bluetooth address (6 bytes at offset 1, reversed). */
     if (!g_cancellable_is_cancelled(cancellable)) {
-        guint8 *r12 = controller_info_hidraw_get_feature(fd, 0x12, 16, 7);
-        if (conttest_ds4_parse_report_12_bt(r12, 7, info->bt_address, sizeof(info->bt_address)))
+        gsize r12_len = 0;
+        guint8 *r12 = controller_info_hidraw_get_feature(fd, 0x12, 16, 7, &r12_len);
+        if (conttest_ds4_parse_report_12_bt(r12, r12_len, info->bt_address, sizeof(info->bt_address)))
             info->has_bt_addr = TRUE;
         g_free(r12);
     }
@@ -77,15 +79,18 @@ static gpointer fetch_ds4_info(const char *hidraw_node,
 static void on_fetch_done(GObject *source, GAsyncResult *result, gpointer user_data) {
     (void)source;
     AdwDialog *dialog = ADW_DIALOG(user_data);
-    DS4InfoData *info = g_task_propagate_pointer(G_TASK(result), NULL);
+    GError *err = NULL;
+    DS4InfoData *info = g_task_propagate_pointer(G_TASK(result), &err);
     GtkWidget *toolbar_view = adw_dialog_get_child(dialog);
 
     if (!info || (!info->ok && !info->has_bt_addr)) {
+        const char *desc = (info && info->error_msg[0] != '\0')
+            ? info->error_msg
+            : (err ? err->message : _("Failed to read device info."));
         controller_info_dialog_show_error(
             toolbar_view,
             _("Could Not Read Device Info"),
-            (info && info->error_msg[0] != '\0') ? info->error_msg
-                                                 : _("Failed to read device info."));
+            desc);
     } else {
         GtkWidget *box = controller_info_dialog_show_content(toolbar_view);
 
@@ -126,22 +131,23 @@ static void on_fetch_done(GObject *source, GAsyncResult *result, gpointer user_d
         }
     }
 
+    g_clear_error(&err);
     g_free(info);
 }
 
 void ds4_info_show(GtkWidget *parent, const ConttestDevice *device) {
-    char *hidraw_node = controller_info_resolve_hidraw(
-        parent,
-        conttest_device_get_evdev_syspath(device),
-        _("DualShock 4 Info"),
-        _("DualShock 4 info requires kernel evdev and hidraw device access, which is unavailable for this controller."));
-    if (!hidraw_node)
+    const char *evdev_syspath = conttest_device_get_evdev_syspath(device);
+    if (!evdev_syspath) {
+        controller_info_show_error_alert(
+            parent,
+            _("DualShock 4 Info"),
+            _("DualShock 4 info requires kernel evdev and hidraw device access, which is unavailable for this controller."));
         return;
+    }
 
     gboolean is_bt = (conttest_device_get_connection_state(device) == SDL_JOYSTICK_CONNECTION_WIRELESS);
     controller_info_present_async_dialog(parent, _("DualShock 4 Info"), 400, 640,
-                                         hidraw_node, is_bt,
+                                         evdev_syspath, TRUE, is_bt,
                                          fetch_ds4_info, g_free,
                                          on_fetch_done);
-    g_free(hidraw_node);
 }

@@ -48,17 +48,12 @@ static inline guint32 controller_info_read_le32(const guint8 *p) {
 char *controller_info_find_hidraw_node(struct udev *udev,
                                        const char *evdev_syspath);
 
-/* Resolve the hidraw devnode for evdev_syspath, showing an alert dialog on error.
- * Returns a newly-allocated devnode path or NULL (alert already shown). */
-char *controller_info_resolve_hidraw(GtkWidget *parent,
-                                     const char *evdev_syspath,
-                                     const char *alert_heading,
-                                     const char *no_evdev_body);
-
 /* Send a HIDIOCGFEATURE ioctl and return a newly-allocated buffer, or NULL.
- * Validates both ioctl success and minimum byte count returned (min_len). */
+ * Validates both ioctl success and minimum byte count returned (min_len).
+ * If out_len is non-NULL, stores the actual byte count returned by ioctl. */
 guint8 *controller_info_hidraw_get_feature(int fd, guint8 report_id,
-                                           gsize buf_size, gsize min_len);
+                                           gsize buf_size, gsize min_len,
+                                           gsize *out_len);
 
 /* Sanitize a raw HID string into valid printable UTF-8 with control chars
  * and trailing whitespace removed. Stops at embedded NUL bytes within max_len
@@ -72,18 +67,22 @@ void controller_info_copy_utf8(char *dst, gsize dst_size, const char *src);
 /* Format into a fixed-size buffer using g_vsnprintf and log on truncation. */
 void controller_info_format(char *dst, gsize dst_size, const char *fmt, ...) G_GNUC_PRINTF(3, 4);
 
-typedef gpointer (*ControllerInfoFetchFunc)(const char *hidraw_node,
+typedef gpointer (*ControllerInfoFetchFunc)(const char *path,
                                             gboolean is_bt,
                                             GCancellable *cancellable);
 
 /* Present a spinner dialog and fetch hardware info on a GTask worker thread.
+ * When resolve_hidraw is TRUE, evdev_syspath is resolved off-thread to a hidraw
+ * devnode via controller_info_find_hidraw_node() before invoking fetch_func;
+ * otherwise evdev_syspath is passed directly to fetch_func.
  * Closing or destroying the dialog cancels the task and ignores late results.
  * done_callback receives a borrowed AdwDialog* as user_data. */
 void controller_info_present_async_dialog(GtkWidget *parent,
                                           const char *title,
                                           int width,
                                           int height,
-                                          const char *hidraw_node,
+                                          const char *evdev_syspath,
+                                          gboolean resolve_hidraw,
                                           gboolean is_bt,
                                           ControllerInfoFetchFunc fetch_func,
                                           GDestroyNotify result_free_func,

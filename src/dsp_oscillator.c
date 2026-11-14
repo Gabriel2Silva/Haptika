@@ -24,6 +24,8 @@ static inline double wrap_phase(double phase) {
     phase = fmod(phase, CONTTEST_TWO_PI);
     if (phase < 0.0)
         phase += CONTTEST_TWO_PI;
+    if (phase >= CONTTEST_TWO_PI || !isfinite(phase))
+        phase = 0.0;
     return phase;
 }
 

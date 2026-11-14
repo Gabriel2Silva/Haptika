@@ -8,6 +8,7 @@ G_BEGIN_DECLS
 
 typedef enum {
     CONTTEST_VIRTUAL_NONE = 0,
+    CONTTEST_VIRTUAL_GENERIC,
     CONTTEST_VIRTUAL_INPUTPLUMBER
 } ConttestVirtualKind;
 
@@ -49,7 +50,8 @@ gboolean conttest_udev_device_probe_virtual(struct udev_device *dev,
                                             char **out_uniq,
                                             char **out_virtual_bus);
 
-/* Convenience wrapper opening syspath or devnode via udev. */
+/* Convenience wrapper opening syspath or devnode via udev. Performs
+ * synchronous udev/sysfs lookups; call only from a worker thread or unit tests. */
 gboolean conttest_udev_probe_virtual(struct udev *udev,
                                      const char *syspath,
                                      const char *devnode,
@@ -60,7 +62,8 @@ gboolean conttest_udev_probe_virtual(struct udev *udev,
  * hidden devlink (/dev/inputplumber/by-hidden/...). */
 gboolean conttest_udev_device_is_inputplumber_hidden(struct udev_device *dev);
 
-/* Convenience wrapper opening syspath or devnode via udev. */
+/* Convenience wrapper opening syspath or devnode via udev. Performs
+ * synchronous udev/sysfs lookups; call only from a worker thread or unit tests. */
 gboolean conttest_udev_is_inputplumber_hidden(struct udev *udev,
                                               const char *syspath,
                                               const char *devnode);

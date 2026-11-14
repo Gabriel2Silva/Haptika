@@ -280,7 +280,8 @@ GPtrArray *conttest_inputplumber_parse_managed_objects(GVariant *reply,
         source_devnodes = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
         *out_source_devnodes = source_devnodes;
     }
-    if (!reply) return results;
+    if (!reply || !g_variant_is_of_type(reply, G_VARIANT_TYPE("(a{oa{sa{sv}}})")))
+        return results;
 
     GVariant *objects = g_variant_get_child_value(reply, 0);
     if (!objects) return results;

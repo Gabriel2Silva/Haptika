@@ -175,8 +175,8 @@ void conttest_touchpad_set_finger_indexed(ConttestTouchpad *self,
     g_return_if_fail(finger_idx < CONTTEST_TOUCHPAD_MAX_FINGERS);
 
     TouchpadFingerState *slot = &self->fingers[finger_idx];
-    float fx = isnan(x) ? 0.5f : CLAMP(x, 0.0f, 1.0f);
-    float fy = isnan(y) ? 0.5f : CLAMP(y, 0.0f, 1.0f);
+    float fx = !isfinite(x) ? 0.5f : CLAMP(x, 0.0f, 1.0f);
+    float fy = !isfinite(y) ? 0.5f : CLAMP(y, 0.0f, 1.0f);
 
     if (!active && !slot->active)
         return;

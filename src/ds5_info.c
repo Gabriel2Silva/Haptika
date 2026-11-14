@@ -13,15 +13,19 @@
 /* Send 0x80 [base, num], receive 0x81, return bytes [4..4+len] as hex or sanitized UTF-8.
  * Returns a newly-allocated string (caller must g_free) or NULL on error. */
 static char *ds5_get_system_info(int fd, guint8 base, guint8 num, gsize length, gboolean as_hex) {
+    if (length == 0 || length > 256)
+        return NULL;
+
     guint8 req[3] = { 0x80, base, num };
     if (ioctl(fd, HIDIOCSFEATURE(3), req) < 0)
         return NULL;
 
-    guint8 *resp = controller_info_hidraw_get_feature(fd, 0x81, 4 + length + 4, 4 + length);
+    gsize resp_len = 0;
+    guint8 *resp = controller_info_hidraw_get_feature(fd, 0x81, 4 + length + 4, 4 + length, &resp_len);
     if (!resp)
         return NULL;
 
-    char *result = conttest_ds5_parse_system_info_response(resp, 4 + length,
+    char *result = conttest_ds5_parse_system_info_response(resp, resp_len,
                                                             base, num, length, as_hex);
     g_free(resp);
     return result;
@@ -79,8 +83,9 @@ static gpointer fetch_ds5_info(const char *hidraw_node,
     }
 
     /* Feature report 0x20: main firmware/hardware info (64 bytes, need >= 60). */
-    guint8 *r20 = controller_info_hidraw_get_feature(fd, 0x20, 64, 60);
-    if (!conttest_ds5_parse_report_20(r20, 60, &info->r20)) {
+    gsize r20_len = 0;
+    guint8 *r20 = controller_info_hidraw_get_feature(fd, 0x20, 64, 60, &r20_len);
+    if (!conttest_ds5_parse_report_20(r20, r20_len, &info->r20)) {
         g_free(r20);
         controller_info_copy_utf8(info->error_msg, sizeof(info->error_msg),
                                   _("Feature report 0x20 failed"));
@@ -126,10 +131,11 @@ static gpointer fetch_ds5_info(const char *hidraw_node,
         /* Bluetooth address: send 0x80 [9, 2], receive 0x81, bytes [4..9] reversed. */
         if (!g_cancellable_is_cancelled(cancellable)) {
             guint8 req[3] = { 0x80, 9, 2 };
+            gsize resp_len = 0;
             guint8 *resp = NULL;
             if (ioctl(fd, HIDIOCSFEATURE(3), req) >= 0)
-                resp = controller_info_hidraw_get_feature(fd, 0x81, 16, 10);
-            if (!conttest_ds5_parse_bt_addr_response(resp, 10, info->bt_address, sizeof(info->bt_address))) {
+                resp = controller_info_hidraw_get_feature(fd, 0x81, 16, 10, &resp_len);
+            if (!conttest_ds5_parse_bt_addr_response(resp, resp_len, info->bt_address, sizeof(info->bt_address))) {
                 controller_info_copy_utf8(info->bt_address, sizeof(info->bt_address),
                                           _("Not available"));
             }
@@ -145,15 +151,18 @@ static gpointer fetch_ds5_info(const char *hidraw_node,
 static void on_ds5_fetch_done(GObject *source, GAsyncResult *result, gpointer user_data) {
     (void)source;
     AdwDialog *dialog = ADW_DIALOG(user_data);
-    DS5InfoData *info = g_task_propagate_pointer(G_TASK(result), NULL);
+    GError *err = NULL;
+    DS5InfoData *info = g_task_propagate_pointer(G_TASK(result), &err);
     GtkWidget *toolbar_view = adw_dialog_get_child(dialog);
 
     if (!info || !info->ok) {
+        const char *desc = (info && info->error_msg[0] != '\0')
+            ? info->error_msg
+            : (err ? err->message : _("Failed to read device info."));
         controller_info_dialog_show_error(
             toolbar_view,
             _("Could Not Read Device Info"),
-            (info && info->error_msg[0] != '\0') ? info->error_msg
-                                                 : _("Failed to read device info."));
+            desc);
     } else {
         GtkWidget *box = controller_info_dialog_show_content(toolbar_view);
 
@@ -194,22 +203,23 @@ static void on_ds5_fetch_done(GObject *source, GAsyncResult *result, gpointer us
         }
     }
 
+    g_clear_error(&err);
     g_free(info);
 }
 
 void ds5_info_show(GtkWidget *parent, const ConttestDevice *device) {
-    char *hidraw_node = controller_info_resolve_hidraw(
-        parent,
-        conttest_device_get_evdev_syspath(device),
-        _("DualSense Info"),
-        _("DualSense info requires kernel evdev and hidraw device access, which is unavailable for this controller."));
-    if (!hidraw_node)
+    const char *evdev_syspath = conttest_device_get_evdev_syspath(device);
+    if (!evdev_syspath) {
+        controller_info_show_error_alert(
+            parent,
+            _("DualSense Info"),
+            _("DualSense info requires kernel evdev and hidraw device access, which is unavailable for this controller."));
         return;
+    }
 
     gboolean is_bt = (conttest_device_get_connection_state(device) == SDL_JOYSTICK_CONNECTION_WIRELESS);
     controller_info_present_async_dialog(parent, _("DualSense Info"), 480, 500,
-                                         hidraw_node, is_bt,
+                                         evdev_syspath, TRUE, is_bt,
                                          fetch_ds5_info, g_free,
                                          on_ds5_fetch_done);
-    g_free(hidraw_node);
 }

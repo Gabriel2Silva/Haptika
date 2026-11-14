@@ -92,9 +92,9 @@ void conttest_evdev_classify_axes(ConttestAbsAxisInfo z,
                                   gboolean *out_z_rz_right_stick,
                                   gboolean *out_rx_ry_triggers);
 
-// Called by the polling thread to initialize the UI structure *once* at startup
-// This must be done via g_main_context_invoke or similar, before sending
-// updates
+// Passed to conttest_input_viewer_handle_layout to initialize the UI structure
+// once at session startup (via g_main_context_invoke when called off-thread,
+// or synchronously when started on the GTK main thread).
 typedef struct {
   ConttestElementDomain domain;
   int element_id;

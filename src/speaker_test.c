@@ -372,17 +372,23 @@ static void on_loop_cancel_quit(void *userdata, int fd, uint32_t mask) {
     pw_main_loop_quit(loop);
 }
 
-static gboolean discover_controller_sink(struct pw_main_loop *loop,
-                                     struct pw_loop *pw_loop,
-                                     int card_num,
+static gboolean discover_controller_sink(int card_num,
                                      GCancellable *cancellable,
                                      SinkTarget *out_target,
                                      char **out_error) {
     sink_target_clear(out_target);
     *out_error = NULL;
 
+    struct pw_main_loop *loop = pw_main_loop_new(NULL);
+    if (!loop) {
+        *out_error = g_strdup(_("Failed to create PipeWire loop"));
+        return FALSE;
+    }
+    struct pw_loop *pw_loop = pw_main_loop_get_loop(loop);
+
     struct pw_context *pw_ctx = pw_context_new(pw_loop, NULL, 0);
     if (!pw_ctx) {
+        pw_main_loop_destroy(loop);
         *out_error = g_strdup(_("Failed to create PipeWire context."));
         return FALSE;
     }
@@ -390,6 +396,7 @@ static gboolean discover_controller_sink(struct pw_main_loop *loop,
     struct pw_core *core = pw_context_connect(pw_ctx, NULL, 0);
     if (!core) {
         pw_context_destroy(pw_ctx);
+        pw_main_loop_destroy(loop);
         *out_error = g_strdup(_("Failed to connect to PipeWire."));
         return FALSE;
     }
@@ -444,6 +451,7 @@ static gboolean discover_controller_sink(struct pw_main_loop *loop,
     spa_hook_remove(&core_listener);
     pw_core_disconnect(core);
     pw_context_destroy(pw_ctx);
+    pw_main_loop_destroy(loop);
 
     if (cancellable && g_cancellable_is_cancelled(cancellable)) {
         sink_target_clear(&disc.best);
@@ -667,17 +675,17 @@ static char *play_tone(int card_num, GCancellable *cancellable) {
 
     ensure_pipewire_init();
 
-    struct pw_main_loop *loop = pw_main_loop_new(NULL);
-    if (!loop)
-        return g_strdup(_("Failed to create PipeWire loop"));
-    struct pw_loop *pw_loop = pw_main_loop_get_loop(loop);
-
     SinkTarget target = { .node_id = PW_ID_ANY };
     char *err = NULL;
-    if (!discover_controller_sink(loop, pw_loop, card_num, cancellable, &target, &err)) {
-        pw_main_loop_destroy(loop);
+    if (!discover_controller_sink(card_num, cancellable, &target, &err))
         return err;
+
+    struct pw_main_loop *loop = pw_main_loop_new(NULL);
+    if (!loop) {
+        sink_target_clear(&target);
+        return g_strdup(_("Failed to create PipeWire loop"));
     }
+    struct pw_loop *pw_loop = pw_main_loop_get_loop(loop);
 
     ToneCtx ctx = {
         .loop         = loop,
@@ -759,6 +767,10 @@ static char *play_tone(int card_num, GCancellable *cancellable) {
                                     g_strerror(-res));
     } else if (!ctx.error && (!cancellable || !g_cancellable_is_cancelled(cancellable))) {
         pw_main_loop_run(ctx.loop);
+        if (!ctx.drained && !ctx.error &&
+            (!cancellable || !g_cancellable_is_cancelled(cancellable))) {
+            ctx.error = g_strdup(_("Audio playback ended prematurely."));
+        }
     }
 
     ctx.tearing_down = TRUE;
@@ -785,7 +797,16 @@ static void speaker_test_task_free(gpointer p) {
 typedef struct {
     SpeakerTestCallback callback;
     gpointer            user_data;
+    GDestroyNotify      destroy_notify;
 } SpeakerTestCaller;
+
+static void speaker_test_caller_free(SpeakerTestCaller *caller) {
+    if (!caller)
+        return;
+    if (caller->destroy_notify)
+        caller->destroy_notify(caller->user_data);
+    g_free(caller);
+}
 
 static void speaker_test_thread(GTask *task, gpointer source,
                                 gpointer task_data, GCancellable *cancellable) {
@@ -820,19 +841,21 @@ static void on_task_done(GObject *source, GAsyncResult *result, gpointer user_da
         caller->callback(error, caller->user_data);
 
     g_free(error);
-    g_free(caller);
+    speaker_test_caller_free(caller);
 }
 
 void speaker_test_play(const char *evdev_syspath,
                        GCancellable *cancellable,
                        SpeakerTestCallback callback,
-                       gpointer user_data) {
+                       gpointer user_data,
+                       GDestroyNotify destroy_notify) {
     SpeakerTestTask *t = g_new(SpeakerTestTask, 1);
     t->evdev_syspath = g_strdup(evdev_syspath);
 
     SpeakerTestCaller *caller = g_new(SpeakerTestCaller, 1);
-    caller->callback  = callback;
-    caller->user_data = user_data;
+    caller->callback       = callback;
+    caller->user_data      = user_data;
+    caller->destroy_notify = destroy_notify;
 
     GTask *task = g_task_new(NULL, cancellable, on_task_done, caller);
     g_task_set_task_data(task, t, speaker_test_task_free);
@@ -846,7 +869,18 @@ typedef struct {
     GCancellable        *cancellable;
     SpeakerTestCallback  callback;
     gpointer             user_data;
+    GDestroyNotify       destroy_notify;
 } NoPipeWireIdleData;
+
+static void no_pipewire_idle_data_free(gpointer data) {
+    NoPipeWireIdleData *d = data;
+    if (!d)
+        return;
+    if (d->destroy_notify)
+        d->destroy_notify(d->user_data);
+    g_clear_object(&d->cancellable);
+    g_free(d);
+}
 
 static gboolean deliver_no_pipewire_error(gpointer data) {
     NoPipeWireIdleData *d = data;
@@ -854,21 +888,22 @@ static gboolean deliver_no_pipewire_error(gpointer data) {
         d->callback(_("Speaker test requires PipeWire (not available in this build)."),
                     d->user_data);
     }
-    g_clear_object(&d->cancellable);
-    g_free(d);
     return G_SOURCE_REMOVE;
 }
 
 void speaker_test_play(const char *evdev_syspath,
                        GCancellable *cancellable,
                        SpeakerTestCallback callback,
-                       gpointer user_data) {
+                       gpointer user_data,
+                       GDestroyNotify destroy_notify) {
     (void)evdev_syspath;
     NoPipeWireIdleData *d = g_new0(NoPipeWireIdleData, 1);
-    d->cancellable = cancellable ? g_object_ref(cancellable) : NULL;
-    d->callback    = callback;
-    d->user_data   = user_data;
-    g_idle_add(deliver_no_pipewire_error, d);
+    d->cancellable    = cancellable ? g_object_ref(cancellable) : NULL;
+    d->callback       = callback;
+    d->user_data      = user_data;
+    d->destroy_notify = destroy_notify;
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, deliver_no_pipewire_error, d,
+                    no_pipewire_idle_data_free);
 }
 
 #endif /* HAVE_PIPEWIRE */

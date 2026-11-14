@@ -30,7 +30,9 @@ gboolean conttest_hw_keys_match(const char *own_a,
                                 const char *own_b,
                                 const char * const *keys_b);
 
-/* Check whether an SDL device node path and an evdev syspath belong to the same physical device. */
+/* Check whether an SDL device node path and an evdev syspath belong to the same
+ * physical device. Performs synchronous udev/sysfs lookups; call only from a
+ * worker thread or unit tests, never from the GTK main loop. */
 gboolean conttest_udev_is_same_hardware(struct udev *udev,
                                         const char *sdl_path,
                                         const char *evdev_syspath);
@@ -45,7 +47,9 @@ SDL_JoystickConnectionState conttest_resolve_connection_state_from_props(
 SDL_JoystickConnectionState conttest_resolve_connection_state_for_udev_device(
     struct udev_device *dev);
 
-/* Resolve connection type from udev for an evdev syspath or SDL devnode path. */
+/* Resolve connection type from udev for an evdev syspath or SDL devnode path.
+ * Performs synchronous udev/sysfs lookups; call only from a worker thread or
+ * unit tests, never from the GTK main loop. */
 SDL_JoystickConnectionState conttest_resolve_connection_state_udev(
     struct udev *udev,
     gboolean has_evdev,

@@ -83,7 +83,7 @@ GtkWidget *conttest_analog_stick_new(const char *name) {
 
 void conttest_analog_stick_set_position(ConttestAnalogStick *self, double x, double y) {
     g_return_if_fail(CONTTEST_IS_ANALOG_STICK(self));
-    if (isnan(x) || isnan(y))
+    if (!isfinite(x) || !isfinite(y))
         return;
     if (fabs(x - self->stick_x) < 0.005 && fabs(y - self->stick_y) < 0.005)
         return;

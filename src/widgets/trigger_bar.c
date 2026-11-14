@@ -22,7 +22,7 @@ G_DEFINE_TYPE(ConttestTriggerBar, conttest_trigger_bar, GTK_TYPE_WIDGET)
 static void update_accessible_value(ConttestTriggerBar *self) {
     double vmin = self->bipolar ? -1.0 : 0.0;
     double vmax = 1.0;
-    double vnow = isnan(self->value) ? 0.0 : CLAMP(self->value, vmin, vmax);
+    double vnow = !isfinite(self->value) ? 0.0 : CLAMP(self->value, vmin, vmax);
     gtk_accessible_update_property(GTK_ACCESSIBLE(self),
                                    GTK_ACCESSIBLE_PROPERTY_VALUE_MIN, vmin,
                                    GTK_ACCESSIBLE_PROPERTY_VALUE_MAX, vmax,
@@ -104,7 +104,7 @@ static void conttest_trigger_bar_snapshot(GtkWidget *widget, GtkSnapshot *snapsh
         }
 
         double vmin = self->bipolar ? -1.0 : 0.0;
-        double v = isnan(self->value) ? 0.0 : CLAMP(self->value, vmin, 1.0);
+        double v = !isfinite(self->value) ? 0.0 : CLAMP(self->value, vmin, 1.0);
 
         gtk_snapshot_push_rounded_clip(snapshot, &track_rr);
         if (!self->bipolar) {
@@ -174,7 +174,7 @@ GtkWidget *conttest_trigger_bar_new(const char *name) {
 
 void conttest_trigger_bar_set_value(ConttestTriggerBar *self, double value) {
     g_return_if_fail(CONTTEST_IS_TRIGGER_BAR(self));
-    if (isnan(value))
+    if (!isfinite(value))
         return;
 
     double vmin = self->bipolar ? -1.0 : 0.0;

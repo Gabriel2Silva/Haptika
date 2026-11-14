@@ -132,6 +132,13 @@ static void test_dsp_edge_cases(void) {
     conttest_dsp_generate_sine(buf, G_N_ELEMENTS(buf), &phase, omega, 0.0f);
     for (size_t i = 0; i < G_N_ELEMENTS(buf); i++)
         g_assert_cmpfloat(buf[i], ==, 0.0f);
+
+    /* Tiny negative phase near -0.0 must wrap strictly inside [0, 2*pi). */
+    const double two_pi = 2.0 * G_PI;
+    double neg_tiny = -1e-17;
+    conttest_dsp_generate_sine(buf, 8, &neg_tiny, 0.0, 1.0f);
+    g_assert_cmpfloat(neg_tiny, >=, 0.0);
+    g_assert_cmpfloat(neg_tiny, <, two_pi);
 }
 
 int main(int argc, char *argv[]) {

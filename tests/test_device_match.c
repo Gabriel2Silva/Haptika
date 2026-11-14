@@ -240,6 +240,19 @@ static void test_inputplumber_managed_objects_and_matching(void) {
         reply, "0.49.1", &source_devnodes);
     g_variant_unref(reply);
 
+    /* Unexpected GVariant types must return empty results cleanly. */
+    GVariant *bad_str = g_variant_ref_sink(g_variant_new_string("not-a-tuple"));
+    GPtrArray *bad_res1 = conttest_inputplumber_parse_managed_objects(bad_str, "0.49.1", NULL);
+    g_assert_cmpuint(bad_res1->len, ==, 0);
+    g_ptr_array_unref(bad_res1);
+    g_variant_unref(bad_str);
+
+    GVariant *bad_tuple = g_variant_ref_sink(g_variant_new("(s)", "wrong-inner-type"));
+    GPtrArray *bad_res2 = conttest_inputplumber_parse_managed_objects(bad_tuple, "0.49.1", NULL);
+    g_assert_cmpuint(bad_res2->len, ==, 0);
+    g_ptr_array_unref(bad_res2);
+    g_variant_unref(bad_tuple);
+
     g_assert_cmpuint(candidates->len, ==, 4);
     g_assert_true(g_hash_table_contains(source_devnodes, "/dev/input/event12"));
     g_assert_true(g_hash_table_contains(source_devnodes, "/dev/input/event15"));

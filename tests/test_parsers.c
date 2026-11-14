@@ -190,6 +190,8 @@ static void test_ds5_parsers(void) {
     g_assert_null(conttest_ds5_parse_system_info_response(sys_hex, sizeof(sys_hex), 1, 9, 4, TRUE));
     sys_hex[3] = 2;
     g_assert_null(conttest_ds5_parse_system_info_response(sys_hex, 7, 1, 9, 4, TRUE));
+    g_assert_null(conttest_ds5_parse_system_info_response(sys_hex, 3, 1, 9, 0, FALSE));
+    g_assert_null(conttest_ds5_parse_system_info_response(sys_hex, sizeof(sys_hex), 1, 9, G_MAXSIZE - 2, FALSE));
 
     /* BT address response parsing */
     guint8 bt_resp[10] = { 0x81, 9, 2, 2, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 };

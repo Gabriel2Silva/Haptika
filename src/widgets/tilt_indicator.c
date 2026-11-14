@@ -108,12 +108,10 @@ static void conttest_tilt_indicator_snapshot(GtkWidget *widget, GtkSnapshot *sna
     /* Derive roll and pitch from accelerometer:
      * roll  = tilt left/right   -> maps to X axis of the circle
      * pitch = tilt forward/back -> maps to Y axis of the circle */
-    float mag = sqrtf(self->sax * self->sax +
-                      self->say * self->say +
-                      self->saz * self->saz);
+    float mag = hypotf(hypotf(self->sax, self->say), self->saz);
     float norm_x = 0.0f;
     float norm_y = 0.0f;
-    if (mag > 0.1f) {
+    if (isfinite(mag) && mag > 0.1f) {
         norm_x = CLAMP(-self->sax / mag, -1.0f, 1.0f);
         norm_y = CLAMP(-self->say / mag, -1.0f, 1.0f);
     }
@@ -151,8 +149,12 @@ GtkWidget *conttest_tilt_indicator_new(void) {
 
 void conttest_tilt_indicator_set_accel(ConttestTiltIndicator *self, float ax, float ay, float az) {
     g_return_if_fail(CONTTEST_IS_TILT_INDICATOR(self));
-    if (isnan(ax) || isnan(ay) || isnan(az))
+    if (!isfinite(ax) || !isfinite(ay) || !isfinite(az))
         return;
+
+    ax = CLAMP(ax, -1000.0f, 1000.0f);
+    ay = CLAMP(ay, -1000.0f, 1000.0f);
+    az = CLAMP(az, -1000.0f, 1000.0f);
 
     self->target_x = ax;
     self->target_y = ay;

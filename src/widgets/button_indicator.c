@@ -1,4 +1,5 @@
 #include "button_indicator.h"
+#include <glib/gi18n.h>
 
 struct _ConttestButtonIndicator {
     GtkWidget parent_instance;
@@ -43,7 +44,7 @@ static void conttest_button_indicator_class_init(ConttestButtonIndicatorClass *k
     wclass->measure = conttest_button_indicator_measure;
     wclass->size_allocate = conttest_button_indicator_size_allocate;
 
-    gtk_widget_class_set_accessible_role(wclass, GTK_ACCESSIBLE_ROLE_METER);
+    gtk_widget_class_set_accessible_role(wclass, GTK_ACCESSIBLE_ROLE_GENERIC);
 }
 
 GtkWidget *conttest_button_indicator_new(const char *label) {
@@ -51,6 +52,7 @@ GtkWidget *conttest_button_indicator_new(const char *label) {
     gtk_label_set_text(GTK_LABEL(self->label_widget), label);
     gtk_accessible_update_property(GTK_ACCESSIBLE(self),
         GTK_ACCESSIBLE_PROPERTY_LABEL, label,
+        GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, _("Released"),
         -1);
     return GTK_WIDGET(self);
 }
@@ -63,4 +65,7 @@ void conttest_button_indicator_set_pressed(ConttestButtonIndicator *self, gboole
     } else {
         gtk_widget_remove_css_class(GTK_WIDGET(self), "pressed");
     }
+    gtk_accessible_update_property(GTK_ACCESSIBLE(self),
+        GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, pressed ? _("Pressed") : _("Released"),
+        -1);
 }

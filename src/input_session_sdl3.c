@@ -1,8 +1,15 @@
+#include "input_session.h"
 #include "input_viewer.h"
 #include "device_manager.h"
 #include <SDL3/SDL.h>
+#include <glib/gi18n.h>
 #include <math.h>
-#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+#define JOY_EXTRA_AXES_MAX   64
+#define TOUCHPAD_FINGERS_MAX 8
+#define AXIS_NOISE_EPSILON   (256.0 / 32768.0)
 
 static const struct {
     SDL_GamepadButton btn;
@@ -53,136 +60,166 @@ static const struct {
 };
 
 typedef struct {
-    SDL_Gamepad          *gamepad;
-    SDL_Joystick         *joystick;   /* borrowed from gamepad, not closed separately */
-    int                   joy_extra_axes; /* number of raw joystick axes beyond the gamepad axes */
+    gint                  ref_count;  /* 1 for session + 1 while tick callback is attached */
+    SDL_JoystickID        sdl_id;
+    SDL_Gamepad          *gamepad;    /* owned refcounted handle closed on cleanup */
+    SDL_Joystick         *joystick;   /* borrowed from gamepad; valid until SDL_CloseGamepad */
+    int                   joy_axis_base;
+    int                   joy_extra_axes;
     ViewerSessionContext *ctx;
+    GtkWidget            *viewer;     /* borrowed; non-NULL only while tick callback is attached */
     gint                 *atomic_stop_flag;
-    guint                 timer_id;
-    gboolean              btn_state[32];
-    double                axis_state[32];
-#define JOY_EXTRA_AXES_MAX 64
+    guint                 tick_id;
+    gboolean              btn_state[SDL_GAMEPAD_BUTTON_COUNT];
+    double                axis_state[SDL_GAMEPAD_AXIS_COUNT];
     double                joy_axis_state[JOY_EXTRA_AXES_MAX];
-#define TOUCHPAD_FINGERS_MAX 8
-    gboolean              touchpad_finger_state[TOUCHPAD_FINGERS_MAX]; /* touched = TRUE */
+    gboolean              touchpad_finger_state[TOUCHPAD_FINGERS_MAX];
+    float                 touchpad_x[TOUCHPAD_FINGERS_MAX];
+    float                 touchpad_y[TOUCHPAD_FINGERS_MAX];
     int                   num_touchpad_fingers;
+    gboolean              sensor_has_prev[2];
+    float                 sensor_prev[2][3];
 } SdlSessionData;
 
-/* GDestroyNotify called when the timer source is removed, in all cases.
- * Releases the ctx ref held on behalf of the timer. */
-static void sdl3_tick_destroyed(gpointer user_data) {
-    SdlSessionData *data = user_data;
-    data->timer_id = 0;
-    if (g_atomic_int_dec_and_test(&data->ctx->ref_count)) {
-        g_free(data->ctx);
+static void sdl_session_data_close_gamepad(SdlSessionData *data) {
+    if (data->gamepad) {
+        SDL_SetGamepadSensorEnabled(data->gamepad, SDL_SENSOR_ACCEL, false);
+        SDL_SetGamepadSensorEnabled(data->gamepad, SDL_SENSOR_GYRO, false);
+        SDL_CloseGamepad(data->gamepad);
+        data->gamepad = NULL;
+        data->joystick = NULL;
     }
 }
 
-/* Main-thread timer: poll gamepad state and dispatch events directly.
- * No SDL calls are made from any background thread. */
-static gboolean sdl3_poll_tick(gpointer user_data) {
+static void sdl_session_data_unref(SdlSessionData *data) {
+    if (!data)
+        return;
+    if (g_atomic_int_dec_and_test(&data->ref_count)) {
+        sdl_session_data_close_gamepad(data);
+        g_free(data);
+    }
+}
+
+static double normalize_gamepad_axis(SDL_GamepadAxis axis, Sint16 raw) {
+    if (axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
+        return CLAMP((double)raw / (double)SDL_JOYSTICK_AXIS_MAX, 0.0, 1.0);
+    if (raw >= 0)
+        return (double)raw / (double)SDL_JOYSTICK_AXIS_MAX;
+    return (double)raw / (-(double)SDL_JOYSTICK_AXIS_MIN);
+}
+
+static gboolean axis_value_changed(double prev, double next, double epsilon) {
+    if (next == prev)
+        return FALSE;
+    /* Always flush boundary transitions so slow releases return to exact 0.0 or +/-1.0. */
+    if (next == 0.0 || fabs(next) >= 1.0)
+        return TRUE;
+    return fabs(next - prev) > epsilon;
+}
+
+static void sdl3_tick_destroyed(gpointer user_data) {
+    SdlSessionData *data = user_data;
+    data->tick_id = 0;
+    data->viewer = NULL;
+    viewer_session_context_unref(data->ctx);
+    sdl_session_data_unref(data);
+}
+
+static gboolean sdl3_poll_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointer user_data) {
+    (void)widget;
+    (void)frame_clock;
     SdlSessionData *data = user_data;
 
-    /* Stop if externally requested or viewer context deactivated. */
     if (g_atomic_int_get(data->atomic_stop_flag) ||
         !g_atomic_int_get(&data->ctx->active)) {
         return G_SOURCE_REMOVE;
     }
 
-    /* Stop if gamepad was unplugged; device manager handles the UI. */
-
-    if (!SDL_GamepadConnected(data->gamepad)) {
+    if (!SDL_GamepadConnected(data->gamepad))
         return G_SOURCE_REMOVE;
-    }
 
-    /* We are on the main thread, so dispatch directly via apply_input_event
-     * using stack-allocated event structs — no heap allocation or refcount
-     * manipulation needed. The evdev path still uses g_idle_add because it
-     * crosses a thread boundary. */
-
-    /* Pump at ~1000 Hz so SDL_GetGamepad*() returns the freshest state.
-     * The device manager also pumps at 50 ms for hotplug events, but that
-     * is too slow for responsive input visualization. Both pumps are on
-     * the main thread and SDL_PumpEvents is idempotent. */
-    SDL_PumpEvents();
+    conttest_sdl_pump_events();
 
     ConttestInputViewer *viewer = data->ctx->viewer;
 
-    for (int i = 0; i < 32; i++) {
-        if (!SDL_GamepadHasButton(data->gamepad, i)) continue;
+    for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++) {
+        SDL_GamepadButton btn = (SDL_GamepadButton)i;
+        if (!SDL_GamepadHasButton(data->gamepad, btn))
+            continue;
 
-        gboolean pressed = SDL_GetGamepadButton(data->gamepad, i) != 0;
-        if (pressed == data->btn_state[i]) continue;
+        gboolean pressed = SDL_GetGamepadButton(data->gamepad, btn) != 0;
+        if (pressed == data->btn_state[i])
+            continue;
         data->btn_state[i] = pressed;
 
         ConttestInputEvent ev = {
-            .ctx            = data->ctx,
             .type           = INPUT_EVENT_BUTTON,
+            .domain         = CONTTEST_ELEMENT_BUTTON,
             .element_id     = i,
             .button_pressed = pressed,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
     }
 
-    for (int i = 0; i < 32; i++) {
-        if (!SDL_GamepadHasAxis(data->gamepad, i)) continue;
+    for (int i = 0; i < SDL_GAMEPAD_AXIS_COUNT; i++) {
+        SDL_GamepadAxis axis = (SDL_GamepadAxis)i;
+        if (!SDL_GamepadHasAxis(data->gamepad, axis))
+            continue;
 
-        Sint16 raw  = SDL_GetGamepadAxis(data->gamepad, i);
-        double norm = (i == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || i == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
-            ? (double)raw / 32767.0
-            : (double)raw / 32768.0;
+        Sint16 raw = SDL_GetGamepadAxis(data->gamepad, axis);
+        double norm = normalize_gamepad_axis(axis, raw);
 
-        /* Noise filter: compare normalised values to avoid the asymmetric
-         * integer-cast rounding that plagued the previous implementation. */
-        if (fabs(norm - data->axis_state[i]) <= (256.0 / 32768.0)) continue;
+        if (!axis_value_changed(data->axis_state[i], norm, AXIS_NOISE_EPSILON))
+            continue;
         data->axis_state[i] = norm;
 
         ConttestInputEvent ev = {
-            .ctx        = data->ctx,
             .type       = INPUT_EVENT_AXIS,
-            .element_id = ELEMENT_NS_SDL_AXIS_BASE + i,
+            .domain     = CONTTEST_ELEMENT_SDL_AXIS,
+            .element_id = i,
             .axis_value = norm,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
     }
 
-    /* Poll raw joystick axes that the gamepad abstraction doesn't expose
-     * (e.g. DS3 pressure-sensitive buttons on axes 6–15).
-     * Values come in as -32768 (unpressed) to 32767 (fully pressed);
-     * normalise to 0–1 for the trigger bar widget. */
+    /* Poll raw joystick axes beyond standard gamepad axes (e.g. DS3 pressures). */
+    const double joy_span = (double)SDL_JOYSTICK_AXIS_MAX - (double)SDL_JOYSTICK_AXIS_MIN;
     for (int i = 0; i < data->joy_extra_axes; i++) {
-        int axis_idx = SDL_GetNumJoystickAxes(data->joystick) - data->joy_extra_axes + i;
+        int axis_idx = data->joy_axis_base + i;
         Sint16 raw   = SDL_GetJoystickAxis(data->joystick, axis_idx);
-        double norm  = (double)(raw - (-32768)) / 65535.0;
+        double norm  = CLAMP(((double)raw - (double)SDL_JOYSTICK_AXIS_MIN) / joy_span, 0.0, 1.0);
 
-        if (fabs(norm - data->joy_axis_state[i]) <= (256.0 / 65535.0)) continue;
+        if (!axis_value_changed(data->joy_axis_state[i], norm, AXIS_NOISE_EPSILON))
+            continue;
         data->joy_axis_state[i] = norm;
 
         ConttestInputEvent ev = {
-            .ctx        = data->ctx,
             .type       = INPUT_EVENT_AXIS,
-            .element_id = ELEMENT_NS_SDL_EXTRA_BASE + i,
+            .domain     = CONTTEST_ELEMENT_SDL_EXTRA,
+            .element_id = i,
             .axis_value = norm,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
     }
 
-    /* Poll touchpad fingers.
-     * Finger 0 (element_id ELEMENT_NS_TOUCHPAD_BASE+0): fires every tick when
-     * down for real-time position updates, and once on lift.
-     * Finger 1+ (element_id ELEMENT_NS_TOUCHPAD_BASE+f): fires only on state change. */
     for (int f = 0; f < data->num_touchpad_fingers; f++) {
-        float x, y, pressure;
+        float x = 0.0f, y = 0.0f, pressure = 0.0f;
         bool down = false;
-        if (!SDL_GetGamepadTouchpadFinger(data->gamepad, 0, f, &down, &x, &y, &pressure)) continue;
+        if (!SDL_GetGamepadTouchpadFinger(data->gamepad, 0, f, &down, &x, &y, &pressure))
+            continue;
+
         gboolean touched = (gboolean)down;
         gboolean state_changed = (touched != data->touchpad_finger_state[f]);
-        if (f == 0 ? (touched || state_changed) : state_changed) {
+        gboolean moved = touched && (fabsf(x - data->touchpad_x[f]) > 0.001f ||
+                                     fabsf(y - data->touchpad_y[f]) > 0.001f);
+        if (state_changed || moved) {
             data->touchpad_finger_state[f] = touched;
+            data->touchpad_x[f] = x;
+            data->touchpad_y[f] = y;
             ConttestInputEvent ev = {
-                .ctx            = data->ctx,
                 .type           = INPUT_EVENT_TOUCHPAD,
-                .element_id     = ELEMENT_NS_TOUCHPAD_BASE + f,
+                .domain         = CONTTEST_ELEMENT_TOUCHPAD_FINGER,
+                .element_id     = f,
                 .button_pressed = touched,
                 .touch_x        = x,
                 .touch_y        = y,
@@ -191,18 +228,28 @@ static gboolean sdl3_poll_tick(gpointer user_data) {
         }
     }
 
-    /* Poll accelerometer (element_id ELEMENT_NS_ACCEL) and gyro (element_id ELEMENT_NS_GYRO). */
-    static const struct { SDL_SensorType type; int id; } sensors[] = {
-        { SDL_SENSOR_ACCEL, ELEMENT_NS_ACCEL },
-        { SDL_SENSOR_GYRO,  ELEMENT_NS_GYRO  },
+    static const struct { SDL_SensorType type; ConttestSensorKind id; float eps; } sensors[] = {
+        { SDL_SENSOR_ACCEL, CONTTEST_SENSOR_ACCEL, 0.005f },
+        { SDL_SENSOR_GYRO,  CONTTEST_SENSOR_GYRO,  0.002f },
     };
     for (int s = 0; s < 2; s++) {
-        if (!SDL_GamepadSensorEnabled(data->gamepad, sensors[s].type)) continue;
+        if (!SDL_GamepadSensorEnabled(data->gamepad, sensors[s].type))
+            continue;
         float vals[3] = {0};
-        if (!SDL_GetGamepadSensorData(data->gamepad, sensors[s].type, vals, 3)) continue;
+        if (!SDL_GetGamepadSensorData(data->gamepad, sensors[s].type, vals, 3))
+            continue;
+        if (data->sensor_has_prev[s] &&
+            fabsf(vals[0] - data->sensor_prev[s][0]) <= sensors[s].eps &&
+            fabsf(vals[1] - data->sensor_prev[s][1]) <= sensors[s].eps &&
+            fabsf(vals[2] - data->sensor_prev[s][2]) <= sensors[s].eps) {
+            continue;
+        }
+        data->sensor_has_prev[s] = TRUE;
+        memcpy(data->sensor_prev[s], vals, sizeof(vals));
+
         ConttestInputEvent ev = {
-            .ctx        = data->ctx,
             .type       = INPUT_EVENT_SENSOR,
+            .domain     = CONTTEST_ELEMENT_SENSOR,
             .element_id = sensors[s].id,
             .sensor     = { vals[0], vals[1], vals[2] },
         };
@@ -210,31 +257,36 @@ static gboolean sdl3_poll_tick(gpointer user_data) {
     }
 
     return G_SOURCE_CONTINUE;
-
 }
 
 static void free_sdl3_session(ConttestInputSession *session) {
     SdlSessionData *data = session->impl_data;
-    if (data->timer_id) {
-        /* sdl3_tick_destroyed is invoked synchronously here, releasing the
-         * ctx ref held by the timer and zeroing data->timer_id. */
-        g_source_remove(data->timer_id);
+    if (data->viewer && data->tick_id != 0) {
+        /* Invokes sdl3_tick_destroyed synchronously, clearing viewer/tick_id and releasing refs. */
+        gtk_widget_remove_tick_callback(data->viewer, data->tick_id);
     }
-    /* gamepad handle is borrowed from the device manager; do not close it. */
-    g_free(data);
+    sdl_session_data_close_gamepad(data);
+    sdl_session_data_unref(data);
 }
 
-ConttestInputSession *conttest_input_session_sdl3_start(const char *id_str, ViewerSessionContext *ctx) {
-    SDL_JoystickID id     = (SDL_JoystickID)strtoul(id_str, NULL, 10);
-    /* Borrow the handle already open by the device manager. */
-    SDL_Gamepad   *gamepad = SDL_GetGamepadFromID(id);
-    if (!gamepad) return NULL;
+_Static_assert(sizeof(SDL_JoystickID) == sizeof(uint32_t),
+               "SDL_JoystickID must match uint32_t");
+
+ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerSessionContext *ctx) {
+    if (sdl_id == 0 || !ctx)
+        return NULL;
+    SDL_JoystickID id = (SDL_JoystickID)sdl_id;
+    SDL_Gamepad *gamepad = SDL_OpenGamepad(id);
+    if (!gamepad)
+        return NULL;
 
     ConttestInputSession *session = g_new0(ConttestInputSession, 1);
     session->free_func = free_sdl3_session;
     /* session->thread remains NULL — no background thread for the SDL backend. */
 
     SdlSessionData *data = g_new0(SdlSessionData, 1);
+    data->ref_count        = 1;
+    data->sdl_id           = id;
     data->gamepad          = gamepad;
     data->joystick         = SDL_GetGamepadJoystick(gamepad);
     data->ctx              = ctx;
@@ -249,30 +301,35 @@ ConttestInputSession *conttest_input_session_sdl3_start(const char *id_str, View
      * (e.g. DS3 pressure-sensitive buttons). */
     int total_joy_axes = data->joystick ? SDL_GetNumJoystickAxes(data->joystick) : 0;
     data->joy_extra_axes = MIN(MAX(0, total_joy_axes - SDL_GAMEPAD_AXIS_COUNT), JOY_EXTRA_AXES_MAX);
+    data->joy_axis_base  = total_joy_axes - data->joy_extra_axes;
 
     /* Detect touchpad fingers on touchpad 0 (DS4 has one touchpad). */
     int num_touchpads = SDL_GetNumGamepadTouchpads(gamepad);
     if (num_touchpads > 0) {
         int fingers = SDL_GetNumGamepadTouchpadFingers(gamepad, 0);
-        data->num_touchpad_fingers = MIN(fingers, TOUCHPAD_FINGERS_MAX);
+        data->num_touchpad_fingers = CLAMP(fingers, 0, TOUCHPAD_FINGERS_MAX);
     }
 
-    /* Build layout. */
-    int max_elements = (int)(G_N_ELEMENTS(SDL_BUTTONS) + G_N_ELEMENTS(SDL_AXES)) + data->joy_extra_axes + data->num_touchpad_fingers;
-    ConttestInputElementDef *defs = g_new0(ConttestInputElementDef, max_elements);
+    /* Build layout. Reserve +1 for CONTTEST_ELEMENT_TOUCHPAD_PAD when a touchpad is present. */
+    int max_elements = (int)(G_N_ELEMENTS(SDL_BUTTONS) + G_N_ELEMENTS(SDL_AXES))
+                     + data->joy_extra_axes
+                     + (data->num_touchpad_fingers > 0 ? 1 + data->num_touchpad_fingers : 0);
+    ConttestInputElementDef *defs = g_new0(ConttestInputElementDef, (gsize)max_elements);
     int num = 0;
+
+    Uint16 vid = SDL_GetGamepadVendorForID(id);
+    Uint16 pid = SDL_GetGamepadProductForID(id);
+    /* GameCube adapter (057e:0337): rename generic SDL labels to GC names. */
+    gboolean is_gc = (vid == 0x057e && pid == 0x0337);
+    /* DualSense: MISC1 is the mute button. */
+    gboolean is_ds5 = (vid == SONY_VID &&
+                       (pid == DS5_PID_V1 || pid == DS5_PID_V2));
 
     for (size_t i = 0; i < G_N_ELEMENTS(SDL_BUTTONS); i++) {
         if (!SDL_GamepadHasButton(gamepad, SDL_BUTTONS[i].btn)) continue;
+        defs[num].domain     = CONTTEST_ELEMENT_BUTTON;
         defs[num].element_id = SDL_BUTTONS[i].btn;
 
-        /* GameCube adapter (057e:0337): rename generic SDL labels to GC names. */
-        gboolean is_gc = (SDL_GetGamepadVendorForID(id) == 0x057e &&
-                          SDL_GetGamepadProductForID(id) == 0x0337);
-        /* DualSense: MISC1 is the mute button. */
-        gboolean is_ds5 = (SDL_GetGamepadVendorForID(id) == SONY_VID &&
-                           (SDL_GetGamepadProductForID(id) == DS5_PID_V1 ||
-                            SDL_GetGamepadProductForID(id) == DS5_PID_V2));
         const char *name = SDL_BUTTONS[i].name;
         if (is_gc) {
             if (SDL_BUTTONS[i].btn == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) name = "Z";
@@ -287,7 +344,8 @@ ConttestInputSession *conttest_input_session_sdl3_start(const char *id_str, View
 
     for (size_t i = 0; i < G_N_ELEMENTS(SDL_AXES); i++) {
         if (!SDL_GamepadHasAxis(gamepad, SDL_AXES[i].axis)) continue;
-        defs[num].element_id = ELEMENT_NS_SDL_AXIS_BASE + SDL_AXES[i].axis;
+        defs[num].domain     = CONTTEST_ELEMENT_SDL_AXIS;
+        defs[num].element_id = SDL_AXES[i].axis;
         defs[num].name       = g_strdup(SDL_AXES[i].name);
         defs[num].is_axis    = TRUE;
         defs[num].is_trigger = SDL_AXES[i].is_trigger;
@@ -308,10 +366,10 @@ ConttestInputSession *conttest_input_session_sdl3_start(const char *id_str, View
         "✕", "○", "□", "△",
         "L1", "R1", "↑", "↓", "←", "→"
     };
-    int joy_axis_base = total_joy_axes - data->joy_extra_axes;
     for (int i = 0; i < data->joy_extra_axes; i++) {
-        int axis_idx = joy_axis_base + i;
-        defs[num].element_id = ELEMENT_NS_SDL_EXTRA_BASE + i;
+        int axis_idx = data->joy_axis_base + i;
+        defs[num].domain     = CONTTEST_ELEMENT_SDL_EXTRA;
+        defs[num].element_id = i;
         defs[num].is_axis    = TRUE;
         defs[num].is_trigger = TRUE;
         if (axis_idx >= 6 && axis_idx <= 15 && (axis_idx - 6) < (int)G_N_ELEMENTS(ds3_pressure_names))
@@ -321,15 +379,14 @@ ConttestInputSession *conttest_input_session_sdl3_start(const char *id_str, View
         num++;
     }
 
-    /* Touchpad: ELEMENT_NS_TOUCHPAD_SENTINEL = sentinel to create the visualizer widget.
-     * ELEMENT_NS_TOUCHPAD_BASE+f = button indicators for each finger ("Touchpad Finger N"). */
     if (data->num_touchpad_fingers > 0) {
-        defs[num].element_id = ELEMENT_NS_TOUCHPAD_SENTINEL;
-        defs[num].name       = g_strdup("Touchpad");
+        defs[num].domain = CONTTEST_ELEMENT_TOUCHPAD_PAD;
+        defs[num].name   = g_strdup(_("Touchpad"));
         num++;
         for (int f = 0; f < data->num_touchpad_fingers; f++) {
-            defs[num].element_id = ELEMENT_NS_TOUCHPAD_BASE + f;
-            defs[num].name       = g_strdup_printf("Touchpad Finger %d", f + 1);
+            defs[num].domain     = CONTTEST_ELEMENT_TOUCHPAD_FINGER;
+            defs[num].element_id = f;
+            defs[num].name       = g_strdup_printf(_("Touchpad Finger %d"), f + 1);
             num++;
         }
     }
@@ -339,17 +396,21 @@ ConttestInputSession *conttest_input_session_sdl3_start(const char *id_str, View
     layout->num_elements = num;
     layout->ctx          = ctx;
 
-    /* Always called from the main thread; g_main_context_invoke executes
-     * handle_layout synchronously, so the ref is acquired and released inline. */
-    g_atomic_int_inc(&ctx->ref_count);
+    viewer_session_context_ref(ctx);
     g_main_context_invoke(NULL, conttest_input_viewer_handle_layout, layout);
 
-    /* Start the main-thread polling timer at ~1000 Hz (1 ms) for low-latency
-     * input visualization. Average added latency: ~0.5 ms. The GDestroyNotify
-     * holds one ctx ref for the lifetime of the timer source. */
-    g_atomic_int_inc(&ctx->ref_count);
-    data->timer_id = g_timeout_add_full(G_PRIORITY_DEFAULT, 1,
-                                        sdl3_poll_tick, data, sdl3_tick_destroyed);
+    if (ctx->viewer) {
+        viewer_session_context_ref(ctx);
+        g_atomic_int_inc(&data->ref_count);
+        data->viewer = GTK_WIDGET(ctx->viewer);
+        data->tick_id = gtk_widget_add_tick_callback(data->viewer, sdl3_poll_tick,
+                                                     data, sdl3_tick_destroyed);
+        if (data->tick_id == 0) {
+            data->viewer = NULL;
+            sdl_session_data_unref(data);
+            viewer_session_context_unref(ctx);
+        }
+    }
 
     return session;
 }

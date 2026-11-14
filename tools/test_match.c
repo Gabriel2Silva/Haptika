@@ -28,10 +28,12 @@ int main(int argc, char *argv[]) {
     struct udev_device *dev = udev_device_new_from_devnum(
         u, S_ISBLK(st.st_mode) ? 'b' : 'c', st.st_rdev);
     if (dev) {
+        const char *subsys = udev_device_get_subsystem(dev);
+        const char *devtype = udev_device_get_devtype(dev);
         printf("Device for %s:\n", path);
         printf("  syspath:   %s\n", udev_device_get_syspath(dev));
-        printf("  subsystem: %s\n", udev_device_get_subsystem(dev) ?: "(null)");
-        printf("  devtype:   %s\n", udev_device_get_devtype(dev) ?: "(null)");
+        printf("  subsystem: %s\n", subsys ? subsys : "(null)");
+        printf("  devtype:   %s\n", devtype ? devtype : "(null)");
         udev_device_unref(dev);
     } else {
         printf("No udev device for %s\n", path);

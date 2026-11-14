@@ -16,6 +16,7 @@ GtkWidget *conttest_window_new(GtkApplication *app);
 void conttest_window_show_selector(ConttestWindow *self);
 void conttest_window_show_input_viewer(ConttestWindow *self, ConttestDevice *device, ConttestBackend backend);
 void conttest_window_show_toast(ConttestWindow *self, const char *message);
+void conttest_window_apply_theme(const char *style);
 
 ConttestDeviceManager *conttest_window_get_device_manager(ConttestWindow *self);
 

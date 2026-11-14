@@ -29,11 +29,12 @@ int main(void) {
             struct udev_device *parent =
                 udev_device_get_parent_with_subsystem_devtype(dev, "input", NULL);
 
+            const char *name_prop = udev_device_get_property_value(dev, "NAME");
+            const char *sys_name = parent ? udev_device_get_sysattr_value(parent, "name") : NULL;
             printf("Node: %s\n", node);
-            printf("  NAME (prop):       %s\n",
-                   udev_device_get_property_value(dev, "NAME") ?: "(null)");
+            printf("  NAME (prop):       %s\n", name_prop ? name_prop : "(null)");
             printf("  name (parent attr): %s\n",
-                   parent ? (udev_device_get_sysattr_value(parent, "name") ?: "(null)") : "(no parent)");
+                   parent ? (sys_name ? sys_name : "(null)") : "(no parent)");
         }
         udev_device_unref(dev);
     }

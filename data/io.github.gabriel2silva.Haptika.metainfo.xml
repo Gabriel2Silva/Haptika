@@ -33,7 +33,6 @@
     <color type="primary" scheme_preference="dark">#1d4372</color>
   </branding>
 
-
   <supports>
     <control>keyboard</control>
     <control>pointing</control>
@@ -51,7 +50,7 @@
   <screenshots>
     <screenshot type="default">
       <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/01-controller-list.png</image>
-      <caption>Controller selection screen with proper SVG icons</caption>
+      <caption>Controller selection screen</caption>
     </screenshot>
     <screenshot>
       <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/02-input-viewer.png</image>

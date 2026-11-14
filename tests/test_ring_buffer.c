@@ -1,0 +1,229 @@
+#include "input_session.h"
+#include <glib.h>
+
+static void test_ring_empty_and_types(void) {
+    ConttestEventRing ring = {0};
+    ConttestInputEvent out = {0};
+
+    g_assert_false(conttest_event_ring_pop(&ring, &out));
+
+    ConttestInputEvent btn = {
+        .type = INPUT_EVENT_BUTTON,
+        .domain = CONTTEST_ELEMENT_BUTTON,
+        .element_id = 3,
+        .button_pressed = TRUE,
+    };
+    ConttestInputEvent axis = {
+        .type = INPUT_EVENT_AXIS,
+        .domain = CONTTEST_ELEMENT_SDL_AXIS,
+        .element_id = 1,
+        .axis_value = -0.625,
+    };
+    ConttestInputEvent tp = {
+        .type = INPUT_EVENT_TOUCHPAD,
+        .domain = CONTTEST_ELEMENT_TOUCHPAD_FINGER,
+        .element_id = 0,
+        .button_pressed = TRUE,
+        .touch_x = 0.25f,
+        .touch_y = 0.75f,
+    };
+    ConttestInputEvent sensor = {
+        .type = INPUT_EVENT_SENSOR,
+        .domain = CONTTEST_ELEMENT_SENSOR,
+        .element_id = CONTTEST_SENSOR_GYRO,
+        .sensor = { 1.25f, -2.5f, 3.75f },
+    };
+
+    g_assert_true(conttest_event_ring_push(&ring, &btn));
+    g_assert_true(conttest_event_ring_push(&ring, &axis));
+    g_assert_true(conttest_event_ring_push(&ring, &tp));
+    g_assert_true(conttest_event_ring_push(&ring, &sensor));
+
+    g_assert_true(conttest_event_ring_pop(&ring, &out));
+    g_assert_cmpint(out.type, ==, INPUT_EVENT_BUTTON);
+    g_assert_cmpint(out.domain, ==, CONTTEST_ELEMENT_BUTTON);
+    g_assert_cmpint(out.element_id, ==, 3);
+    g_assert_true(out.button_pressed);
+
+    g_assert_true(conttest_event_ring_pop(&ring, &out));
+    g_assert_cmpint(out.type, ==, INPUT_EVENT_AXIS);
+    g_assert_cmpint(out.domain, ==, CONTTEST_ELEMENT_SDL_AXIS);
+    g_assert_cmpint(out.element_id, ==, 1);
+    g_assert_cmpfloat(out.axis_value, ==, -0.625);
+
+    g_assert_true(conttest_event_ring_pop(&ring, &out));
+    g_assert_cmpint(out.type, ==, INPUT_EVENT_TOUCHPAD);
+    g_assert_cmpint(out.domain, ==, CONTTEST_ELEMENT_TOUCHPAD_FINGER);
+    g_assert_cmpfloat(out.touch_x, ==, 0.25f);
+    g_assert_cmpfloat(out.touch_y, ==, 0.75f);
+
+    g_assert_true(conttest_event_ring_pop(&ring, &out));
+    g_assert_cmpint(out.type, ==, INPUT_EVENT_SENSOR);
+    g_assert_cmpint(out.domain, ==, CONTTEST_ELEMENT_SENSOR);
+    g_assert_cmpint(out.element_id, ==, CONTTEST_SENSOR_GYRO);
+    g_assert_cmpfloat(out.sensor[0], ==, 1.25f);
+    g_assert_cmpfloat(out.sensor[1], ==, -2.5f);
+    g_assert_cmpfloat(out.sensor[2], ==, 3.75f);
+
+    g_assert_false(conttest_event_ring_pop(&ring, &out));
+}
+
+static void test_ring_capacity_and_overflow(void) {
+    ConttestEventRing ring = {0};
+    const int max_items = CONTTEST_EVENT_RING_CAP - 1;
+
+    for (int i = 0; i < max_items; i++) {
+        ConttestInputEvent ev = { .type = INPUT_EVENT_BUTTON, .element_id = i };
+        g_assert_true(conttest_event_ring_push(&ring, &ev));
+    }
+    g_assert_false(atomic_load(&ring.overflow));
+
+    ConttestInputEvent extra = { .type = INPUT_EVENT_BUTTON, .element_id = 999999 };
+    g_assert_false(conttest_event_ring_push(&ring, &extra));
+    g_assert_true(atomic_load(&ring.overflow));
+
+    ConttestInputEvent out = {0};
+    g_assert_true(conttest_event_ring_pop(&ring, &out));
+    g_assert_cmpint(out.element_id, ==, 0);
+
+    ConttestInputEvent tail = { .type = INPUT_EVENT_BUTTON, .element_id = max_items };
+    g_assert_true(conttest_event_ring_push(&ring, &tail));
+
+    for (int i = 1; i <= max_items; i++) {
+        g_assert_true(conttest_event_ring_pop(&ring, &out));
+        g_assert_cmpint(out.element_id, ==, i);
+    }
+    g_assert_false(conttest_event_ring_pop(&ring, &out));
+}
+
+static void test_ring_wraparound(void) {
+    ConttestEventRing ring = {0};
+    int next_push = 0;
+    int next_pop = 0;
+
+    for (int round = 0; round < 20; round++) {
+        for (int i = 0; i < 500; i++) {
+            ConttestInputEvent ev = {
+                .type = INPUT_EVENT_AXIS,
+                .element_id = next_push,
+                .axis_value = (double)next_push * 0.25,
+            };
+            g_assert_true(conttest_event_ring_push(&ring, &ev));
+            next_push++;
+        }
+        for (int i = 0; i < 500; i++) {
+            ConttestInputEvent out = {0};
+            g_assert_true(conttest_event_ring_pop(&ring, &out));
+            g_assert_cmpint(out.element_id, ==, next_pop);
+            g_assert_cmpfloat(out.axis_value, ==, (double)next_pop * 0.25);
+            next_pop++;
+        }
+    }
+    g_assert_false(atomic_load(&ring.overflow));
+}
+
+typedef struct {
+    ConttestEventRing *ring;
+    int count;
+} ProducerCtx;
+
+static gpointer spsc_producer(gpointer data) {
+    ProducerCtx *ctx = data;
+    for (int i = 0; i < ctx->count; i++) {
+        ConttestInputEvent ev = {
+            .type = INPUT_EVENT_AXIS,
+            .element_id = i,
+            .axis_value = (double)i * 0.5,
+        };
+        while (!conttest_event_ring_push(ctx->ring, &ev)) {
+            g_thread_yield();
+        }
+    }
+    return NULL;
+}
+
+static void test_ring_concurrent_spsc(void) {
+    ConttestEventRing *ring = g_new0(ConttestEventRing, 1);
+    const int total = 200000;
+    ProducerCtx ctx = { .ring = ring, .count = total };
+
+    GThread *prod = g_thread_new("spsc-prod", spsc_producer, &ctx);
+    for (int i = 0; i < total; i++) {
+        ConttestInputEvent out = {0};
+        while (!conttest_event_ring_pop(ring, &out)) {
+            g_thread_yield();
+        }
+        g_assert_cmpint(out.type, ==, INPUT_EVENT_AXIS);
+        g_assert_cmpint(out.element_id, ==, i);
+        g_assert_cmpfloat(out.axis_value, ==, (double)i * 0.5);
+    }
+
+    g_thread_join(prod);
+    ConttestInputEvent trailing = {0};
+    g_assert_false(conttest_event_ring_pop(ring, &trailing));
+    g_free(ring);
+}
+
+static void test_evdev_axis_classification(void) {
+    gboolean z_rz_stick = FALSE, rx_ry_trig = FALSE;
+
+    /* Xbox / xpad: RX/RY signed stick, Z/RZ unsigned triggers. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = -32768, .maximum = 32767, .value = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = -32768, .maximum = 32767, .value = 0 },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_false(z_rz_stick);
+    g_assert_false(rx_ry_trig);
+
+    /* hid-playstation DS4/DS5: 0..255 with flat>0 on sticks (RX/RY), flat==0 & value==0 on Z/RZ. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0, .flat = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0, .flat = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 128, .flat = 8 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 128, .flat = 8 },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_false(z_rz_stick);
+    g_assert_false(rx_ry_trig);
+
+    /* hid-sony DS4: 0..255 everywhere, Z/RZ rest centered (~128), RX/RY triggers rest at 0. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 128, .flat = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 128, .flat = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0, .flat = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0, .flat = 0 },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_true(z_rz_stick);
+    g_assert_true(rx_ry_trig);
+
+    /* hid-sony DS3: only Z/RZ present (resting centered ~128), no RX/RY. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 128 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 127 },
+        (ConttestAbsAxisInfo){ .present = false },
+        (ConttestAbsAxisInfo){ .present = false },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_true(z_rz_stick);
+    g_assert_false(rx_ry_trig);
+
+    /* Single-stick pad with unipolar triggers on Z/RZ resting at 0, no RX/RY. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0 },
+        (ConttestAbsAxisInfo){ .present = false },
+        (ConttestAbsAxisInfo){ .present = false },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_false(z_rz_stick);
+    g_assert_false(rx_ry_trig);
+}
+
+int main(int argc, char *argv[]) {
+    g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/ring/empty_and_types", test_ring_empty_and_types);
+    g_test_add_func("/ring/capacity_and_overflow", test_ring_capacity_and_overflow);
+    g_test_add_func("/ring/wraparound", test_ring_wraparound);
+    g_test_add_func("/ring/concurrent_spsc", test_ring_concurrent_spsc);
+    g_test_add_func("/evdev/axis_classification", test_evdev_axis_classification);
+    return g_test_run();
+}

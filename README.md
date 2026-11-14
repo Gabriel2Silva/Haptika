@@ -11,117 +11,100 @@
 
 ---
 
-Haptika is a native Linux application for testing and inspecting game controllers. It lets you verify that every button, stick, trigger, touchpad, and sensor on your gamepad is working correctly, with real-time visual feedback and sub-millisecond input latency.
+Haptika is a native Linux application for testing and inspecting game controllers. It lets you verify buttons, analog sticks, triggers, touchpads, motion sensors, vibration, and DualSense speakers with live visual feedback.
 
-Unlike browser-based gamepad testers or aging CLI tools, Haptika is a proper desktop application that integrates perfectly with the GNOME desktop, follows the GNOME Human Interface Guidelines, and talks directly to the kernel's input subsystem for maximum accuracy.
-
-## Why Haptika?
-
-| | Haptika | jstest-gtk | Browser testers |
-|---|---|---|---|
-| Real-time visual feedback | ✅ | ✅ | ✅ |
-| Analog stick visualization | ✅ | ✅ | ✅ |
-| Pressure-sensitive buttons (DS3) | ✅ | ❌ | ❌ |
-| Touchpad tracking (DS4/DS5) | ✅ | ❌ | ❌ |
-| Motion sensors (accel/gyro) | ✅ | ⚠️ | ⚠️ |
-| Battery & connection info | ✅ | ❌ | ❌ |
-| Controller hardware info | ✅ | ❌ | ❌ |
-| Clone/authenticity detection | ✅ | ❌ | ❌ |
-| Speaker testing | ✅ | ❌ | ❌ |
-| Vibration/rumble testing | ✅ | ❌ | ⚠️ |
-| Hotplug support | ✅ | ❌ | ✅ |
-| SDL3 + evdev dual backend | ✅ | ❌ | ❌ |
+Built for the GNOME desktop in pure C11, GTK 4, and Libadwaita, Haptika follows the GNOME Human Interface Guidelines and supports both SDL3 and raw Linux evdev backends.
 
 ## Features
 
 ### Input Testing
-- **Buttons/D-PAD** — every button lights up in real time when pressed
-- **Analog sticks** — circular visualizer showing precise stick position and travel
-- **Triggers** — vertical bar indicators for analog trigger depth
+- **Buttons & D-pad** — lights up each button in real time with accessible state reporting
+- **Analog sticks** — circular position visualizers showing continuous travel and deflection
+- **Triggers & axes** — unipolar and centered bipolar bars for triggers, analog face buttons, and gyroscope axes
 
 ### Advanced Input
-- **Touchpad finger tracking** — real-time visualization of finger position on DualShock 4 and DualSense touchpads
-- **Motion sensors** — tilt indicator for accelerometer data and bar graphs for gyroscope X/Y/Z axes
-- **Pressure-sensitive buttons** — reads the analog pressure values from DualShock 3 face buttons, shoulder buttons, and D-pad **(the only Linux tool that does this)**
+- **Touchpad finger tracking** — live multi-touch finger tracking on DualShock 4 and DualSense touchpads
+- **Motion sensors** — 2D tilt visualizer for accelerometer data and bipolar bar indicators for gyroscope X/Y/Z axes
+- **Pressure-sensitive buttons** — reads analog pressure axes exposed on DualShock 3 controllers
 
 ### Dual Backend
-- **SDL3** — the default backend, provides standardized button/axis mapping, rumble, touchpad, sensors, and battery info for most controllers
-- **evdev** — raw Linux input backend, shows every axis and button the kernel exposes without any mapping layer
-- **One-click switching** — toggle between SDL3 and evdev on the same controller without disconnecting
+- **SDL3** — default backend providing standardized gamepad mapping, vibration, touchpad, motion sensors, and battery telemetry
+- **evdev** — raw kernel input backend exposing every axis and button reported by `libevdev` without a mapping layer
+- **One-click switching** — switch between SDL3 and evdev on any controller directly from the header bar
 
-### Hardware Information
-- **DualShock 3** — Bluetooth address, clone/authenticity detection
-- **DualShock 4** — firmware build date, hardware/software version, board model (JDM-001 through JDM-055), Bluetooth address, clone/authenticity detection
-- **DualSense / DualSense Edge** — firmware versions (main, SBL, Venom, Spider), board model (BDM-010 through BDM-060X), serial number, color variant, MCU unique ID, PCBA ID, battery barcode, VCM barcodes, Bluetooth address
+### Hardware & InputPlumber Inspection
+- **DualShock 3** — Bluetooth address lookup and Sony OUI authenticity check
+- **DualShock 4** — firmware build date, hardware/software version, PCB board model (`JDM-001` through `JDM-055`), Bluetooth address, and USB hardware authenticity check
+- **DualSense / DualSense Edge** — firmware versions (main, SBL, Venom, Spider), PCB board model (`BDM-010` through `BDM-060X`), plus USB-only factory serial number, color variant, MCU unique ID, PCBA ID, battery/VCM barcodes, and Bluetooth address
+- **InputPlumber inspection** — detects virtual UHID/uinput controllers managed by InputPlumber, matches them to their `CompositeDevice` over D-Bus, and displays virtual bus/address, active profile, output capabilities, and physical source devices
 
 ### Device Management
-- **Hotplug** — controllers are detected and removed in real time
-- **Battery status** — percentage and charging state displayed in the header bar and device list
-- **Connection type** — Bluetooth or USB indicator
-- **Controller icons** — 30+ custom SVG icons for PlayStation, Xbox, Nintendo, Sega, Atari, and other controller families
+- **Hotplug** — live detection and removal via SDL3 and `libudev`
+- **Battery telemetry** — charge percentage and charging state in the device list and viewer header bar (including sysfs power supply fallback for DualShock 3)
+- **Connection type** — wired USB vs wireless Bluetooth status resolved via SDL3 and sysfs/udev bustype
+- **Custom iconography** — 31 custom `-symbolic.svg` controller icons across PlayStation, Xbox, Nintendo, Sega, Atari, and other families
+- **Theme switcher** — Follow System, Light, and Dark styles persisted via GSettings
 
 ### Output Testing
-- **Vibration** — adjustable low-frequency and high-frequency motor intensity
-- **Speaker** — plays a 440 Hz test tone through the DualSense's built-in speaker via PipeWire (USB only)
+- **Vibration** — independent low-frequency and high-frequency motor intensity sliders and test trigger
+- **Speaker** — plays a 440 Hz test tone through the DualSense controller's built-in speaker via PipeWire (available when connected over USB)
 
 ## Installation
 
 ### Dependencies
 
 - GCC or Clang (C11)
-- Meson ≥ 0.59
+- Meson and Ninja
 - GTK 4
 - Libadwaita 1
 - SDL3 ≥ 3.2.0
 - libevdev ≥ 1.11.0
 - libudev ≥ 249
-- libpipewire 0.3 (optional, for speaker testing)
+- libpipewire-0.3 (optional, for DualSense speaker testing)
 
-### Building from source
+### Building, testing, and installing from source
 
 ```bash
 meson setup build --prefix=$HOME/.local
-ninja -C build
-ninja -C build install
+meson compile -C build
+meson test -C build
+meson install -C build
 ```
 
-Then run `haptika` from your terminal or find it in your application launcher.
+Then run `haptika` from your terminal or launch it from your application menu.
 
 ## Usage
 
 1. Launch Haptika
-2. Connect a controller — it appears in the device list automatically
-3. Click a controller to open the input viewer
-4. Press buttons, move sticks, pull triggers — everything updates in real time
-5. Use the header bar buttons to:
-   - Switch between SDL3 and evdev backends
-   - View controller hardware info (Sony controllers)
-   - See battery level and connection type
+2. Connect a controller — it appears automatically in the device list
+3. Select a controller to open the input viewer
+4. Test buttons, sticks, triggers, touchpad, motion sensors, vibration, and speakers
+5. Use the header bar controls to switch between SDL3 and evdev, inspect Sony hardware info or InputPlumber details, and monitor battery/connection status
 
 ### Permissions
 
-Haptika needs read access to `/dev/input/event*` devices. If your controller doesn't appear, you may need to add your user to the `input` group:
+Haptika needs read access to `/dev/input/event*` devices. If your controller does not appear, add your user to the `input` group and log out and back in:
 
 ```bash
 sudo usermod -aG input $USER
 ```
 
-Then log out and back in.
-
-For DualShock 4/DualSense hardware info, Haptika also needs access to `/dev/hidraw*` devices. On most modern distributions this works automatically. If the info dialog shows an error, your system may need a udev rule granting access to Sony HID devices.
+DualShock 4 and DualSense hardware info also reads `/dev/hidraw*`. Most modern distributions grant access to active desktop sessions via udev `uaccess`; if reading hardware info fails, check your hidraw udev rules for Sony devices (`054c:*`).
 
 ## Technical Details
 
-Haptika is written in pure C11 with no C++ dependencies. The UI is built entirely in code (no `.ui` XML files) using GTK 4 and Libadwaita widgets. Custom widgets for analog sticks, touchpad, tilt indicator, and button indicators use `GtkDrawingArea` with Cairo rendering.
+Haptika is written in pure C11 (`c_std=c11`) plus optional x86-64 GNU assembly DSP kernels, with no C++ source code or external UI XML files — all interface layout and dialogs are constructed in code using GTK 4 and Libadwaita.
 
-The architecture follows a clean module separation:
+Custom input visualizers (`ConttestAnalogStick`, `ConttestTiltIndicator`, `ConttestTouchpad`, `ConttestTriggerBar`) subclass `GtkWidget` directly and emit GPU render nodes (`GskPath` fills/strokes, rounded clips, and solid color nodes) through `GtkSnapshot` rather than CPU-rasterized Cairo surfaces.
 
-- **device_manager** — unified device tracking across SDL3 and udev, with topological hardware matching to merge both views of the same physical device
-- **input_session** — abstract polling interface with SDL3 and evdev implementations
-- **input_viewer** — dynamic UI that builds itself from the device's reported capabilities
-- **widgets/** — reusable custom GTK 4 widgets for gamepad visualization
+The codebase is organized into focused modules:
 
-The SDL3 backend polls at 1000 Hz (1 ms timer) for sub-millisecond input latency. The evdev backend uses `poll()` for event-driven, zero-latency input processing. So Haptika can also be used as an input lag tester of sorts!
+- **`device_manager` / `device_matching`** — tracks controllers across SDL3 and `libudev`, correlates SDL devices and evdev syspaths via common `hid`/`bluetooth`/`input`/`usb_interface` ancestors, resolves wired vs wireless bus types, and hides source evdev nodes claimed by InputPlumber
+- **`inputplumber` / `inputplumber_logic` / `inputplumber_info`** — monitors `org.shadowblip.InputPlumber` over D-Bus, matches deterministic UHID devices via FNV-1a MAC derivation and uinput devices without ambiguous cross-attribution, and presents virtual/source metadata
+- **`input_session_sdl3` / `input_session_evdev` / `input_session`** — `input_session_sdl3` samples controller state on display vsync via `gtk_widget_add_tick_callback`; `input_session_evdev` runs a `poll()` worker thread pushing normalized kernel events into a lock-free C11 SPSC ring buffer (`ConttestEventRing`) scheduled onto the GTK main loop
+- **`speaker_test` / `speaker_routing` / `dsp_oscillator`** — performs two-phase PipeWire registry and `pw_node_info` discovery to target the DualSense ALSA speaker sink without fallback routing, masks haptic channels silent, and synthesizes a 440 Hz tone using a pure C11 oscillator or runtime-dispatched x86-64 `AVX2+FMA` / `SSE2` assembly kernels (`src/dsp_oscillator_x86_64.S`)
+- **`controller_info_parsers` / `controller_info_utils` / `ds*_info`** — asynchronous `GTask` hidraw feature-report and udev OUI parsers with UTF-8 sanitization
+- **`widgets/`** — custom `GtkWidget` indicators and GPU `GtkSnapshot` vector drawing utilities (`drawing_utils.c`)
 
 ## License
 

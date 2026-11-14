@@ -1,125 +1,172 @@
 #include "tilt_indicator.h"
-#include <pango/pangocairo.h>
+#include "drawing_utils.h"
+#include <glib/gi18n.h>
 #include <math.h>
+
+#define TILT_MIN_SIZE 100
+#define TILT_NAT_SIZE 100
+/* Frame-rate-independent smoothing time constant (seconds).
+ * TAU = 0.10 s reproduces alpha ~ 0.15 at 60 Hz across all refresh rates. */
+#define TILT_TAU_SEC  0.10f
+#define TILT_EPS      0.01f
 
 struct _ConttestTiltIndicator {
     GtkWidget  parent_instance;
-    GtkWidget *drawing_area;
-    float      sax, say, saz; /* EMA-smoothed values */
-    PangoLayout *layout;
+    GtkWidget *label;
+    int        canvas_w;
+    int        canvas_h;
+    float      target_x;
+    float      target_y;
+    float      target_z;
+    float      sax;
+    float      say;
+    float      saz;
+    guint      tick_id;
+    gint64     last_frame_time_us;
 };
 
 G_DEFINE_TYPE(ConttestTiltIndicator, conttest_tilt_indicator, GTK_TYPE_WIDGET)
 
-static void draw_tilt(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
-    ConttestTiltIndicator *self = CONTTEST_TILT_INDICATOR(user_data);
-    (void)area;
+static void stop_tilt_tick(ConttestTiltIndicator *self) {
+    if (self->tick_id != 0) {
+        gtk_widget_remove_tick_callback(GTK_WIDGET(self), self->tick_id);
+        self->tick_id = 0;
+    }
+    self->last_frame_time_us = 0;
+}
 
-    double cx = width / 2.0, cy = height / 2.0;
-    double radius = MIN(cx, cy) - 2.0;
+static gboolean on_tilt_tick(GtkWidget *widget,
+                             GdkFrameClock *frame_clock,
+                             gpointer user_data) {
+    (void)user_data;
+    ConttestTiltIndicator *self = CONTTEST_TILT_INDICATOR(widget);
 
-    /* Boundary circle */
-    cairo_set_source_rgba(cr, 0.5, 0.5, 0.5, 0.3);
-    cairo_arc(cr, cx, cy, radius, 0, 2 * G_PI);
-    cairo_stroke(cr);
+    gint64 now = gdk_frame_clock_get_frame_time(frame_clock);
+    float dt = 1.0f / 60.0f;
+    if (self->last_frame_time_us > 0) {
+        dt = (float)(now - self->last_frame_time_us) * 1e-6f;
+        dt = CLAMP(dt, 0.0f, 0.1f);
+    }
+    self->last_frame_time_us = now;
 
-    /* Crosshair */
-    cairo_set_source_rgba(cr, 0.5, 0.5, 0.5, 0.1);
-    cairo_move_to(cr, cx, cy - radius); cairo_line_to(cr, cx, cy + radius);
-    cairo_move_to(cr, cx - radius, cy); cairo_line_to(cr, cx + radius, cy);
-    cairo_stroke(cr);
+    float alpha = 1.0f - expf(-dt / TILT_TAU_SEC);
+    self->sax += alpha * (self->target_x - self->sax);
+    self->say += alpha * (self->target_y - self->say);
+    self->saz += alpha * (self->target_z - self->saz);
 
-    /* Derive roll and pitch from accelerometer.
-     * roll  = tilt left/right  → maps to X axis of the circle
-     * pitch = tilt forward/back → maps to Y axis of the circle
-     * Clamp to ±1 so the dot stays inside. */
-    float mag = sqrtf(self->sax * self->sax + self->say * self->say + self->saz * self->saz);
-    double norm_x = 0.0, norm_y = 0.0;
-    if (mag > 0.1f) {
-        norm_x = CLAMP(-self->sax / mag, -1.0, 1.0);  /* roll  (invert: tilt left → dot left) */
-        norm_y = CLAMP(-self->say / mag, -1.0, 1.0);  /* pitch (invert so forward = up) */
+    gtk_widget_queue_draw(widget);
+
+    if (fabsf(self->target_x - self->sax) < TILT_EPS &&
+        fabsf(self->target_y - self->say) < TILT_EPS &&
+        fabsf(self->target_z - self->saz) < TILT_EPS) {
+        self->sax = self->target_x;
+        self->say = self->target_y;
+        self->saz = self->target_z;
+        self->tick_id = 0;
+        self->last_frame_time_us = 0;
+        return G_SOURCE_REMOVE;
     }
 
-    double dot_r = radius * 0.15;
-    double travel = radius - dot_r;
-    double dx = norm_x * travel;
-    double dy = norm_y * travel;
-    /* Clamp to circle boundary */
-    double dist = sqrt(dx * dx + dy * dy);
-    if (dist > travel) { dx *= travel / dist; dy *= travel / dist; }
-
-    cairo_set_source_rgba(cr, 0.2, 0.6, 1.0, 0.8);
-    cairo_arc(cr, cx + dx, cy + dy, dot_r, 0, 2 * G_PI);
-    cairo_fill(cr);
-
-    /* Label */
-    if (self->layout) {
-        pango_cairo_update_layout(cr, self->layout);
-        int text_width;
-        pango_layout_get_pixel_size(self->layout, &text_width, NULL);
-
-        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.5);
-        cairo_move_to(cr, cx - text_width / 2.0, cy + radius + 4.0);
-        pango_cairo_show_layout(cr, self->layout);
-    }
+    return G_SOURCE_CONTINUE;
 }
 
 static void conttest_tilt_indicator_dispose(GObject *object) {
     ConttestTiltIndicator *self = CONTTEST_TILT_INDICATOR(object);
-    if (self->drawing_area) { gtk_widget_unparent(self->drawing_area); self->drawing_area = NULL; }
-    g_clear_object(&self->layout);
+    stop_tilt_tick(self);
+    g_clear_pointer(&self->label, gtk_widget_unparent);
     G_OBJECT_CLASS(conttest_tilt_indicator_parent_class)->dispose(object);
 }
 
-static void conttest_tilt_indicator_measure(GtkWidget *widget, GtkOrientation orientation,
-                                            int for_size, int *minimum, int *natural,
-                                            int *minimum_baseline, int *natural_baseline) {
-    (void)widget; (void)for_size; (void)minimum_baseline; (void)natural_baseline; (void)orientation;
-    *minimum = *natural = 100;
+static void conttest_tilt_indicator_measure(GtkWidget *widget,
+                                            GtkOrientation orientation,
+                                            int for_size,
+                                            int *minimum,
+                                            int *natural,
+                                            int *minimum_baseline,
+                                            int *natural_baseline) {
+    ConttestTiltIndicator *self = CONTTEST_TILT_INDICATOR(widget);
+    conttest_captioned_widget_measure(self->label, orientation, for_size,
+                                      TILT_MIN_SIZE, TILT_MIN_SIZE,
+                                      TILT_NAT_SIZE, TILT_NAT_SIZE,
+                                      minimum, natural,
+                                      minimum_baseline, natural_baseline);
 }
 
-static void conttest_tilt_indicator_size_allocate(GtkWidget *widget, int width, int height, int baseline) {
+static void conttest_tilt_indicator_size_allocate(GtkWidget *widget,
+                                                  int width,
+                                                  int height,
+                                                  int baseline) {
+    (void)baseline;
     ConttestTiltIndicator *self = CONTTEST_TILT_INDICATOR(widget);
-    gtk_widget_size_allocate(self->drawing_area, &(GtkAllocation){0, 0, width, height}, baseline);
+    conttest_captioned_widget_allocate(self->label, width, height,
+                                       &self->canvas_w, &self->canvas_h);
+}
+
+static void conttest_tilt_indicator_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
+    ConttestTiltIndicator *self = CONTTEST_TILT_INDICATOR(widget);
+
+    /* Derive roll and pitch from accelerometer:
+     * roll  = tilt left/right   -> maps to X axis of the circle
+     * pitch = tilt forward/back -> maps to Y axis of the circle */
+    float mag = sqrtf(self->sax * self->sax +
+                      self->say * self->say +
+                      self->saz * self->saz);
+    float norm_x = 0.0f;
+    float norm_y = 0.0f;
+    if (mag > 0.1f) {
+        norm_x = CLAMP(-self->sax / mag, -1.0f, 1.0f);
+        norm_y = CLAMP(-self->say / mag, -1.0f, 1.0f);
+    }
+
+    conttest_snapshot_circular_indicator(widget, snapshot,
+                                         (float)self->canvas_w,
+                                         (float)self->canvas_h,
+                                         norm_x, norm_y);
+    if (self->label && gtk_widget_get_visible(self->label))
+        gtk_widget_snapshot_child(widget, self->label, snapshot);
 }
 
 static void conttest_tilt_indicator_init(ConttestTiltIndicator *self) {
-    self->saz = -9.81f; /* rest position: gravity pointing down */
-
-    self->drawing_area = gtk_drawing_area_new();
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(self->drawing_area), draw_tilt, self, NULL);
-    gtk_widget_set_parent(self->drawing_area, GTK_WIDGET(self));
-
-    self->layout = gtk_widget_create_pango_layout(GTK_WIDGET(self), "Tilt");
-    PangoFontDescription *desc = pango_font_description_from_string("Sans 10");
-    pango_layout_set_font_description(self->layout, desc);
-    pango_font_description_free(desc);
+    self->target_z = -9.81f; /* rest position: gravity pointing down */
+    self->saz = -9.81f;
+    self->label = conttest_captioned_widget_create_label(GTK_WIDGET(self), _("Tilt"));
+    conttest_widget_connect_style_redraw(GTK_WIDGET(self));
 }
 
 static void conttest_tilt_indicator_class_init(ConttestTiltIndicatorClass *klass) {
-    G_OBJECT_CLASS(klass)->dispose = conttest_tilt_indicator_dispose;
+    GObjectClass *oclass = G_OBJECT_CLASS(klass);
     GtkWidgetClass *wclass = GTK_WIDGET_CLASS(klass);
-    wclass->measure       = conttest_tilt_indicator_measure;
+
+    oclass->dispose = conttest_tilt_indicator_dispose;
+    wclass->measure = conttest_tilt_indicator_measure;
     wclass->size_allocate = conttest_tilt_indicator_size_allocate;
+    wclass->snapshot = conttest_tilt_indicator_snapshot;
 
     gtk_widget_class_set_accessible_role(wclass, GTK_ACCESSIBLE_ROLE_IMG);
 }
 
 GtkWidget *conttest_tilt_indicator_new(void) {
-    GtkWidget *w = GTK_WIDGET(g_object_new(CONTTEST_TYPE_TILT_INDICATOR, NULL));
-    gtk_accessible_update_property(GTK_ACCESSIBLE(w),
-        GTK_ACCESSIBLE_PROPERTY_LABEL, "Tilt",
-        -1);
-    return w;
+    return GTK_WIDGET(g_object_new(CONTTEST_TYPE_TILT_INDICATOR, NULL));
 }
 
 void conttest_tilt_indicator_set_accel(ConttestTiltIndicator *self, float ax, float ay, float az) {
-    /* EMA smoothing: α=0.15 keeps the dot stable while still feeling responsive */
+    g_return_if_fail(CONTTEST_IS_TILT_INDICATOR(self));
+    if (isnan(ax) || isnan(ay) || isnan(az))
+        return;
 
-    #define TILT_ALPHA 0.15f
-    self->sax = TILT_ALPHA * ax + (1.0f - TILT_ALPHA) * self->sax;
-    self->say = TILT_ALPHA * ay + (1.0f - TILT_ALPHA) * self->say;
-    self->saz = TILT_ALPHA * az + (1.0f - TILT_ALPHA) * self->saz;
-    #undef TILT_ALPHA
-    gtk_widget_queue_draw(self->drawing_area);
+    self->target_x = ax;
+    self->target_y = ay;
+    self->target_z = az;
+
+    if (fabsf(ax - self->sax) < TILT_EPS &&
+        fabsf(ay - self->say) < TILT_EPS &&
+        fabsf(az - self->saz) < TILT_EPS) {
+        return;
+    }
+
+    if (self->tick_id == 0) {
+        self->last_frame_time_us = 0;
+        self->tick_id = gtk_widget_add_tick_callback(GTK_WIDGET(self),
+                                                     on_tilt_tick, NULL, NULL);
+    }
 }

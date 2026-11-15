@@ -1,5 +1,7 @@
 project('haptika', 'c',
   version: '1.0.0',
+  license: 'GPL-3.0-or-later',
+  meson_version: '>= 0.63.0',
   default_options: [
     'c_std=c11',
     'warning_level=2'
@@ -8,10 +10,12 @@ project('haptika', 'c',
 
 cc = meson.get_compiler('c')
 
-adw_dep = dependency('libadwaita-1')
-gtk_dep = dependency('gtk4')
-glib_dep = dependency('glib-2.0')
-gio_dep = dependency('gio-2.0')
+# libadwaita 1.7 is required for AdwWrapBox; GTK 4.16 for the CSS color-mix()
+# used by data/style.css.
+adw_dep = dependency('libadwaita-1', version: '>=1.7')
+gtk_dep = dependency('gtk4', version: '>=4.16')
+glib_dep = dependency('glib-2.0', version: '>=2.66')
+gio_dep = dependency('gio-2.0', version: '>=2.66')
 sdl3_dep = dependency('sdl3', version: '>=3.2.0')
 evdev_dep = dependency('libevdev', version: '>=1.11.0')
 udev_dep = dependency('libudev', version: '>=249')

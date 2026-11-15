@@ -10,6 +10,9 @@
 #define JOY_EXTRA_AXES_MAX   64
 #define TOUCHPAD_FINGERS_MAX 8
 #define AXIS_NOISE_EPSILON   (256.0 / 32768.0)
+/* Main-thread state sampling period. GTK still paints on the frame clock;
+ * this only controls how often SDL state is read and pushed to the widgets. */
+#define SDL_POLL_INTERVAL_MS 1
 
 static const struct {
     SDL_GamepadButton btn;
@@ -60,16 +63,15 @@ static const struct {
 };
 
 typedef struct {
-    gint                  ref_count;  /* 1 for session + 1 while tick callback is attached */
+    gint                  ref_count;  /* 1 for session + 1 while poll source is attached */
     SDL_JoystickID        sdl_id;
     SDL_Gamepad          *gamepad;    /* owned refcounted handle closed on cleanup */
     SDL_Joystick         *joystick;   /* borrowed from gamepad; valid until SDL_CloseGamepad */
     int                   joy_axis_base;
     int                   joy_extra_axes;
     ViewerSessionContext *ctx;
-    GtkWidget            *viewer;     /* borrowed; non-NULL only while tick callback is attached */
     gint                 *atomic_stop_flag;
-    guint                 tick_id;
+    guint                 timer_id;
     gboolean              btn_state[SDL_GAMEPAD_BUTTON_COUNT];
     double                axis_state[SDL_GAMEPAD_AXIS_COUNT];
     double                joy_axis_state[JOY_EXTRA_AXES_MAX];
@@ -117,17 +119,17 @@ static gboolean axis_value_changed(double prev, double next, double epsilon) {
     return fabs(next - prev) > epsilon;
 }
 
-static void sdl3_tick_destroyed(gpointer user_data) {
+static void sdl3_poll_timer_destroyed(gpointer user_data) {
     SdlSessionData *data = user_data;
-    data->tick_id = 0;
-    data->viewer = NULL;
+    data->timer_id = 0;
     viewer_session_context_unref(data->ctx);
     sdl_session_data_unref(data);
 }
 
-static gboolean sdl3_poll_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointer user_data) {
-    (void)widget;
-    (void)frame_clock;
+/* Main-thread ~1 ms state sampler. Only widget state is updated here; the
+ * widgets queue draws and GTK coalesces them on the frame clock, so rendering
+ * remains at the display refresh rate while input state is sampled at ~1 kHz. */
+static gboolean sdl3_poll_timer(gpointer user_data) {
     SdlSessionData *data = user_data;
 
     if (g_atomic_int_get(data->atomic_stop_flag) ||
@@ -141,6 +143,8 @@ static gboolean sdl3_poll_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gp
     conttest_sdl_pump_events();
 
     ConttestInputViewer *viewer = data->ctx->viewer;
+    if (!viewer)
+        return G_SOURCE_REMOVE;
 
     for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++) {
         SDL_GamepadButton btn = (SDL_GamepadButton)i;
@@ -261,9 +265,10 @@ static gboolean sdl3_poll_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gp
 
 static void free_sdl3_session(ConttestInputSession *session) {
     SdlSessionData *data = session->impl_data;
-    if (data->viewer && data->tick_id != 0) {
-        /* Invokes sdl3_tick_destroyed synchronously, clearing viewer/tick_id and releasing refs. */
-        gtk_widget_remove_tick_callback(data->viewer, data->tick_id);
+    if (data->timer_id != 0) {
+        /* Invokes sdl3_poll_timer_destroyed synchronously, clearing timer_id
+         * and releasing the poll source's ctx/data refs. */
+        g_source_remove(data->timer_id);
     }
     sdl_session_data_close_gamepad(data);
     sdl_session_data_unref(data);
@@ -402,11 +407,11 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
     if (ctx->viewer) {
         viewer_session_context_ref(ctx);
         g_atomic_int_inc(&data->ref_count);
-        data->viewer = GTK_WIDGET(ctx->viewer);
-        data->tick_id = gtk_widget_add_tick_callback(data->viewer, sdl3_poll_tick,
-                                                     data, sdl3_tick_destroyed);
-        if (data->tick_id == 0) {
-            data->viewer = NULL;
+        data->timer_id = g_timeout_add_full(G_PRIORITY_DEFAULT,
+                                            SDL_POLL_INTERVAL_MS,
+                                            sdl3_poll_timer, data,
+                                            sdl3_poll_timer_destroyed);
+        if (data->timer_id == 0) {
             sdl_session_data_unref(data);
             viewer_session_context_unref(ctx);
         }

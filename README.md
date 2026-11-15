@@ -4,11 +4,12 @@ Haptika is a powerful gamepad tester for Linux. It tests and shows buttons (incl
 pressure-sensitive buttons, such as DualShock 2/3), sticks, triggers, touchpads, motion
 sensors, vibration, and speakers (such as DualSense).
 
-It is written in pure C11 with GTK 4 and Libadwaita, integrating tightly with the GNOME
+It is written in pure C with GTK 4 and Libadwaita, integrating tightly with the GNOME
 desktop. SDL3 is the default backend, but raw evdev is also available.
 
-Haptika is capable of displaying connection method (USB vs. Bluetooth), battery status for
-Bluetooth controllers, and it integrates InputPlumber compatibility.
+Haptika is also capable of displaying various information such as connection method
+(USB vs. Bluetooth), battery levels for Bluetooth controllers, and it integrates InputPlumber
+compatibility.
 
 ## What it shows
 
@@ -30,6 +31,9 @@ Bluetooth controllers, and it integrates InputPlumber compatibility.
 
 SDL3 is the default. It provides a standard gamepad mapping, vibration, touchpad and
 motion sensor access, and battery telemetry. It is the best choice for most controllers.
+SDL3 state is sampled on a 1 ms main-thread timer; GTK still paints on the display frame
+clock, so the visualizers update at the monitor refresh rate while short presses between
+frames are not missed.
 
 The raw evdev backend exposes every button and axis reported by `libevdev` without a
 mapping layer. This is useful for older or unusual controllers, for checking what the
@@ -54,7 +58,7 @@ Haptika can read hardware details over hidraw for Sony controllers.
 The dialogs are fetched off the main thread and can be closed while a read is in
 progress.
 
-## InputPlumber
+## InputPlumber Integration
 
 Haptika detects virtual controllers managed by InputPlumber and matches them to their
 `CompositeDevice` over D-Bus. For a matched device it shows the virtual bus and address,
@@ -64,8 +68,9 @@ broken duplicate next to the virtual pad.
 
 ## Build
 
-Dependencies: GTK 4, Libadwaita 1, SDL3 3.2 or newer, libevdev, libudev, and optionally
-libpipewire for the speaker test.
+Dependencies: GTK 4.16 or newer, Libadwaita 1.7 or newer, SDL3 3.2 or newer,
+libevdev 1.11 or newer, libudev 249 or newer, Meson 0.63 or newer, and optionally
+libpipewire 0.3 for the speaker test.
 
 ```sh
 meson setup build --prefix=$HOME/.local
@@ -99,6 +104,10 @@ hardware info fails, check your hidraw rules for Sony devices (`054c:*`).
 
 ## Status
 
+Haptika is hobbyist software. I made it in order to personally test some of my unusual
+controllers and adapters. Expectations should be in line with that. Code changes and
+updates occur locally most of the time, or in a different branch, as I'm not very active
+on GitHub.
 No translation catalog ships yet. Many controllers are untested. If you got a controller
 with strange behavior (wrong name, buttons, mapping, anything), open an issue with the
 model and the `lsusb` line. Even though I'm a controller collector of sorts, I don't have

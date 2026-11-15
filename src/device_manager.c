@@ -34,6 +34,7 @@ typedef enum {
 typedef struct {
   char *own_syspath;
   GStrv hw_keys;
+  char *serial;
   SDL_JoystickConnectionState udev_conn;
   gboolean is_virtual;
   char *virtual_bus;
@@ -45,6 +46,7 @@ typedef struct {
 static void udev_attach_meta_clear(UdevAttachMeta *m) {
   g_clear_pointer(&m->own_syspath, g_free);
   g_clear_pointer(&m->hw_keys, g_strfreev);
+  g_clear_pointer(&m->serial, g_free);
   m->udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
   m->is_virtual = FALSE;
   g_clear_pointer(&m->virtual_bus, g_free);
@@ -510,13 +512,86 @@ static ConttestDevice *find_device_by_evdev_syspath(ConttestDeviceManager *self,
   return NULL;
 }
 
+typedef enum {
+  MATCH_REJECT,
+  MATCH_WEAK,
+  MATCH_STRONG,
+} CandidateMatch;
+
+/* Serial numbers are only useful for identity when they are non-trivial.
+ * Some drivers expose placeholders such as "0". */
+static gboolean serial_is_usable(const char *serial) {
+  if (!serial || !*serial)
+    return FALSE;
+
+  guint chars = 0;
+  gboolean nonzero = FALSE;
+  for (const unsigned char *p = (const unsigned char *)serial; *p; p++) {
+    if (!g_ascii_isalnum(*p))
+      continue;
+    chars++;
+    if (*p != '0')
+      nonzero = TRUE;
+  }
+  return chars >= 4 && nonzero;
+}
+
+/* Compare serials ignoring separators and case, so MAC addresses and UIDs
+ * written as "aa:bb:..." or "AABB..." still match. */
+static gboolean serial_matches(const char *a, const char *b) {
+  if (!a || !b)
+    return FALSE;
+
+  while (*a || *b) {
+    while (*a && !g_ascii_isalnum((guchar)*a))
+      a++;
+    while (*b && !g_ascii_isalnum((guchar)*b))
+      b++;
+    if (g_ascii_tolower((guchar)*a) != g_ascii_tolower((guchar)*b))
+      return FALSE;
+    if (*a)
+      a++;
+    if (*b)
+      b++;
+  }
+  return TRUE;
+}
+
+static gboolean conn_contradicts(SDL_JoystickConnectionState a,
+                                 SDL_JoystickConnectionState b) {
+  if (a == SDL_JOYSTICK_CONNECTION_UNKNOWN ||
+      a == SDL_JOYSTICK_CONNECTION_INVALID ||
+      b == SDL_JOYSTICK_CONNECTION_UNKNOWN ||
+      b == SDL_JOYSTICK_CONNECTION_INVALID)
+    return FALSE;
+  return a != b;
+}
+
+static CandidateMatch classify_pair(const char *serial_a,
+                                    SDL_JoystickConnectionState conn_a,
+                                    const char *serial_b,
+                                    SDL_JoystickConnectionState conn_b) {
+  /* A serial is the strongest identity available; a matching serial is
+   * preferred over a connection-type disagreement, which can come from
+   * different reporting layers for the same link. */
+  if (serial_is_usable(serial_a) && serial_is_usable(serial_b))
+    return serial_matches(serial_a, serial_b) ? MATCH_STRONG : MATCH_REJECT;
+
+  if (conn_contradicts(conn_a, conn_b))
+    return MATCH_REJECT;
+
+  return MATCH_WEAK;
+}
+
 static ConttestDevice *find_device_by_hardware_for_sdl(
     ConttestDeviceManager *self,
     const char *sdl_path,
     const char *sdl_own_syspath,
     const char *const *sdl_hw_keys,
     uint16_t sdl_vid,
-    uint16_t sdl_pid) {
+    uint16_t sdl_pid,
+    const char *sdl_serial,
+    SDL_JoystickConnectionState sdl_conn) {
   /* Fast path in memory: a /dev/input/event* devnode maps 1:1 to a tracked
    * evdev device. */
   if (sdl_path && *sdl_path) {
@@ -542,25 +617,41 @@ static ConttestDevice *find_device_by_hardware_for_sdl(
     }
   }
 
-  /* Second pass: symmetric VID/PID fallback for SDL devices without a /dev/
-   * devnode path (e.g. HIDAPI DS3 when evdev attached before SDL). Only merge
-   * with a single unambiguous physical evdev candidate so identical pads or
-   * virtual controllers are never cross-merged. */
+  /* Second pass: VID/PID fallback for SDL devices without a /dev/ devnode
+   * path. A matching serial identifies the candidate; otherwise a candidate
+   * whose connection type does not contradict SDL's is accepted only if it is
+   * unique. */
   if ((!sdl_path || !g_str_has_prefix(sdl_path, "/dev/")) &&
       sdl_vid != 0 && sdl_pid != 0) {
-    ConttestDevice *match = NULL;
-    guint match_count = 0;
+    ConttestDevice *strong_match = NULL;
+    ConttestDevice *weak_match = NULL;
+    guint strong_count = 0;
+    guint weak_count = 0;
+
     for (guint i = 0; i < self->devices->len; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
       if (d->has_evdev && !d->has_sdl && !d->evdev_meta.is_virtual &&
           d->virtual_kind == CONTTEST_VIRTUAL_NONE &&
           d->vendor_id == sdl_vid && d->product_id == sdl_pid) {
-        match = d;
-        match_count++;
+        CandidateMatch score = classify_pair(sdl_serial, sdl_conn,
+                                             d->evdev_meta.serial,
+                                             d->evdev_meta.udev_conn);
+        if (score == MATCH_STRONG) {
+          strong_match = d;
+          strong_count++;
+        } else if (score == MATCH_WEAK) {
+          weak_match = d;
+          weak_count++;
+        }
       }
     }
-    if (match_count == 1)
-      return match;
+
+    if (strong_count == 1)
+      return strong_match;
+    if (strong_count > 1)
+      return NULL;
+    if (weak_count == 1)
+      return weak_match;
   }
 
   return NULL;
@@ -573,7 +664,9 @@ static ConttestDevice *find_device_by_hardware_for_evdev(
     const char *const *evdev_hw_keys,
     uint16_t udev_vid,
     uint16_t udev_pid,
-    gboolean udev_is_virtual) {
+    gboolean udev_is_virtual,
+    const char *udev_serial,
+    SDL_JoystickConnectionState udev_conn) {
   /* Fast path in memory: SDL devnode matches this evdev devnode directly. */
   if (evdev_devnode) {
     for (guint i = 0; i < self->devices->len; i++) {
@@ -598,12 +691,16 @@ static ConttestDevice *find_device_by_hardware_for_evdev(
     }
   }
 
-  /* Second pass: for SDL devices without a devnode path (e.g. HIDAPI-backed
-   * controllers like DS3), fall back to VID/PID matching only for a single
-   * unambiguous non-virtual candidate. */
+  /* Second pass: for SDL devices without a devnode path, fall back to VID/PID.
+   * A matching serial identifies the candidate; otherwise a candidate whose
+   * connection type does not contradict the evdev one is accepted only if it
+   * is unique. */
   if (udev_vid != 0 && udev_pid != 0 && !udev_is_virtual) {
-    ConttestDevice *match = NULL;
-    guint match_count = 0;
+    ConttestDevice *strong_match = NULL;
+    ConttestDevice *weak_match = NULL;
+    guint strong_count = 0;
+    guint weak_count = 0;
+
     for (guint i = 0; i < self->devices->len; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
       if (d->has_sdl && !d->has_evdev && !d->sdl_meta.is_virtual &&
@@ -614,13 +711,31 @@ static ConttestDevice *find_device_by_hardware_for_evdev(
         uint16_t sdl_pid = d->product_id ? d->product_id
                                          : SDL_GetGamepadProductForID(d->sdl_id);
         if (sdl_vid == udev_vid && sdl_pid == udev_pid) {
-          match = d;
-          match_count++;
+          const char *sdl_serial = d->sdl_gamepad
+              ? SDL_GetGamepadSerial(d->sdl_gamepad) : NULL;
+          SDL_JoystickConnectionState sdl_conn = d->sdl_gamepad
+              ? SDL_GetGamepadConnectionState(d->sdl_gamepad)
+              : SDL_JOYSTICK_CONNECTION_UNKNOWN;
+
+          CandidateMatch score = classify_pair(udev_serial, udev_conn,
+                                               sdl_serial, sdl_conn);
+          if (score == MATCH_STRONG) {
+            strong_match = d;
+            strong_count++;
+          } else if (score == MATCH_WEAK) {
+            weak_match = d;
+            weak_count++;
+          }
         }
       }
     }
-    if (match_count == 1)
-      return match;
+
+    if (strong_count == 1)
+      return strong_match;
+    if (strong_count > 1)
+      return NULL;
+    if (weak_count == 1)
+      return weak_match;
   }
 
   return NULL;
@@ -686,6 +801,17 @@ static void udev_extract_attach_meta(struct udev_device *dev,
     return;
   out->hw_keys = conttest_udev_collect_hw_keys(dev, &out->own_syspath);
   out->udev_conn = conttest_resolve_connection_state_for_udev_device(dev);
+  struct udev_device *hid_parent =
+      udev_device_get_parent_with_subsystem_devtype(dev, "hid", NULL);
+  /* HID_UNIQ holds the Bluetooth address on wireless links; ID_SERIAL_SHORT
+   * is the USB iSerial. ID_SERIAL is skipped because without a serial suffix
+   * it is just vendor and model, shared by identical units. */
+  const char *serial = hid_parent
+      ? udev_device_get_property_value(hid_parent, "HID_UNIQ") : NULL;
+  if (!serial || !*serial)
+    serial = udev_device_get_property_value(dev, "ID_SERIAL_SHORT");
+  if (serial && *serial)
+    out->serial = g_strdup(serial);
   out->is_virtual = conttest_udev_device_probe_virtual(dev, &out->virtual_uniq,
                                                        &out->virtual_bus);
   out->ip_hidden_devlink = conttest_udev_device_is_inputplumber_hidden(dev);
@@ -1463,10 +1589,15 @@ static void on_sdl_udev_probe_done(GObject *source, GAsyncResult *res,
 
     ConttestDevice *existing = NULL;
     if (!d->has_evdev) {
+      const char *sdl_serial = d->sdl_gamepad
+          ? SDL_GetGamepadSerial(d->sdl_gamepad) : NULL;
+      SDL_JoystickConnectionState sdl_conn = d->sdl_gamepad
+          ? SDL_GetGamepadConnectionState(d->sdl_gamepad)
+          : SDL_JOYSTICK_CONNECTION_UNKNOWN;
       existing = find_device_by_hardware_for_sdl(
           self, d->sdl_path, d->sdl_meta.own_syspath,
           (const char *const *)d->sdl_meta.hw_keys, d->vendor_id,
-          d->product_id);
+          d->product_id, sdl_serial, sdl_conn);
       if (existing == d || (existing && existing->has_sdl))
         existing = NULL;
     }
@@ -1535,6 +1666,23 @@ static void schedule_sdl_udev_probe(ConttestDeviceManager *self,
   g_object_unref(task);
 }
 
+/* Refresh SDL-side udev metadata for an already visible device (typically an
+ * evdev node that SDL just attached to). The device is not hidden while this
+ * runs: sdl_probe_pending stays FALSE so no user-visible transition depends on
+ * it; on completion on_sdl_udev_probe_done() only refreshes the device. */
+static void schedule_sdl_meta_probe(ConttestDeviceManager *self,
+                                    ConttestDevice *d) {
+  if (!self || !d || self->disposed || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable) ||
+      !d->has_sdl || d->sdl_probe_pending ||
+      d->sdl_meta.own_syspath || !d->sdl_path ||
+      !g_str_has_prefix(d->sdl_path, "/dev/"))
+    return;
+
+  guint seq = ++d->sdl_udev_seq;
+  schedule_sdl_udev_probe(self, d, d->sdl_path, seq);
+}
+
 static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
   if (self->disposed || !self->devices || find_device_by_sdl_id(self, id))
     return;
@@ -1551,11 +1699,31 @@ static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
    * so empty or shared multi-port adapter paths never coalesce distinct pads. */
   ConttestDevice *d =
       find_device_by_sdl_path(self, sdl_path, sdl_vid, sdl_pid, name);
-  if (d)
+  if (d) {
+    /* A duplicate SDL add event can still be the first chance to populate
+     * sdl_meta for a device whose earlier probe found nothing. */
+    schedule_sdl_meta_probe(self, d);
     return;
+  }
+
+  g_autofree char *sdl_serial = NULL;
+  SDL_JoystickConnectionState sdl_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+  /* Serial and connection type require an open handle; only the pathless
+   * VID/PID fallback below consumes them. */
+  if ((!sdl_path || !g_str_has_prefix(sdl_path, "/dev/")) &&
+      sdl_vid != 0 && sdl_pid != 0) {
+    SDL_Gamepad *match_gamepad = SDL_OpenGamepad(id);
+    if (match_gamepad) {
+      const char *serial = SDL_GetGamepadSerial(match_gamepad);
+      if (serial && *serial)
+        sdl_serial = g_strdup(serial);
+      sdl_conn = SDL_GetGamepadConnectionState(match_gamepad);
+      SDL_CloseGamepad(match_gamepad);
+    }
+  }
 
   d = find_device_by_hardware_for_sdl(self, sdl_path, NULL, NULL, sdl_vid,
-                                      sdl_pid);
+                                      sdl_pid, sdl_serial, sdl_conn);
 
   if (d) {
     gboolean was_hidden = d->hidden;
@@ -1565,6 +1733,7 @@ static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
       d->vendor_id = sdl_vid;
       d->product_id = sdl_pid;
     }
+    schedule_sdl_meta_probe(self, d);
     device_poll_battery(self, d);
     device_refresh_virtual_state(self, d);
     d->hidden = compute_device_hidden(self, d);
@@ -1645,7 +1814,7 @@ static void apply_probed_evdev_meta(ConttestDeviceManager *self,
   ConttestDevice *d = find_device_by_hardware_for_evdev(
       self, m->devnode, m->meta.own_syspath,
       (const char *const *)m->meta.hw_keys, m->vendor_id, m->product_id,
-      m->meta.is_virtual);
+      m->meta.is_virtual, m->meta.serial, m->meta.udev_conn);
 
   gboolean is_new = FALSE;
   gboolean was_hidden = FALSE;
@@ -1662,7 +1831,11 @@ static void apply_probed_evdev_meta(ConttestDeviceManager *self,
       device_set_name(d, m->name);
     if (d->sdl_probe_pending) {
       d->sdl_probe_pending = FALSE;
+      /* The placeholder's in-flight SDL probe is stale now that evdev has
+       * identified the device; invalidate it and fetch SDL metadata in the
+       * background so hidden/connection state is not left cold. */
       d->sdl_udev_seq++;
+      schedule_sdl_meta_probe(self, d);
     }
   }
 

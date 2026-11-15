@@ -96,6 +96,7 @@ static const struct {
     { "psp",                 "psp-symbolic" },
     { "dualshock",           "ps1-symbolic" },
     { "ps1",                 "ps1-symbolic" },
+    { "psx",                 "ps1-symbolic" },
     { "playstation",         "ps1-symbolic" },
     { "series x",            "xbox-series-x-symbolic" },
     { "series s",            "xbox-series-x-symbolic" },
@@ -133,6 +134,16 @@ static const struct {
     { "xbox",                "xbox-symbolic" }
 };
 
+/* Case-insensitive substring test used by the device-name icon heuristics. */
+static gboolean name_contains_ci(const char *name, const char *keyword) {
+    if (!name || !keyword)
+        return FALSE;
+    char *lower = g_ascii_strdown(name, -1);
+    gboolean found = strstr(lower, keyword) != NULL;
+    g_free(lower);
+    return found;
+}
+
 static const char *get_icon_for_name(const char *name) {
     char *lower = g_ascii_strdown(name, -1);
     const char *result = "stadia-symbolic";
@@ -149,6 +160,12 @@ static const char *get_icon_for_name(const char *name) {
 }
 
 static const char *get_icon_for_device(const ConttestDevice *dev) {
+    /* PSX adapters (e.g. Raphnet PSX-to-USB) have no SDL PS1 type and may be
+     * evdev-only or report a generic gamepad type, so the device name takes
+     * precedence to ensure every "PSX" device gets the PS1 icon. */
+    if (name_contains_ci(conttest_device_get_name(dev), "psx"))
+        return "ps1-symbolic";
+
     if (conttest_device_get_has_sdl(dev)) {
         switch (SDL_GetGamepadTypeForID(conttest_device_get_sdl_id(dev))) {
         case SDL_GAMEPAD_TYPE_PS5:                  return "ps5-symbolic";

@@ -104,7 +104,7 @@ static void on_manager_device_updated(ConttestDeviceManager *mgr, ConttestDevice
 static void on_manager_device_removed(ConttestDeviceManager *mgr, ConttestDevice *dev, gpointer user_data);
 
 
-/* ── Theme persistence ─────────────────────────────────────────────────── */
+/* --- Theme persistence --- */
 
 static const char *normalize_theme_style(const char *val) {
     if (g_strcmp0(val, "dark") == 0)  return "dark";
@@ -122,7 +122,7 @@ void conttest_window_apply_theme(const char *style) {
         adw_style_manager_set_color_scheme(mgr, ADW_COLOR_SCHEME_DEFAULT);
 }
 
-/* ── Theme selector widget ─────────────────────────────────────────────── */
+/* --- Theme selector widget --- */
 
 static void sync_theme_checkbuttons(ConttestWindow *self) {
     if (!self->settings || !self->theme_follow) return;

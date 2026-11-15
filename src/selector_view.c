@@ -16,7 +16,7 @@ struct _ConttestSelectorView {
 
 G_DEFINE_TYPE(ConttestSelectorView, conttest_selector_view, GTK_TYPE_BOX)
 
-/* ── UI policy helpers ─────────────────────────────────────────────────── */
+/* --- UI policy helpers --- */
 
 /* When a device supports multiple backends, SDL3 is preferred. */
 static ConttestBackend preferred_backend(const ConttestDevice *dev) {
@@ -43,7 +43,7 @@ static char *format_device_subtitle(const ConttestDevice *dev) {
     return g_strdup(backends);
 }
 
-/* ── Row context and icon cache ────────────────────────────────────────── */
+/* --- Row context and icon cache --- */
 
 /* Attached to each AdwActionRow via g_object_set_data_full("ctx"). */
 typedef struct {
@@ -70,7 +70,7 @@ static void row_context_free(gpointer data) {
     g_free(ctx);
 }
 
-/* ── Signal handlers ─────────────────────────────────────────────────────── */
+/* --- Signal handlers --- */
 
 static void on_row_activated(AdwActionRow *row, gpointer user_data) {
     (void)user_data;
@@ -310,7 +310,7 @@ static GtkWidget *create_row_for_device(ConttestSelectorView *self, ConttestDevi
     return row;
 }
 
-/* ── List management ─────────────────────────────────────────────────────── */
+/* --- List management --- */
 
 static void update_placeholder(ConttestSelectorView *self) {
     GtkWidget *child = gtk_widget_get_first_child(self->list_box);
@@ -371,7 +371,7 @@ static void on_device_updated(ConttestDeviceManager *mgr, ConttestDevice *dev, g
     update_row_battery(ctx, dev);
 }
 
-/* ── GObject boilerplate ─────────────────────────────────────────────────── */
+/* --- GObject boilerplate --- */
 
 static void conttest_selector_view_init(ConttestSelectorView *self) {
     self->list_box = gtk_list_box_new();

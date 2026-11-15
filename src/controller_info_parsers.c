@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── DualShock 3 OUI lookup ───────────────────────────────────────────────── */
+/* --- DualShock 3 OUI lookup --- */
 
 /* Genuine Sony OUI database (must stay lexicographically sorted for bsearch). */
 static const char * const GENUINE_OUIS[] = {
@@ -43,7 +43,7 @@ const char *conttest_ds3_oui_get(gsize index) {
     return GENUINE_OUIS[index];
 }
 
-/* ── DualShock 4 binary parsers & lookup ──────────────────────────────────── */
+/* --- DualShock 4 binary parsers & lookup --- */
 
 static const struct {
     guint8 min;
@@ -110,7 +110,7 @@ gboolean conttest_ds4_parse_report_12_bt(const guint8 *buf, gsize len,
     return TRUE;
 }
 
-/* ── DualSense binary parsers & lookup ────────────────────────────────────── */
+/* --- DualSense binary parsers & lookup --- */
 
 static const struct {
     guint8 min;

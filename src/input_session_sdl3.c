@@ -282,7 +282,7 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
 
     ConttestInputSession *session = g_new0(ConttestInputSession, 1);
     session->free_func = free_sdl3_session;
-    /* session->thread remains NULL — no background thread for the SDL backend. */
+    /* session->thread remains NULL; no background thread for the SDL backend. */
 
     SdlSessionData *data = g_new0(SdlSessionData, 1);
     data->ref_count        = 1;

@@ -13,7 +13,7 @@
 #define IP_IFACE_TARGET    "org.shadowblip.Input.Target"
 #define IP_IFACE_UDEV      "org.shadowblip.Input.Source.UdevDevice"
 
-/* ── Sysfs / udev virtual & hidden detection ─────────────────────────────── */
+/* --- Sysfs / udev virtual & hidden detection --- */
 
 static struct udev_device *resolve_udev_device(struct udev *udev,
                                                const char *syspath,
@@ -135,9 +135,9 @@ gboolean conttest_udev_is_inputplumber_hidden(struct udev *udev,
     return hidden;
 }
 
-/* ── Deterministic InputPlumber ID helpers ───────────────────────────────── */
+/* --- Deterministic InputPlumber ID helpers --- */
 
-/* ── D-Bus Monitor GObject ───────────────────────────────────────────────── */
+/* --- D-Bus Monitor GObject --- */
 
 struct _ConttestInputPlumberMonitor {
     GObject parent_instance;

@@ -32,7 +32,7 @@
 
 static const double CONTTEST_TWO_PI = 6.283185307179586476925286766559;
 
-/* ── udev: resolve ALSA card index sharing a USB parent with evdev ───────── */
+/* --- udev: resolve ALSA card index sharing a USB parent with evdev --- */
 
 static int find_alsa_card_for_evdev(struct udev *udev, const char *evdev_syspath) {
     if (!udev || !evdev_syspath)
@@ -85,7 +85,7 @@ static int find_alsa_card_for_evdev(struct udev *udev, const char *evdev_syspath
     return card_num;
 }
 
-/* ── PipeWire live registry discovery for controller Audio/Sink ─────────── */
+/* --- PipeWire live registry discovery for controller Audio/Sink --- */
 
 static void ensure_pipewire_init(void) {
     static gsize initialized = 0;
@@ -505,7 +505,7 @@ static gboolean discover_controller_sink(int card_num,
     return TRUE;
 }
 
-/* ── PipeWire tone playback ──────────────────────────────────────────────── */
+/* --- PipeWire tone playback --- */
 
 typedef struct {
     struct pw_main_loop *loop;
@@ -823,7 +823,7 @@ static char *play_tone(int card_num, GCancellable *cancellable) {
     return ctx.error;
 }
 
-/* ── GTask async wrapper ─────────────────────────────────────────────────── */
+/* --- GTask async wrapper --- */
 
 typedef struct {
     char *evdev_syspath;

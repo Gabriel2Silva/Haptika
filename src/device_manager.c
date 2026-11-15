@@ -89,9 +89,9 @@ struct _ConttestDevice {
   gboolean ds3_battery_in_flight;
   guint ds3_battery_probe_seq;
 
-  /* Battery state — only meaningful when has_sdl is TRUE. */
+  /* Battery state; only meaningful when has_sdl is TRUE. */
   SDL_PowerState battery_state;
-  int battery_percent; /* 0–100, or -1 if unknown */
+  int battery_percent; /* 0-100, or -1 if unknown */
   SDL_JoystickConnectionState connection_state;
 
   /* Virtual / InputPlumber state */
@@ -341,7 +341,7 @@ static void device_detach_evdev(ConttestDevice *d) {
   }
 }
 
-/* ── Public device-type predicates (defined in device_manager.h) ─────── */
+/* --- Public device-type predicates (defined in device_manager.h) --- */
 
 gboolean conttest_device_is_ds3(const ConttestDevice *device) {
     return conttest_vid_pid_is_ds3(device->vendor_id, device->product_id);
@@ -1077,7 +1077,7 @@ static gboolean compute_device_hidden(ConttestDeviceManager *self,
   if (d->sdl_probe_pending)
     return TRUE;
 
-  /* Never hide virtual devices — only physical source devices captured by
+  /* Never hide virtual devices; only physical source devices captured by
    * InputPlumber are hidden to prevent broken duplicate entries. */
   if (d->virtual_kind != CONTTEST_VIRTUAL_NONE)
     return FALSE;

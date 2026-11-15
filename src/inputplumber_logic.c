@@ -2,7 +2,7 @@
 #include <inttypes.h>
 #include <string.h>
 
-/* ── Source / Info data helpers ──────────────────────────────────────────── */
+/* --- Source / Info data helpers --- */
 
 static ConttestInputPlumberSource *source_copy(const ConttestInputPlumberSource *src) {
     if (!src) return NULL;
@@ -126,7 +126,7 @@ gboolean conttest_inputplumber_info_equal(const ConttestInputPlumberInfo *a,
     return TRUE;
 }
 
-/* ── Deterministic ID / MAC / target lookup helpers ──────────────────────── */
+/* --- Deterministic ID / MAC / target lookup helpers --- */
 
 guint64 conttest_inputplumber_fnv1a_64(const char *str) {
     guint64 hash = G_GUINT64_CONSTANT(0xcbf29ce484222325);
@@ -227,7 +227,7 @@ gboolean conttest_inputplumber_is_gamepad_target_type(const char *type) {
     return TRUE;
 }
 
-/* ── ManagedObjects parser ────────────────────────────────────────────────── */
+/* --- ManagedObjects parser --- */
 
 typedef struct {
     char *device_type;
@@ -416,7 +416,7 @@ GPtrArray *conttest_inputplumber_parse_managed_objects(GVariant *reply,
     return results;
 }
 
-/* ── Candidate matching ───────────────────────────────────────────────────── */
+/* --- Candidate matching --- */
 
 static ConttestInputPlumberInfo *clone_matched(const ConttestInputPlumberInfo *cand,
                                                const char *uniq,

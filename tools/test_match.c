@@ -1,5 +1,5 @@
 /*
- * test_match — test udev device-from-devnum lookup.
+ * test_match: test udev device-from-devnum lookup.
  *
  * Usage: test_match [devnode]
  *   Defaults to /dev/null if no argument is given.

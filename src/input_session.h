@@ -18,7 +18,7 @@ typedef enum {
   INPUT_EVENT_SENSOR
 } ConttestInputEventType;
 
-/* Explicit element domains — avoid overlapping numeric ranges across backends. */
+/* Explicit element domains: avoid overlapping numeric ranges across backends. */
 typedef enum {
   CONTTEST_ELEMENT_BUTTON = 0,      /* SDL_GamepadButton or evdev KEY/BTN code */
   CONTTEST_ELEMENT_SDL_AXIS,        /* SDL_GamepadAxis */
@@ -45,7 +45,7 @@ typedef struct {
   float touch_x;
   float touch_y;
   /* Sensor data (type == INPUT_EVENT_SENSOR) */
-  float sensor[3]; /* accel: m/s², gyro: rad/s */
+  float sensor[3]; /* accel: m/s^2, gyro: rad/s */
 } ConttestInputEvent;
 
 /* Fixed lock-free SPSC ring buffer (producer: evdev thread, consumer: main loop). */

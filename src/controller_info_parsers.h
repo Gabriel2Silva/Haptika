@@ -5,13 +5,13 @@
 
 G_BEGIN_DECLS
 
-/* ── DualShock 3 ──────────────────────────────────────────────────────────── */
+/* --- DualShock 3 --- */
 
 gboolean conttest_ds3_oui_is_genuine(const char *bt_addr);
 gsize conttest_ds3_oui_count(void);
 const char *conttest_ds3_oui_get(gsize index);
 
-/* ── DualShock 4 ──────────────────────────────────────────────────────────── */
+/* --- DualShock 4 --- */
 
 typedef struct {
     char build_date[64];
@@ -26,7 +26,7 @@ gboolean conttest_ds4_parse_report_a3(const guint8 *buf, gsize len,
 gboolean conttest_ds4_parse_report_12_bt(const guint8 *buf, gsize len,
                                          char *bt_address, gsize bt_size);
 
-/* ── DualSense ────────────────────────────────────────────────────────────── */
+/* --- DualSense --- */
 
 typedef struct {
     char fw_build_date[64];

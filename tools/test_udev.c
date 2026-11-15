@@ -1,5 +1,5 @@
 /*
- * test_udev — list input event nodes with device name properties.
+ * test_udev: list input event nodes with device name properties.
  *
  * Useful for verifying which evdev nodes are visible and how names resolve.
  */

@@ -25,7 +25,7 @@ ConttestVirtualKind conttest_device_get_virtual_kind(const ConttestDevice *devic
 gboolean conttest_device_is_virtual(const ConttestDevice *device);
 const ConttestInputPlumberInfo *conttest_device_get_inputplumber_info(const ConttestDevice *device);
 
-/* ── Sony VID/PID constants ────────────────────────────────────────────── */
+/* --- Sony VID/PID constants --- */
 #define SONY_VID      0x054c
 #define DS3_PID       0x0268
 #define DS4_PID_V1    0x05c4  /* CUH-ZCT1x (first gen)   */
@@ -34,7 +34,7 @@ const ConttestInputPlumberInfo *conttest_device_get_inputplumber_info(const Cont
 #define DS5_PID_V1    0x0ce6  /* CFI-ZCT1x               */
 #define DS5_PID_V2    0x0df2  /* CFI-ZCP1 (DualSense Edge) */
 
-/* Convenience predicates — check VID+PID via the device accessors. */
+/* Convenience predicates: check VID+PID via the device accessors. */
 gboolean conttest_device_is_ds3(const ConttestDevice *device);
 gboolean conttest_device_is_ds4(const ConttestDevice *device);
 gboolean conttest_device_is_ds5(const ConttestDevice *device);

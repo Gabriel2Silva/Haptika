@@ -23,6 +23,7 @@
       <li>Motion sensor (accelerometer and gyroscope) visualization</li>
       <li>Touchpad finger tracking for DualShock 4 and DualSense</li>
       <li>Support for both SDL3 and evdev backends with one-click switching</li>
+      <li>InputPlumber virtual controller detection and source device inspection</li>
     </ul>
   </description>
 
@@ -32,7 +33,6 @@
     <color type="primary" scheme_preference="light">#cedff2</color>
     <color type="primary" scheme_preference="dark">#1d4372</color>
   </branding>
-
 
   <supports>
     <control>keyboard</control>
@@ -50,20 +50,24 @@
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/01-controller-list.png</image>
-      <caption>Controller selection screen with proper SVG icons</caption>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v2.0.0/data/screenshots/01-controller-list.png</image>
+      <caption>Controller list with USB, Bluetooth, and InputPlumber virtual controllers</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/02-input-viewer.png</image>
-      <caption>Real-time input testing including pressure-sensitive buttons on capable controllers</caption>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v2.0.0/data/screenshots/02-input-viewer.png</image>
+      <caption>Touchpad contacts, sticks, triggers, and motion sensors in the input viewer</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/03-evdev-test.png</image>
-      <caption>Support for legacy, evdev-only controllers</caption>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v2.0.0/data/screenshots/03-pressure-sensitive-buttons.png</image>
+      <caption>Analog pressure readout for the pressure-sensitive buttons of a DualShock 3</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v1.0.0/data/screenshots/04-dualshock4-info.png</image>
-      <caption>Fetch controller hardware information and check authenticity</caption>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v2.0.0/data/screenshots/04-dualsense-input-viewer.png</image>
+      <caption>DualSense input testing including the mute button and sensor axes</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Gabriel2Silva/Haptika/v2.0.0/data/screenshots/05-dualshock4-info.png</image>
+      <caption>Controller hardware information and authenticity check</caption>
     </screenshot>
   </screenshots>
 
@@ -76,6 +80,19 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="2.0.0" date="2026-11-18">
+      <description>
+        <p>New features and reliability improvements:</p>
+        <ul>
+          <li>InputPlumber virtual controller detection, profile details, and source device inspection</li>
+          <li>DualSense speaker test over PipeWire</li>
+          <li>Redrawn symbolic controller icons rendered through GSK</li>
+          <li>Hardware info dialogs can be closed while a read is in progress</li>
+          <li>More robust device reconnection and hardware matching</li>
+        </ul>
+        <p>Version 2.0 requires GTK 4.16 and libadwaita 1.7 or newer.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-04-28">
       <description>
         <p>Initial release.</p>

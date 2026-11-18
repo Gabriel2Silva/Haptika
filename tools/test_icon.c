@@ -1,5 +1,5 @@
 /*
- * test_icon — verify that the Haptika app icon is discoverable by GTK.
+ * test_icon: verify that the Haptika app icon is discoverable by GTK.
  *
  * Usage: test_icon [icon-search-dir]
  *   If no argument is given, only the default theme paths are checked.

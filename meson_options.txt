@@ -1,0 +1,11 @@
+option('pipewire',
+  type: 'feature',
+  value: 'auto',
+  description: 'Controller speaker testing via PipeWire'
+)
+
+option('x86_64_v1',
+  type: 'boolean',
+  value: true,
+  description: 'Enforce strict x86-64-v1 (SSE2) ISA baseline on x86_64 targets'
+)

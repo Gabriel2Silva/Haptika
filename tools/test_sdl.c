@@ -1,5 +1,5 @@
 /*
- * test_sdl — list connected gamepads via SDL3.
+ * test_sdl: list connected gamepads via SDL3.
  *
  * Useful for verifying SDL3 sees the same devices as the main application.
  */

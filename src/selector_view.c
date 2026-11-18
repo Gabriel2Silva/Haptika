@@ -23,94 +23,136 @@ static ConttestBackend preferred_backend(const ConttestDevice *dev) {
     return conttest_device_get_has_sdl(dev) ? CONTTEST_BACKEND_SDL3 : CONTTEST_BACKEND_EVDEV;
 }
 
-/* Format a user-facing subtitle describing available backends. */
-static const char *format_backend_subtitle(const ConttestDevice *dev) {
-    if (conttest_device_get_has_sdl(dev) && conttest_device_get_has_evdev(dev)) return "SDL3, evdev";
-    if (conttest_device_get_has_sdl(dev))  return "SDL3";
-    return "evdev";
+/* Format a user-facing subtitle describing available backends and
+ * InputPlumber status. Caller must g_free() the result. */
+static char *format_device_subtitle(const ConttestDevice *dev) {
+    const char *backends = "evdev";
+    if (conttest_device_get_has_sdl(dev) && conttest_device_get_has_evdev(dev))
+        backends = "SDL3, evdev";
+    else if (conttest_device_get_has_sdl(dev))
+        backends = "SDL3";
+
+    ConttestVirtualKind vkind = conttest_device_get_virtual_kind(dev);
+    if (vkind == CONTTEST_VIRTUAL_INPUTPLUMBER) {
+        const ConttestInputPlumberInfo *ip = conttest_device_get_inputplumber_info(dev);
+        if (ip && ip->composite_name && *ip->composite_name) {
+            return g_strdup_printf(_("%s · InputPlumber: %s"), backends, ip->composite_name);
+        }
+        return g_strdup_printf(_("%s · InputPlumber"), backends);
+    }
+    return g_strdup(backends);
 }
 
-/* --- Typed context structs for row / menu wiring --- */
+/* --- Row context and icon cache --- */
 
 /* Attached to each AdwActionRow via g_object_set_data_full("ctx"). */
 typedef struct {
     ConttestSelectorView *view;        /* borrowed, outlives row */
-    ConttestDevice       *device;      /* borrowed, manager-owned */
+    ConttestDevice       *device;      /* owned ref */
     GtkWidget            *icon;        /* owned by the row widget tree */
+    const char           *cached_icon_name; /* static string literal */
+    char                 *cached_dev_name;
+    gboolean              cached_has_sdl;
+    SDL_JoystickID        cached_sdl_id;
+    SDL_GamepadType       cached_gamepad_type;
     GtkWidget            *battery_box; /* suffix container for battery icon+label, nullable */
     GtkWidget            *battery_icon;
     GtkWidget            *battery_label;
+    GtkWidget            *virtual_icon;    /* nullable, InputPlumber indicator */
     GtkWidget            *connection_icon; /* nullable, wireless/wired indicator */
 } RowContext;
+
+static void row_context_free(gpointer data) {
+    RowContext *ctx = data;
+    if (!ctx) return;
+    g_clear_object(&ctx->device);
+    g_free(ctx->cached_dev_name);
+    g_free(ctx);
+}
 
 /* --- Signal handlers --- */
 
 static void on_row_activated(AdwActionRow *row, gpointer user_data) {
     (void)user_data;
     RowContext *ctx = g_object_get_data(G_OBJECT(row), "ctx");
-    conttest_window_show_input_viewer(ctx->view->window, ctx->device, preferred_backend(ctx->device));
+    g_autoptr(ConttestDevice) dev = g_object_ref(ctx->device);
+    conttest_window_show_input_viewer(ctx->view->window, dev, preferred_backend(dev));
 }
 
 static const struct {
     const char *keyword;
-    const char *icon_path;
+    const char *icon_name;
 } ICON_LOOKUP[] = {
-    { "dualsense",           "/io/github/gabriel2silva/Haptika/icons/ps5.svg" },
-    { "ps5",                 "/io/github/gabriel2silva/Haptika/icons/ps5.svg" },
-    { "dualshock 4",         "/io/github/gabriel2silva/Haptika/icons/ps4.svg" },
-    { "ps4",                 "/io/github/gabriel2silva/Haptika/icons/ps4.svg" },
-    { "wireless controller", "/io/github/gabriel2silva/Haptika/icons/ps4.svg" },
-    { "dualshock 3",         "/io/github/gabriel2silva/Haptika/icons/ps3.svg" },
-    { "ps3",                 "/io/github/gabriel2silva/Haptika/icons/ps3.svg" },
-    { "dualshock 2",         "/io/github/gabriel2silva/Haptika/icons/ps2.svg" },
-    { "ps2",                 "/io/github/gabriel2silva/Haptika/icons/ps2.svg" },
-    { "playstation portable","/io/github/gabriel2silva/Haptika/icons/psp.svg" },
-    { "psp",                 "/io/github/gabriel2silva/Haptika/icons/psp.svg" },
-    { "dualshock",           "/io/github/gabriel2silva/Haptika/icons/ps1.svg" },
-    { "ps1",                 "/io/github/gabriel2silva/Haptika/icons/ps1.svg" },
-    { "playstation",         "/io/github/gabriel2silva/Haptika/icons/ps1.svg" },
-    { "series x",            "/io/github/gabriel2silva/Haptika/icons/xbox-series-x.svg" },
-    { "series s",            "/io/github/gabriel2silva/Haptika/icons/xbox-series-x.svg" },
-    { "xbox one",            "/io/github/gabriel2silva/Haptika/icons/xbox-one.svg" },
-    { "xbox wireless",       "/io/github/gabriel2silva/Haptika/icons/xbox-one.svg" },
-    { "xbox 360",            "/io/github/gabriel2silva/Haptika/icons/xbox-360.svg" },
-    { "xbox controller s",   "/io/github/gabriel2silva/Haptika/icons/xbox-controller-s.svg" },
-    { "joy-con (l)",         "/io/github/gabriel2silva/Haptika/icons/joy-con-l.svg" },
-    { "joy-con (r)",         "/io/github/gabriel2silva/Haptika/icons/joy-con-r.svg" },
-    { "joy-con",             "/io/github/gabriel2silva/Haptika/icons/joy-cons.svg" },
-    { "switch pro",          "/io/github/gabriel2silva/Haptika/icons/switch-pro.svg" },
-    { "pro controller",      "/io/github/gabriel2silva/Haptika/icons/switch-pro.svg" },
-    { "wii u pro",           "/io/github/gabriel2silva/Haptika/icons/wii-u-pro.svg" },
-    { "wii u",               "/io/github/gabriel2silva/Haptika/icons/wii-u.svg" },
-    { "wii classic",         "/io/github/gabriel2silva/Haptika/icons/wii-classic.svg" },
-    { "wiimote",             "/io/github/gabriel2silva/Haptika/icons/wii.svg" },
-    { "wii remote",          "/io/github/gabriel2silva/Haptika/icons/wii.svg" },
-    { "gamecube",            "/io/github/gabriel2silva/Haptika/icons/gamecube.svg" },
-    { "n64",                 "/io/github/gabriel2silva/Haptika/icons/n64.svg" },
-    { "nintendo 64",         "/io/github/gabriel2silva/Haptika/icons/n64.svg" },
-    { "snes",                "/io/github/gabriel2silva/Haptika/icons/snes.svg" },
-    { "super nintendo",      "/io/github/gabriel2silva/Haptika/icons/snes.svg" },
-    { "nes",                 "/io/github/gabriel2silva/Haptika/icons/nes.svg" },
-    { "nintendo entertainment system", "/io/github/gabriel2silva/Haptika/icons/nes.svg" },
-    { "virtual boy",         "/io/github/gabriel2silva/Haptika/icons/virtual-boy.svg" },
-    { "dreamcast",           "/io/github/gabriel2silva/Haptika/icons/dreamcast.svg" },
-    { "saturn",              "/io/github/gabriel2silva/Haptika/icons/sega-saturn.svg" },
-    { "mega drive",          "/io/github/gabriel2silva/Haptika/icons/mega-drive.svg" },
-    { "genesis",             "/io/github/gabriel2silva/Haptika/icons/mega-drive.svg" },
-    { "master system",       "/io/github/gabriel2silva/Haptika/icons/master-system.svg" },
-    { "jaguar",              "/io/github/gabriel2silva/Haptika/icons/atari-jaguar.svg" },
-    { "atari 2600",          "/io/github/gabriel2silva/Haptika/icons/atari-2600.svg" },
-    { "2600",                "/io/github/gabriel2silva/Haptika/icons/atari-2600.svg" },
-    { "stadia",              "/io/github/gabriel2silva/Haptika/icons/stadia.svg" }
+    { "dualsense",           "ps5-symbolic" },
+    { "ps5",                 "ps5-symbolic" },
+    { "dualshock 4",         "ps4-symbolic" },
+    { "ps4",                 "ps4-symbolic" },
+    { "wireless controller", "ps4-symbolic" },
+    { "dualshock 3",         "ps3-symbolic" },
+    { "ps3",                 "ps3-symbolic" },
+    { "dualshock 2",         "ps2-symbolic" },
+    { "ps2",                 "ps2-symbolic" },
+    { "playstation portable","psp-symbolic" },
+    { "psp",                 "psp-symbolic" },
+    { "dualshock",           "ps1-symbolic" },
+    { "ps1",                 "ps1-symbolic" },
+    { "psx",                 "ps1-symbolic" },
+    { "playstation",         "ps1-symbolic" },
+    { "series x",            "xbox-series-x-symbolic" },
+    { "series s",            "xbox-series-x-symbolic" },
+    { "xbox one",            "xbox-one-symbolic" },
+    { "xbox wireless",       "xbox-one-symbolic" },
+    { "xbox 360",            "xbox-360-symbolic" },
+    { "xbox controller s",   "xbox-controller-s-symbolic" },
+    { "joy-con (l)",         "joy-con-l-symbolic" },
+    { "joy-con (r)",         "joy-con-r-symbolic" },
+    { "joy-con",             "joy-cons-symbolic" },
+    { "switch pro",          "switch-pro-symbolic" },
+    { "pro controller",      "switch-pro-symbolic" },
+    { "wii u pro",           "wii-u-pro-symbolic" },
+    { "wii u",               "wii-u-symbolic" },
+    { "wii classic",         "wii-classic-symbolic" },
+    { "wiimote",             "wii-symbolic" },
+    { "wii remote",          "wii-symbolic" },
+    { "gamecube",            "gamecube-symbolic" },
+    { "n64",                 "n64-symbolic" },
+    { "nintendo 64",         "n64-symbolic" },
+    { "snes",                "snes-symbolic" },
+    { "super nintendo",      "snes-symbolic" },
+    { "nes",                 "nes-symbolic" },
+    { "nintendo entertainment system", "nes-symbolic" },
+    { "virtual boy",         "virtual-boy-symbolic" },
+    { "dreamcast",           "dreamcast-symbolic" },
+    { "saturn",              "sega-saturn-symbolic" },
+    { "mega drive",          "mega-drive-symbolic" },
+    { "genesis",             "mega-drive-symbolic" },
+    { "master system",       "master-system-symbolic" },
+    { "jaguar",              "atari-jaguar-symbolic" },
+    { "atari 2600",          "atari-2600-symbolic" },
+    { "2600",                "atari-2600-symbolic" },
+    { "stadia",              "stadia-symbolic" },
+    { "xbox",                "xbox-symbolic" }
 };
 
-static const char *get_icon_for_name(const char *name) {
+/* Case-insensitive substring test used by the device-name icon heuristics. */
+static gboolean name_contains_ci(const char *name, const char *keyword) {
+    if (!name || !keyword)
+        return FALSE;
     char *lower = g_ascii_strdown(name, -1);
-    const char *result = "/io/github/gabriel2silva/Haptika/icons/stadia.svg";
+    gboolean found = strstr(lower, keyword) != NULL;
+    g_free(lower);
+    return found;
+}
+
+static const char *get_icon_for_name(const char *name) {
+    if (!name)
+        return "stadia-symbolic";
+    char *lower = g_ascii_strdown(name, -1);
+    const char *result = "stadia-symbolic";
 
     for (size_t i = 0; i < G_N_ELEMENTS(ICON_LOOKUP); i++) {
         if (strstr(lower, ICON_LOOKUP[i].keyword)) {
-            result = ICON_LOOKUP[i].icon_path;
+            result = ICON_LOOKUP[i].icon_name;
             break;
         }
     }
@@ -120,21 +162,57 @@ static const char *get_icon_for_name(const char *name) {
 }
 
 static const char *get_icon_for_device(const ConttestDevice *dev) {
+    /* PSX adapters (e.g. Raphnet PSX-to-USB) have no SDL PS1 type and may be
+     * evdev-only or report a generic gamepad type, so the device name takes
+     * precedence to ensure every "PSX" device gets the PS1 icon. */
+    if (name_contains_ci(conttest_device_get_name(dev), "psx"))
+        return "ps1-symbolic";
+
     if (conttest_device_get_has_sdl(dev)) {
         switch (SDL_GetGamepadTypeForID(conttest_device_get_sdl_id(dev))) {
-        case SDL_GAMEPAD_TYPE_PS5:                  return "/io/github/gabriel2silva/Haptika/icons/ps5.svg";
-        case SDL_GAMEPAD_TYPE_PS4:                  return "/io/github/gabriel2silva/Haptika/icons/ps4.svg";
-        case SDL_GAMEPAD_TYPE_PS3:                  return "/io/github/gabriel2silva/Haptika/icons/ps3.svg";
-        case SDL_GAMEPAD_TYPE_XBOX360:              return "/io/github/gabriel2silva/Haptika/icons/xbox-360.svg";
-        case SDL_GAMEPAD_TYPE_XBOXONE:              return "/io/github/gabriel2silva/Haptika/icons/xbox-one.svg";
-        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:  return "/io/github/gabriel2silva/Haptika/icons/switch-pro.svg";
-        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:  return "/io/github/gabriel2silva/Haptika/icons/joy-con-l.svg";
-        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: return "/io/github/gabriel2silva/Haptika/icons/joy-con-r.svg";
-        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:  return "/io/github/gabriel2silva/Haptika/icons/joy-cons.svg";
+        case SDL_GAMEPAD_TYPE_PS5:                  return "ps5-symbolic";
+        case SDL_GAMEPAD_TYPE_PS4:                  return "ps4-symbolic";
+        case SDL_GAMEPAD_TYPE_PS3:                  return "ps3-symbolic";
+        case SDL_GAMEPAD_TYPE_XBOX360:              return "xbox-360-symbolic";
+        case SDL_GAMEPAD_TYPE_XBOXONE:              return "xbox-one-symbolic";
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:  return "switch-pro-symbolic";
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:  return "joy-con-l-symbolic";
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: return "joy-con-r-symbolic";
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:  return "joy-cons-symbolic";
         default: break;
         }
     }
     return get_icon_for_name(conttest_device_get_name(dev));
+}
+
+static void update_row_icon(RowContext *ctx, const ConttestDevice *dev) {
+    if (!ctx->icon) return;
+
+    gboolean has_sdl = conttest_device_get_has_sdl(dev);
+    SDL_JoystickID sdl_id = has_sdl ? conttest_device_get_sdl_id(dev) : 0;
+    SDL_GamepadType gtype =
+        has_sdl ? SDL_GetGamepadTypeForID(sdl_id) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    const char *name = conttest_device_get_name(dev);
+
+    if (ctx->cached_icon_name &&
+        ctx->cached_has_sdl == has_sdl &&
+        ctx->cached_sdl_id == sdl_id &&
+        ctx->cached_gamepad_type == gtype &&
+        g_strcmp0(ctx->cached_dev_name, name) == 0) {
+        return;
+    }
+
+    const char *icon_name = get_icon_for_device(dev);
+    g_free(ctx->cached_dev_name);
+    ctx->cached_dev_name = g_strdup(name);
+    ctx->cached_has_sdl = has_sdl;
+    ctx->cached_sdl_id = sdl_id;
+    ctx->cached_gamepad_type = gtype;
+
+    if (g_strcmp0(ctx->cached_icon_name, icon_name) != 0) {
+        ctx->cached_icon_name = icon_name;
+        gtk_image_set_from_icon_name(GTK_IMAGE(ctx->icon), icon_name);
+    }
 }
 
 static void update_row_battery(RowContext *ctx, const ConttestDevice *device) {
@@ -154,13 +232,37 @@ static void update_row_battery(RowContext *ctx, const ConttestDevice *device) {
         gtk_widget_set_visible(ctx->battery_box, FALSE);
     }
 
+    if (ctx->virtual_icon) {
+        if (conttest_device_get_virtual_kind(device) == CONTTEST_VIRTUAL_INPUTPLUMBER) {
+            const ConttestInputPlumberInfo *ip = conttest_device_get_inputplumber_info(device);
+            char *label = NULL;
+            if (ip && ip->composite_name && *ip->composite_name) {
+                label = g_strdup_printf(_("InputPlumber virtual device (%s)"), ip->composite_name);
+            } else {
+                label = g_strdup(_("InputPlumber virtual device"));
+            }
+            gtk_widget_set_tooltip_text(ctx->virtual_icon, label);
+            gtk_accessible_update_property(GTK_ACCESSIBLE(ctx->virtual_icon),
+                                           GTK_ACCESSIBLE_PROPERTY_LABEL, label, -1);
+            g_free(label);
+            gtk_widget_set_visible(ctx->virtual_icon, TRUE);
+        } else {
+            gtk_widget_set_visible(ctx->virtual_icon, FALSE);
+        }
+    }
+
     if (ctx->connection_icon) {
         SDL_JoystickConnectionState conn = conttest_device_get_connection_state(device);
         if (conn != SDL_JOYSTICK_CONNECTION_UNKNOWN) {
-            const char *conn_icon = (conn == SDL_JOYSTICK_CONNECTION_WIRELESS)
+            gboolean wireless = (conn == SDL_JOYSTICK_CONNECTION_WIRELESS);
+            const char *conn_icon = wireless
                 ? "haptika-bluetooth-symbolic"
                 : "haptika-usb-symbolic";
             gtk_image_set_from_icon_name(GTK_IMAGE(ctx->connection_icon), conn_icon);
+            gtk_accessible_update_property(
+                GTK_ACCESSIBLE(ctx->connection_icon),
+                GTK_ACCESSIBLE_PROPERTY_LABEL,
+                wireless ? _("Connected via Bluetooth") : _("Connected via USB"), -1);
             gtk_widget_set_visible(ctx->connection_icon, TRUE);
         } else {
             gtk_widget_set_visible(ctx->connection_icon, FALSE);
@@ -170,11 +272,13 @@ static void update_row_battery(RowContext *ctx, const ConttestDevice *device) {
 
 static GtkWidget *create_row_for_device(ConttestSelectorView *self, ConttestDevice *device) {
     GtkWidget *row = adw_action_row_new();
+    adw_preferences_row_set_use_markup(ADW_PREFERENCES_ROW(row), FALSE);
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), conttest_device_get_name(device));
-    adw_action_row_set_subtitle(ADW_ACTION_ROW(row), format_backend_subtitle(device));
+    char *subtitle = format_device_subtitle(device);
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(row), subtitle);
+    g_free(subtitle);
 
-    const char *icon_path = get_icon_for_device(device);
-    GtkWidget *icon = gtk_image_new_from_resource(icon_path);
+    GtkWidget *icon = gtk_image_new();
     gtk_image_set_pixel_size(GTK_IMAGE(icon), 48);
     adw_action_row_add_prefix(ADW_ACTION_ROW(row), icon);
     
@@ -183,20 +287,27 @@ static GtkWidget *create_row_for_device(ConttestSelectorView *self, ConttestDevi
 
     RowContext *ctx = g_new0(RowContext, 1);
     ctx->view   = self;
-    ctx->device = device;
+    ctx->device = g_object_ref(device);
     ctx->icon   = icon;
+    update_row_icon(ctx, device);
 
     /* Always pre-create battery widgets to ensure stable suffix order (Battery | Menu). */
     ctx->battery_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_valign(ctx->battery_box, GTK_ALIGN_CENTER);
     ctx->battery_label = gtk_label_new(NULL);
-    gtk_widget_add_css_class(ctx->battery_label, "dim-label");
+    gtk_widget_add_css_class(ctx->battery_label, "dimmed");
     gtk_box_append(GTK_BOX(ctx->battery_box), ctx->battery_label);
     ctx->battery_icon = gtk_image_new();
     gtk_image_set_pixel_size(GTK_IMAGE(ctx->battery_icon), 16);
     gtk_box_append(GTK_BOX(ctx->battery_box), ctx->battery_icon);
     
     adw_action_row_add_suffix(ADW_ACTION_ROW(row), ctx->battery_box);
+
+    ctx->virtual_icon = gtk_image_new_from_icon_name("haptika-inputplumber-symbolic");
+    gtk_image_set_pixel_size(GTK_IMAGE(ctx->virtual_icon), 16);
+    gtk_widget_set_valign(ctx->virtual_icon, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_end(ctx->virtual_icon, 4);
+    adw_action_row_add_suffix(ADW_ACTION_ROW(row), ctx->virtual_icon);
 
     ctx->connection_icon = gtk_image_new();
     gtk_image_set_pixel_size(GTK_IMAGE(ctx->connection_icon), 16);
@@ -206,7 +317,7 @@ static GtkWidget *create_row_for_device(ConttestSelectorView *self, ConttestDevi
 
     update_row_battery(ctx, device);
 
-    g_object_set_data_full(G_OBJECT(row), "ctx", ctx, g_free);
+    g_object_set_data_full(G_OBJECT(row), "ctx", ctx, row_context_free);
     return row;
 }
 
@@ -262,11 +373,11 @@ static void on_device_updated(ConttestDeviceManager *mgr, ConttestDevice *dev, g
 
     AdwActionRow *row = ADW_ACTION_ROW(child);
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), conttest_device_get_name(dev));
-    adw_action_row_set_subtitle(row, format_backend_subtitle(dev));
+    char *subtitle = format_device_subtitle(dev);
+    adw_action_row_set_subtitle(row, subtitle);
+    g_free(subtitle);
 
-    if (ctx->icon) {
-        gtk_image_set_from_resource(GTK_IMAGE(ctx->icon), get_icon_for_device(dev));
-    }
+    update_row_icon(ctx, dev);
 
     update_row_battery(ctx, dev);
 }

@@ -1,21 +1,37 @@
 project('haptika', 'c',
-  version: '1.0.0',
+  version: '2.0.0',
+  license: 'GPL-3.0-or-later',
+  meson_version: '>= 0.63.0',
   default_options: [
     'c_std=c11',
-    'warning_level=2'
+    'warning_level=3'
   ]
 )
 
 cc = meson.get_compiler('c')
 
-adw_dep = dependency('libadwaita-1')
-gtk_dep = dependency('gtk4')
+if get_option('x86_64_v1') and host_machine.cpu_family() == 'x86_64'
+  add_project_arguments(
+    cc.get_supported_arguments(['-march=x86-64', '-mtune=generic']),
+    language: 'c',
+  )
+endif
+
+# libadwaita 1.7 is required for AdwWrapBox; GTK 4.16 for the CSS color-mix()
+# used by data/style.css.
+adw_dep = dependency('libadwaita-1', version: '>=1.7')
+gtk_dep = dependency('gtk4', version: '>=4.16')
+glib_dep = dependency('glib-2.0', version: '>=2.66')
+gio_dep = dependency('gio-2.0', version: '>=2.66')
 sdl3_dep = dependency('sdl3', version: '>=3.2.0')
 evdev_dep = dependency('libevdev', version: '>=1.11.0')
 udev_dep = dependency('libudev', version: '>=249')
 threads_dep = dependency('threads')
 m_dep = cc.find_library('m', required : false)
-pipewire_dep = dependency('libpipewire-0.3', required: false)
+# PipeWire and SPA headers are not warning-clean under -Wpedantic; keep them
+# out of the project's warning set.
+pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire'),
+  include_type: 'system')
 
 gnome = import('gnome')
 i18n = import('i18n')
@@ -33,25 +49,39 @@ resources = gnome.compile_resources('haptika-resources',
   source_dir: 'data',
 )
 
-
+# The embedded gresource blob exceeds the ISO C99 minimum string length. Keep
+# -Woverlength-strings active for project code and build the generated source
+# as its own translation unit with that warning disabled.
+resources_lib = static_library('haptika-resources', resources,
+  dependencies: [glib_dep, gio_dep],
+  c_args: ['-Wno-overlength-strings'],
+  install: false,
+)
 
 src_files = [
   'src/main.c',
   'src/window.c',
   'src/device_manager.c',
+  'src/device_matching.c',
+  'src/inputplumber.c',
+  'src/inputplumber_logic.c',
+  'src/inputplumber_info.c',
   'src/ds4_info.c',
   'src/ds5_info.c',
   'src/ds3_info.c',
   'src/controller_info_utils.c',
+  'src/controller_info_parsers.c',
   'src/selector_view.c',
   'src/input_viewer.c',
   'src/input_session.c',
   'src/input_session_evdev.c',
   'src/input_session_sdl3.c',
   'src/battery.c',
+  'src/dsp_oscillator.c',
   'src/speaker_test.c',
   'src/widgets/analog_stick.c',
   'src/widgets/button_indicator.c',
+  'src/widgets/drawing_utils.c',
   'src/widgets/tilt_indicator.c',
   'src/widgets/touchpad.c',
   'src/widgets/trigger_bar.c'
@@ -59,12 +89,14 @@ src_files = [
 
 haptika_deps = [adw_dep, gtk_dep, sdl3_dep, evdev_dep, udev_dep, threads_dep, m_dep]
 if pipewire_dep.found()
+  src_files += 'src/speaker_routing.c'
   haptika_deps += pipewire_dep
 endif
 
 executable('haptika',
-  src_files, resources, config_h,
+  src_files, config_h,
   dependencies: haptika_deps,
+  link_whole: resources_lib,
   include_directories: include_directories('.'),
   install: true
 )
@@ -83,6 +115,10 @@ install_data('data/icons/hicolor/scalable/apps/io.github.gabriel2silva.Haptika.s
 
 install_data('data/icons/hicolor/symbolic/apps/io.github.gabriel2silva.Haptika-symbolic.svg',
   install_dir: get_option('datadir') / 'icons/hicolor/symbolic/apps'
+)
+
+install_data('data/icons/NOTICE.md', 'data/icons/OFL.txt',
+  install_dir: get_option('datadir') / 'doc' / meson.project_name()
 )
 
 install_data('data/io.github.gabriel2silva.Haptika.gschema.xml',
@@ -108,6 +144,72 @@ if appstreamcli.found()
   test('validate-metainfo', appstreamcli,
     args: ['validate', '--no-net',
            meson.project_source_root() / 'data/io.github.gabriel2silva.Haptika.metainfo.xml'])
+endif
+
+# Pure C unit tests (run with `meson test -C build`)
+unit_inc = include_directories('src', '.')
+
+test_dsp_exe = executable('unit_test_dsp',
+  ['tests/test_dsp.c', 'src/dsp_oscillator.c'],
+  dependencies: [glib_dep, m_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-dsp', test_dsp_exe, suite: 'unit')
+
+test_ring_exe = executable('unit_test_ring_buffer',
+  ['tests/test_ring_buffer.c', 'src/input_session.c'],
+  dependencies: [glib_dep, threads_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-ring-buffer', test_ring_exe, suite: 'unit')
+
+test_parsers_exe = executable('unit_test_parsers',
+  ['tests/test_parsers.c', 'src/controller_info_parsers.c',
+   'src/controller_info_utils.c'],
+  dependencies: [adw_dep, gtk_dep, udev_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-parsers', test_parsers_exe, suite: 'unit')
+
+test_device_match_exe = executable('unit_test_device_match',
+  ['tests/test_device_match.c', 'src/device_matching.c',
+   'src/inputplumber_logic.c'],
+  dependencies: [sdl3_dep, udev_dep, gio_dep, glib_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-device-match', test_device_match_exe, suite: 'unit')
+
+test_device_manager_exe = executable('unit_test_device_manager',
+  ['tests/test_device_manager.c', 'src/device_manager.c',
+   'src/device_matching.c', 'src/inputplumber.c',
+   'src/inputplumber_logic.c'],
+  dependencies: [sdl3_dep, udev_dep, gio_dep, glib_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-device-manager', test_device_manager_exe, suite: 'unit')
+
+test_inputplumber_monitor_exe = executable('unit_test_inputplumber_monitor',
+  ['tests/test_inputplumber_monitor.c', 'src/inputplumber.c',
+   'src/inputplumber_logic.c'],
+  dependencies: [gio_dep, glib_dep, udev_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-inputplumber-monitor', test_inputplumber_monitor_exe, suite: 'unit')
+
+if pipewire_dep.found()
+  test_speaker_exe = executable('unit_test_speaker',
+    ['tests/test_speaker.c', 'src/speaker_routing.c', config_h],
+    dependencies: [glib_dep, pipewire_dep],
+    include_directories: unit_inc,
+    install: false,
+  )
+  test('unit-speaker', test_speaker_exe, suite: 'unit')
 endif
 
 # Developer tools (not installed, build with `meson compile -C build test_sdl` etc.)

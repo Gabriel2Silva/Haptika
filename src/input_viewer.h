@@ -12,18 +12,25 @@ G_DECLARE_FINAL_TYPE(ConttestInputViewer, conttest_input_viewer, CONTTEST, INPUT
 
 GtkWidget *conttest_input_viewer_new(ConttestWindow *window);
 
-gboolean conttest_input_viewer_start(ConttestInputViewer *self, ConttestBackend api, const char *device_path_or_id, const ConttestDevice *device);
+gboolean conttest_input_viewer_start(ConttestInputViewer *self, ConttestBackend api, const ConttestDevice *device);
+void conttest_input_viewer_refresh_device(ConttestInputViewer *self, const ConttestDevice *device);
 void conttest_input_viewer_stop(ConttestInputViewer *self);
+
+/* Called on the main loop when a backend reports that its device disappeared.
+ * Tears down the session if `ctx` is still current and asks the window to
+ * return to the selector. */
+void conttest_input_viewer_session_lost(ConttestInputViewer *self,
+                                        ViewerSessionContext *ctx);
 
 /* Apply a single input event directly. Only call from the main thread.
  * The SDL3 backend calls this directly since it already runs on the main thread.
- * The evdev backend uses handle_event_batch (via g_idle_add) because it
- * operates from a background thread. */
+ * The evdev backend pushes into the lock-free SPSC ring and coalesces
+ * wakeups via conttest_input_viewer_drain_ring. */
 void conttest_input_viewer_apply_event(ConttestInputViewer *self, const ConttestInputEvent *ev);
 
 /* Called by main thread dispatchers */
 gboolean conttest_input_viewer_handle_layout(gpointer data);
-gboolean conttest_input_viewer_handle_event_batch(gpointer data);
+gboolean conttest_input_viewer_drain_ring(gpointer data);
 
 
 G_END_DECLS

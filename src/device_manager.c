@@ -1,30 +1,140 @@
+#define _POSIX_C_SOURCE 200809L
 #include "device_manager.h"
+#include "device_matching.h"
+#include <fcntl.h>
+#include <gio/gio.h>
+#include <glib-unix.h>
 #include <libudev.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+#define SDL_POLL_INTERVAL_MS 50
+#define SDL_PUMP_COALESCE_US (20 * G_TIME_SPAN_MILLISECOND)
+#define BATTERY_POLL_INTERVAL_SEC 5
+
+/* Main-thread monotonic timestamp of the most recent SDL_PumpEvents() call,
+ * used to coalesce back-to-back pumps between the 50 ms hotplug timer and the
+ * active SDL3 session's 1 kHz poll source. */
+static gint64 last_sdl_pump_us = 0;
+
+void conttest_sdl_configure_events(void) {
+  static const Uint32 unused_high_rate_events[] = {
+    SDL_EVENT_GAMEPAD_AXIS_MOTION,
+    SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+    SDL_EVENT_GAMEPAD_BUTTON_UP,
+    SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN,
+    SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION,
+    SDL_EVENT_GAMEPAD_TOUCHPAD_UP,
+    SDL_EVENT_GAMEPAD_SENSOR_UPDATE,
+    SDL_EVENT_GAMEPAD_UPDATE_COMPLETE,
+    SDL_EVENT_JOYSTICK_AXIS_MOTION,
+    SDL_EVENT_JOYSTICK_BUTTON_DOWN,
+    SDL_EVENT_JOYSTICK_BUTTON_UP,
+    SDL_EVENT_JOYSTICK_HAT_MOTION,
+    SDL_EVENT_JOYSTICK_BALL_MOTION,
+    SDL_EVENT_JOYSTICK_UPDATE_COMPLETE,
+  };
+  for (gsize i = 0; i < G_N_ELEMENTS(unused_high_rate_events); i++) {
+    SDL_SetEventEnabled(unused_high_rate_events[i], false);
+  }
+}
+
+void conttest_sdl_pump_events_at(gint64 monotonic_now_us) {
+  SDL_PumpEvents();
+  last_sdl_pump_us = (monotonic_now_us > 0)
+      ? monotonic_now_us
+      : g_get_monotonic_time();
+}
+
+void conttest_sdl_pump_events(void) {
+  conttest_sdl_pump_events_at(g_get_monotonic_time());
+}
+
+typedef enum {
+  DS3_BATTERY_UNPROBED = 0,
+  DS3_BATTERY_PROBING,
+  DS3_BATTERY_PROBED,
+} Ds3BatteryState;
+
+/* Cached udev metadata extracted on worker threads so main-loop matching,
+ * connection-state resolution, and InputPlumber visibility checks never perform
+ * synchronous sysfs/udev I/O. */
+typedef struct {
+  char *own_syspath;
+  GStrv hw_keys;
+  char *serial;
+  SDL_JoystickConnectionState udev_conn;
+  gboolean is_virtual;
+  char *virtual_bus;
+  char *virtual_uniq;
+  gboolean ip_hidden_devlink;
+  gboolean udev_dead;
+} UdevAttachMeta;
+
+static void udev_attach_meta_clear(UdevAttachMeta *m) {
+  g_clear_pointer(&m->own_syspath, g_free);
+  g_clear_pointer(&m->hw_keys, g_strfreev);
+  g_clear_pointer(&m->serial, g_free);
+  m->udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+  m->is_virtual = FALSE;
+  g_clear_pointer(&m->virtual_bus, g_free);
+  g_clear_pointer(&m->virtual_uniq, g_free);
+  m->ip_hidden_devlink = FALSE;
+  m->udev_dead = FALSE;
+}
+
+static void udev_attach_meta_move(UdevAttachMeta *dst, UdevAttachMeta *src) {
+  udev_attach_meta_clear(dst);
+  *dst = *src;
+  memset(src, 0, sizeof(*src));
+  src->udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+}
 
 /* ConttestDevice definition is private to this file. */
 struct _ConttestDevice {
+  GObject parent_instance;
+
   char *name;
   gboolean has_sdl;
   SDL_JoystickID sdl_id;
   char *sdl_path;
   SDL_Gamepad *sdl_gamepad; /* kept open while attached, for battery polling */
+  UdevAttachMeta sdl_meta;
+  gboolean sdl_probe_pending;
+  guint sdl_udev_seq;
+
   gboolean has_evdev;
   char *evdev_syspath;
+  char *evdev_devnode;
+  UdevAttachMeta evdev_meta;
+  guint evdev_udev_seq;
 
   /* Hardware identity for narrow fallbacks (e.g. DS3 battery). */
 
   uint16_t vendor_id;
   uint16_t product_id;
   char *battery_syspath; /* Resolved power_supply node */
+  Ds3BatteryState ds3_battery_state;
+  gboolean ds3_battery_rescan_pending;
+  gboolean ds3_battery_in_flight;
+  guint ds3_battery_probe_seq;
 
-  /* Battery state — only meaningful when has_sdl is TRUE. */
+  /* Battery state; only meaningful when has_sdl is TRUE. */
   SDL_PowerState battery_state;
-  int battery_percent; /* 0–100, or -1 if unknown */
+  int battery_percent; /* 0-100, or -1 if unknown */
   SDL_JoystickConnectionState connection_state;
+
+  /* Virtual / InputPlumber state */
+  ConttestVirtualKind virtual_kind;
+  char *virtual_bus;
+  char *virtual_uniq;
+  ConttestInputPlumberInfo *ip_info;
+  gboolean hidden;
 };
+
+G_DEFINE_TYPE(ConttestDevice, conttest_device, G_TYPE_OBJECT)
 
 /* Read-only accessors */
 
@@ -48,6 +158,10 @@ const char *conttest_device_get_evdev_syspath(const ConttestDevice *device) {
   return device->evdev_syspath;
 }
 
+const char *conttest_device_get_evdev_devnode(const ConttestDevice *device) {
+  return device->evdev_devnode;
+}
+
 SDL_PowerState conttest_device_get_battery_state(const ConttestDevice *device) {
   return device->battery_state;
 }
@@ -69,18 +183,58 @@ uint16_t conttest_device_get_product_id(const ConttestDevice *device) {
   return device->product_id;
 }
 
+ConttestVirtualKind conttest_device_get_virtual_kind(const ConttestDevice *device) {
+  return device->virtual_kind;
+}
+
+gboolean conttest_device_is_virtual(const ConttestDevice *device) {
+  return device->virtual_kind != CONTTEST_VIRTUAL_NONE;
+}
+
+const ConttestInputPlumberInfo *
+conttest_device_get_inputplumber_info(const ConttestDevice *device) {
+  return device->ip_info;
+}
+
 struct _ConttestDeviceManager {
   GObject parent_instance;
-  GPtrArray *devices; // Array of ConttestDevice*
+  GPtrArray *devices; /* Array of ConttestDevice* */
 
+  GCancellable *cancellable;
   struct udev *udev;
   struct udev_monitor *udev_mon;
-  GIOChannel *udev_channel;
   guint udev_watch_id;
 
   guint sdl_timer_id;
-  guint battery_poll_counter; /* throttle: poll battery every N ticks */
+  guint battery_timer_id;
+  guint sdl_sync_idle_id;
+
+  gboolean evdev_scan_in_flight;
+  gboolean evdev_rescan_pending;
+  gboolean udev_refresh_in_flight;
+  gboolean udev_refresh_pending;
+
+  GHashTable *evdev_seq_by_syspath; /* owned char* -> GUINT_TO_POINTER(seq) */
+  guint evdev_seq;
+  guint evdev_probes_in_flight;
+  guint evdev_remove_seq;
+
+  gboolean disposed;
+
+  ConttestInputPlumberMonitor *ip_monitor;
 };
+
+static GWeakRef *manager_weak_ref_new(ConttestDeviceManager *self) {
+  GWeakRef *wr = g_new0(GWeakRef, 1);
+  g_weak_ref_init(wr, self);
+  return wr;
+}
+
+static void manager_weak_ref_free(gpointer data) {
+  GWeakRef *wr = data;
+  g_weak_ref_clear(wr);
+  g_free(wr);
+}
 
 enum {
   SIGNAL_DEVICE_ADDED,
@@ -93,30 +247,51 @@ static guint signals[LAST_SIGNAL] = {0};
 
 G_DEFINE_TYPE(ConttestDeviceManager, conttest_device_manager, G_TYPE_OBJECT)
 
-static ConttestDevice *conttest_device_new(const char *name) {
-  ConttestDevice *dev = g_new0(ConttestDevice, 1);
-  dev->name = g_strdup(name);
-  dev->battery_state = SDL_POWERSTATE_UNKNOWN;
-  dev->battery_percent = -1;
-  dev->connection_state = SDL_JOYSTICK_CONNECTION_UNKNOWN;
-  return dev;
-}
-
-static void conttest_device_free(ConttestDevice *device) {
-  if (!device)
-    return;
+static void conttest_device_finalize(GObject *object) {
+  ConttestDevice *device = CONTTEST_DEVICE(object);
   if (device->sdl_gamepad) {
     SDL_CloseGamepad(device->sdl_gamepad);
     device->sdl_gamepad = NULL;
   }
+  udev_attach_meta_clear(&device->sdl_meta);
+  udev_attach_meta_clear(&device->evdev_meta);
   g_free(device->name);
   g_free(device->sdl_path);
   g_free(device->evdev_syspath);
+  g_free(device->evdev_devnode);
   g_free(device->battery_syspath);
-  g_free(device);
+  g_free(device->virtual_bus);
+  g_free(device->virtual_uniq);
+  conttest_inputplumber_info_free(device->ip_info);
+  G_OBJECT_CLASS(conttest_device_parent_class)->finalize(object);
 }
 
-// Device Mutation Helpers
+static void conttest_device_class_init(ConttestDeviceClass *klass) {
+  G_OBJECT_CLASS(klass)->finalize = conttest_device_finalize;
+}
+
+static void conttest_device_init(ConttestDevice *dev) {
+  dev->battery_state = SDL_POWERSTATE_UNKNOWN;
+  dev->battery_percent = -1;
+  dev->connection_state = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+  dev->sdl_meta.udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+  dev->evdev_meta.udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+}
+
+static ConttestDevice *conttest_device_new(const char *name) {
+  ConttestDevice *dev = g_object_new(CONTTEST_TYPE_DEVICE, NULL);
+  dev->name = g_strdup(name);
+  return dev;
+}
+
+static void device_reset_ds3_battery(ConttestDevice *d) {
+  g_clear_pointer(&d->battery_syspath, g_free);
+  d->ds3_battery_state = DS3_BATTERY_UNPROBED;
+  d->ds3_battery_rescan_pending = FALSE;
+  d->ds3_battery_probe_seq++;
+}
+
+/* Device mutation helpers */
 
 static void device_set_name(ConttestDevice *d, const char *name) {
   if (g_strcmp0(d->name, name) != 0 &&
@@ -127,14 +302,55 @@ static void device_set_name(ConttestDevice *d, const char *name) {
   }
 }
 
+static gboolean device_sdl_attachment_is_live(const ConttestDevice *d) {
+  /* SDL keeps an opened gamepad alive after removal and may still report it
+   * as connected. Releasing the handle late lets SDL enumerate the replayed
+   * hardware through the generic joystick driver, which drops touchpad and
+   * battery support; treat a missing cached udev node as a dead attachment. */
+  if (!d->has_sdl || !d->sdl_gamepad || !SDL_GamepadConnected(d->sdl_gamepad))
+    return FALSE;
+  if (d->sdl_meta.own_syspath && access(d->sdl_meta.own_syspath, F_OK) != 0)
+    return FALSE;
+  return TRUE;
+}
+
+/* A live attachment is still replaceable when the incoming instance was probed
+ * from the same udev node: one node cannot back two gamepads, so a new instance
+ * ID for it is a re-enumeration of the previous attachment. */
+static gboolean device_sdl_attachment_is_replaceable(
+    const ConttestDevice *d, const char *incoming_sdl_syspath) {
+  if (!d->has_sdl)
+    return TRUE;
+  if (!device_sdl_attachment_is_live(d))
+    return TRUE;
+  return incoming_sdl_syspath && d->sdl_meta.own_syspath &&
+         g_strcmp0(d->sdl_meta.own_syspath, incoming_sdl_syspath) == 0;
+}
+
 static void device_attach_sdl(ConttestDevice *d, SDL_JoystickID id,
                               const char *sdl_path) {
+  gboolean rebind = d->has_sdl && d->sdl_id != id;
+
   d->has_sdl = TRUE;
-  d->sdl_id = id;
-  if (sdl_path && g_strcmp0(d->sdl_path, sdl_path) != 0) {
+  /* Instance IDs are not stable across re-enumeration, and the cached path
+   * metadata belongs to the previous ID. Invalidate it before rebinding. */
+  if (rebind || g_strcmp0(d->sdl_path, sdl_path) != 0) {
     g_free(d->sdl_path);
     d->sdl_path = g_strdup(sdl_path);
+    udev_attach_meta_clear(&d->sdl_meta);
+    d->sdl_udev_seq++;
   }
+  if (rebind) {
+    if (d->sdl_gamepad) {
+      SDL_CloseGamepad(d->sdl_gamepad);
+      d->sdl_gamepad = NULL;
+    }
+    d->battery_state = SDL_POWERSTATE_UNKNOWN;
+    d->battery_percent = -1;
+    g_debug("Rebinding \"%s\" from SDL instance %u to %u", d->name,
+            (unsigned)d->sdl_id, (unsigned)id);
+  }
+  d->sdl_id = id;
   /* Keep a handle open so battery polling has warm driver data. */
   if (!d->sdl_gamepad) {
     d->sdl_gamepad = SDL_OpenGamepad(id);
@@ -142,6 +358,9 @@ static void device_attach_sdl(ConttestDevice *d, SDL_JoystickID id,
 }
 
 static void device_detach_sdl(ConttestDevice *d) {
+  if (d->has_sdl)
+    g_debug("Detaching \"%s\" from SDL instance %u", d->name,
+            (unsigned)d->sdl_id);
   d->has_sdl = FALSE;
   d->sdl_id = 0;
   g_free(d->sdl_path);
@@ -150,6 +369,9 @@ static void device_detach_sdl(ConttestDevice *d) {
     SDL_CloseGamepad(d->sdl_gamepad);
     d->sdl_gamepad = NULL;
   }
+  udev_attach_meta_clear(&d->sdl_meta);
+  d->sdl_probe_pending = FALSE;
+  d->sdl_udev_seq++;
   d->battery_state = SDL_POWERSTATE_UNKNOWN;
   d->battery_percent = -1;
   d->connection_state = SDL_JOYSTICK_CONNECTION_UNKNOWN;
@@ -159,11 +381,19 @@ static void device_detach_sdl(ConttestDevice *d) {
   }
 }
 
-static void device_attach_evdev(ConttestDevice *d, const char *evdev_syspath) {
+static void device_attach_evdev(ConttestDevice *d, const char *evdev_syspath,
+                                const char *evdev_devnode) {
   d->has_evdev = TRUE;
   if (evdev_syspath && g_strcmp0(d->evdev_syspath, evdev_syspath) != 0) {
     g_free(d->evdev_syspath);
     d->evdev_syspath = g_strdup(evdev_syspath);
+    udev_attach_meta_clear(&d->evdev_meta);
+    d->evdev_udev_seq++;
+    device_reset_ds3_battery(d);
+  }
+  if (evdev_devnode && g_strcmp0(d->evdev_devnode, evdev_devnode) != 0) {
+    g_free(d->evdev_devnode);
+    d->evdev_devnode = g_strdup(evdev_devnode);
   }
 }
 
@@ -171,8 +401,11 @@ static void device_detach_evdev(ConttestDevice *d) {
   d->has_evdev = FALSE;
   g_free(d->evdev_syspath);
   d->evdev_syspath = NULL;
-  g_free(d->battery_syspath);
-  d->battery_syspath = NULL;
+  g_free(d->evdev_devnode);
+  d->evdev_devnode = NULL;
+  udev_attach_meta_clear(&d->evdev_meta);
+  d->evdev_udev_seq++;
+  device_reset_ds3_battery(d);
   /* Clear hardware identity only if SDL is also gone, so that predicates
    * like conttest_device_is_ds3() remain valid during the window between
    * udev remove and SDL remove. */
@@ -182,49 +415,28 @@ static void device_detach_evdev(ConttestDevice *d) {
   }
 }
 
-/* ── Public device-type predicates (defined in device_manager.h) ─────── */
+/* --- Public device-type predicates (defined in device_manager.h) --- */
 
 gboolean conttest_device_is_ds3(const ConttestDevice *device) {
-    return device->vendor_id == SONY_VID && device->product_id == DS3_PID;
+    return conttest_vid_pid_is_ds3(device->vendor_id, device->product_id);
 }
 
 gboolean conttest_device_is_ds4(const ConttestDevice *device) {
-    return device->vendor_id == SONY_VID &&
-           (device->product_id == DS4_PID_V1 ||
-            device->product_id == DS4_PID_V2 ||
-            device->product_id == DS4_PID_BT);
+    return conttest_vid_pid_is_ds4(device->vendor_id, device->product_id);
 }
 
 gboolean conttest_device_is_ds5(const ConttestDevice *device) {
-    return device->vendor_id == SONY_VID &&
-           (device->product_id == DS5_PID_V1 ||
-            device->product_id == DS5_PID_V2);
+    return conttest_vid_pid_is_ds5(device->vendor_id, device->product_id);
 }
 
-
-static gboolean parse_vid_pid(const char *str, char sep, uint16_t *v,
-                              uint16_t *p) {
-  if (!str)
-    return FALSE;
-  uint16_t tv, tp;
-  int matches = (sep == '/')
-      ? sscanf(str, "%*x/%hx/%hx", &tv, &tp)
-      : sscanf(str, "%*x:%hx:%hx", &tv, &tp);
-  if (matches == 2) {
-    *v = tv;
-    *p = tp;
-    return TRUE;
-  }
-  return FALSE;
-}
-
-static char *resolve_ds3_battery_path(ConttestDeviceManager *self,
-                                      ConttestDevice *d) {
-  if (!d->evdev_syspath)
+/* Runs on a GTask worker thread using a thread-local libudev handle. */
+static char *probe_ds3_battery_syspath(struct udev *udev,
+                                       const char *evdev_syspath) {
+  if (!udev || !evdev_syspath)
     return NULL;
 
   struct udev_device *udev_dev =
-      udev_device_new_from_syspath(self->udev, d->evdev_syspath);
+      udev_device_new_from_syspath(udev, evdev_syspath);
   if (!udev_dev)
     return NULL;
 
@@ -241,7 +453,7 @@ static char *resolve_ds3_battery_path(ConttestDeviceManager *self,
   int matches = 0;
 
   /* Enumerate power_supply devices. */
-  struct udev_enumerate *en = udev_enumerate_new(self->udev);
+  struct udev_enumerate *en = udev_enumerate_new(udev);
   if (!en) {
     udev_device_unref(udev_dev);
     return NULL;
@@ -253,8 +465,7 @@ static char *resolve_ds3_battery_path(ConttestDeviceManager *self,
   struct udev_list_entry *l, *entries = udev_enumerate_get_list_entry(en);
   udev_list_entry_foreach(l, entries) {
     const char *name = udev_list_entry_get_name(l);
-    struct udev_device *bat_dev =
-        udev_device_new_from_syspath(self->udev, name);
+    struct udev_device *bat_dev = udev_device_new_from_syspath(udev, name);
     if (bat_dev) {
       struct udev_device *bat_hid =
           udev_device_get_parent_with_subsystem_devtype(bat_dev, "hid", NULL);
@@ -281,51 +492,58 @@ static char *resolve_ds3_battery_path(ConttestDeviceManager *self,
   return resolved_path;
 }
 
-static void poll_ds3_battery_sysfs(const char *syspath, SDL_PowerState *state,
-                                   int *percent) {
+static gboolean read_sysfs_attr_line(const char *syspath, const char *attr,
+                                     char *buf, size_t buf_size) {
+  if (!syspath || !attr || !buf || buf_size < 2)
+    return FALSE;
+  g_autofree char *path = g_build_filename(syspath, attr, NULL);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return FALSE;
+  ssize_t n = read(fd, buf, buf_size - 1);
+  close(fd);
+  if (n <= 0)
+    return FALSE;
+  buf[n] = '\0';
+  return TRUE;
+}
+
+static gboolean poll_ds3_battery_sysfs(const char *syspath,
+                                       SDL_PowerState *state,
+                                       int *percent) {
   *state = SDL_POWERSTATE_UNKNOWN;
   *percent = -1;
 
-  char path[512];
+  if (!syspath || access(syspath, F_OK) != 0)
+    return FALSE;
+
   char buf[64];
-  FILE *f;
 
   /* Read capacity */
-  snprintf(path, sizeof(path), "%s/capacity", syspath);
-  f = fopen(path, "r");
-  if (f) {
-    if (fgets(buf, sizeof(buf), f)) {
-      char *end;
-      long val = strtol(buf, &end, 10);
-      if (end != buf && val >= 0 && val <= 100) {
-        *percent = (int)val;
-      }
+  if (read_sysfs_attr_line(syspath, "capacity", buf, sizeof(buf))) {
+    char *end = NULL;
+    long val = strtol(buf, &end, 10);
+    if (end != buf && val >= 0 && val <= 100) {
+      *percent = (int)val;
     }
-    fclose(f);
   }
 
   /* Read status */
-  snprintf(path, sizeof(path), "%s/status", syspath);
-  f = fopen(path, "r");
-  if (f) {
-    if (fgets(buf, sizeof(buf), f)) {
-      g_strstrip(buf);
-      if (g_strcmp0(buf, "Charging") == 0) {
-        *state = SDL_POWERSTATE_CHARGING;
-        *percent = -1; /* Suppress unreliable DS3 charging percentage */
-      } else if (g_strcmp0(buf, "Full") == 0) {
-        *state = SDL_POWERSTATE_CHARGED;
-        *percent = 100;
-      } else if (g_strcmp0(buf, "Discharging") == 0 ||
-                 g_strcmp0(buf, "Not charging") == 0) {
-        *state = SDL_POWERSTATE_ON_BATTERY;
-      }
+  if (read_sysfs_attr_line(syspath, "status", buf, sizeof(buf))) {
+    g_strstrip(buf);
+    if (g_strcmp0(buf, "Charging") == 0) {
+      *state = SDL_POWERSTATE_CHARGING;
+      *percent = -1; /* Suppress unreliable DS3 charging percentage */
+    } else if (g_strcmp0(buf, "Full") == 0) {
+      *state = SDL_POWERSTATE_CHARGED;
+      *percent = 100;
+    } else if (g_strcmp0(buf, "Discharging") == 0 ||
+               g_strcmp0(buf, "Not charging") == 0) {
+      *state = SDL_POWERSTATE_ON_BATTERY;
     }
-    fclose(f);
   }
+  return TRUE;
 }
-
-// Identifiers fallbacks removed: exclusively topological.
 
 static ConttestDevice *find_device_by_sdl_id(ConttestDeviceManager *self,
                                              SDL_JoystickID id) {
@@ -339,11 +557,21 @@ static ConttestDevice *find_device_by_sdl_id(ConttestDeviceManager *self,
 }
 
 static ConttestDevice *find_device_by_sdl_path(ConttestDeviceManager *self,
-                                               const char *sdl_path) {
-  if (!sdl_path) return NULL;
+                                               const char *sdl_path,
+                                               uint16_t vendor_id,
+                                               uint16_t product_id,
+                                               const char *name) {
+  /* Never coalesce empty paths or shared multi-port nodes (e.g. /dev/hidraw*
+   * or libusb paths used by multi-controller adapters). Only dedicated evdev
+   * device nodes map 1:1 to a controller, and only match identical identity. */
+  if (!sdl_path || !*sdl_path ||
+      !g_str_has_prefix(sdl_path, "/dev/input/event"))
+    return NULL;
   for (guint i = 0; i < self->devices->len; i++) {
     ConttestDevice *d = g_ptr_array_index(self->devices, i);
-    if (d->has_sdl && d->sdl_path && g_strcmp0(d->sdl_path, sdl_path) == 0)
+    if (d->has_sdl && d->sdl_path && g_strcmp0(d->sdl_path, sdl_path) == 0 &&
+        d->vendor_id == vendor_id && d->product_id == product_id &&
+        g_strcmp0(d->name, name) == 0)
       return d;
   }
   return NULL;
@@ -361,219 +589,587 @@ static ConttestDevice *find_device_by_evdev_syspath(ConttestDeviceManager *self,
   return NULL;
 }
 
-static struct udev_device *udev_device_from_devnode(struct udev *udev,
-                                                    const char *path) {
-  if (!path)
-    return NULL;
-  struct stat st;
-  if (stat(path, &st) == 0) {
-    return udev_device_new_from_devnum(udev, S_ISBLK(st.st_mode) ? 'b' : 'c',
-                                       st.st_rdev);
+static ConttestDevice *find_device_by_hardware_for_sdl(
+    ConttestDeviceManager *self,
+    const char *sdl_path,
+    const char *sdl_own_syspath,
+    const char *const *sdl_hw_keys,
+    uint16_t sdl_vid,
+    uint16_t sdl_pid,
+    const char *sdl_serial,
+    SDL_JoystickConnectionState sdl_conn) {
+  /* Fast path in memory: a /dev/input/event* devnode maps 1:1 to a tracked
+   * evdev device. A stale SDL attachment on the candidate is replaceable:
+   * re-enumeration can hand the same hardware a new instance ID. */
+  if (sdl_path && *sdl_path) {
+    for (guint i = 0; i < self->devices->len; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (d->has_evdev &&
+          device_sdl_attachment_is_replaceable(d, sdl_own_syspath) &&
+          d->evdev_devnode && g_strcmp0(d->evdev_devnode, sdl_path) == 0) {
+        return d;
+      }
+    }
   }
+
+  /* Topological match in memory via cached udev hardware ancestor keys.
+   * Only a unique candidate may be merged: keys shared by several pads (USB
+   * receivers, multi-port adapters) must not be resolved by array order, and
+   * the serial/connection data has to agree where both sides provide it. */
+  if (sdl_own_syspath || sdl_hw_keys) {
+    guint count = self->devices->len;
+    g_autofree gboolean *matches = g_new0(gboolean, count);
+    g_autofree gboolean *live = g_new0(gboolean, count);
+    for (guint i = 0; i < count; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (!d->has_evdev ||
+          !device_sdl_attachment_is_replaceable(d, sdl_own_syspath))
+        continue;
+      if (conttest_classify_candidate_pair(
+              sdl_serial, sdl_conn, d->evdev_meta.serial,
+              d->evdev_meta.udev_conn) == CONTTEST_MATCH_REJECT)
+        continue;
+      if (conttest_hw_keys_match(sdl_own_syspath, sdl_hw_keys,
+                                 d->evdev_meta.own_syspath,
+                                 (const char *const *)d->evdev_meta.hw_keys)) {
+        matches[i] = TRUE;
+        live[i] = d->evdev_devnode && access(d->evdev_devnode, F_OK) == 0;
+      }
+    }
+    int idx = conttest_select_unique_candidate(matches, live, count);
+    if (idx >= 0)
+      return g_ptr_array_index(self->devices, (guint)idx);
+    /* Ambiguous or no key match: the serial/VID/PID pass below can still
+     * identify the peripheral unambiguously. */
+  }
+
+  /* Second pass: VID/PID fallback for SDL devices without a /dev/ devnode
+   * path. A matching serial identifies the candidate; otherwise a candidate
+   * whose connection type does not contradict SDL's is accepted only if it is
+   * unique. */
+  if ((!sdl_path || !g_str_has_prefix(sdl_path, "/dev/")) &&
+      sdl_vid != 0 && sdl_pid != 0) {
+    ConttestDevice *strong_match = NULL;
+    ConttestDevice *weak_match = NULL;
+    guint strong_count = 0;
+    guint weak_count = 0;
+
+    for (guint i = 0; i < self->devices->len; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (d->has_evdev &&
+          device_sdl_attachment_is_replaceable(d, sdl_own_syspath) &&
+          !d->evdev_meta.is_virtual &&
+          d->virtual_kind == CONTTEST_VIRTUAL_NONE &&
+          d->vendor_id == sdl_vid && d->product_id == sdl_pid) {
+        ConttestCandidateMatch score = conttest_classify_candidate_pair(
+            sdl_serial, sdl_conn,
+            d->evdev_meta.serial, d->evdev_meta.udev_conn);
+        if (score == CONTTEST_MATCH_STRONG) {
+          strong_match = d;
+          strong_count++;
+        } else if (score == CONTTEST_MATCH_WEAK) {
+          weak_match = d;
+          weak_count++;
+        }
+      }
+    }
+
+    if (strong_count == 1)
+      return strong_match;
+    if (strong_count > 1)
+      return NULL;
+    if (weak_count == 1)
+      return weak_match;
+  }
+
   return NULL;
 }
 
-static gboolean is_same_hardware(struct udev *udev, const char *sdl_path,
-                                 const char *evdev_syspath) {
-  if (!sdl_path || !evdev_syspath)
-    return FALSE;
+static ConttestDevice *find_device_by_hardware_for_evdev(
+    ConttestDeviceManager *self,
+    const char *evdev_devnode,
+    const char *evdev_own_syspath,
+    const char *const *evdev_hw_keys,
+    uint16_t udev_vid,
+    uint16_t udev_pid,
+    gboolean udev_is_virtual,
+    const char *udev_serial,
+    SDL_JoystickConnectionState udev_conn) {
+  /* Fast path in memory: SDL devnode matches this evdev devnode directly. */
+  if (evdev_devnode) {
+    for (guint i = 0; i < self->devices->len; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (d->has_sdl && !d->has_evdev && d->sdl_path &&
+          g_strcmp0(d->sdl_path, evdev_devnode) == 0) {
+        return d;
+      }
+    }
+  }
 
-  struct udev_device *u1 = udev_device_from_devnode(udev, sdl_path);
-  struct udev_device *u2 = udev_device_new_from_syspath(udev, evdev_syspath);
-  gboolean match = FALSE;
+  /* First pass: topological match in memory via cached udev ancestor keys.
+   * Only a unique candidate may be merged; several split SDL entries can
+   * share keys during a reconnect, and receivers expose one shared node for
+   * multiple pads. The live attachment disambiguates a stale leftover. */
+  if (evdev_own_syspath || evdev_hw_keys) {
+    guint count = self->devices->len;
+    g_autofree gboolean *matches = g_new0(gboolean, count);
+    g_autofree gboolean *live = g_new0(gboolean, count);
+    for (guint i = 0; i < count; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (!d->has_sdl || d->has_evdev)
+        continue;
+      if (conttest_classify_candidate_pair(
+              udev_serial, udev_conn, d->sdl_meta.serial,
+              d->sdl_meta.udev_conn) == CONTTEST_MATCH_REJECT)
+        continue;
+      if (conttest_hw_keys_match(d->sdl_meta.own_syspath,
+                                 (const char *const *)d->sdl_meta.hw_keys,
+                                 evdev_own_syspath, evdev_hw_keys)) {
+        matches[i] = TRUE;
+        live[i] = device_sdl_attachment_is_live(d);
+      }
+    }
+    int idx = conttest_select_unique_candidate(matches, live, count);
+    if (idx >= 0)
+      return g_ptr_array_index(self->devices, (guint)idx);
+  }
 
-  if (u1 && u2) {
-    if (g_strcmp0(udev_device_get_syspath(u1), udev_device_get_syspath(u2)) ==
-        0) {
-      match = TRUE;
-    } else {
-      struct udev_device *p1 = u1;
-      while (p1 && !match) {
-        const char *sp1 = udev_device_get_syspath(p1);
-        struct udev_device *p2 = u2;
-        while (p2) {
-          const char *sp2 = udev_device_get_syspath(p2);
-          if (sp1 && sp2 && g_strcmp0(sp1, sp2) == 0) {
-            const char *sub = udev_device_get_subsystem(p1);
-            if (sub) {
-              if (g_strcmp0(sub, "hid") == 0 ||
-                  g_strcmp0(sub, "bluetooth") == 0 ||
-                  g_strcmp0(sub, "input") == 0) {
-                match = TRUE;
-                break;
-              } else if (g_strcmp0(sub, "usb") == 0) {
-                const char *devtype = udev_device_get_devtype(p1);
-                if (g_strcmp0(devtype, "usb_interface") == 0) {
-                  match = TRUE;
-                  break;
-                }
-              }
-            }
+  /* Second pass: for SDL devices without a devnode path, fall back to VID/PID.
+   * A matching serial identifies the candidate; otherwise a candidate whose
+   * connection type does not contradict the evdev one is accepted only if it
+   * is unique. */
+  if (udev_vid != 0 && udev_pid != 0 && !udev_is_virtual) {
+    ConttestDevice *strong_match = NULL;
+    ConttestDevice *weak_match = NULL;
+    guint strong_count = 0;
+    guint weak_count = 0;
+
+    for (guint i = 0; i < self->devices->len; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (d->has_sdl && !d->has_evdev && !d->sdl_meta.is_virtual &&
+          d->virtual_kind == CONTTEST_VIRTUAL_NONE &&
+          (!d->sdl_path || !g_str_has_prefix(d->sdl_path, "/dev/"))) {
+        uint16_t sdl_vid = d->vendor_id ? d->vendor_id
+                                        : SDL_GetGamepadVendorForID(d->sdl_id);
+        uint16_t sdl_pid = d->product_id ? d->product_id
+                                         : SDL_GetGamepadProductForID(d->sdl_id);
+        if (sdl_vid == udev_vid && sdl_pid == udev_pid) {
+          const char *sdl_serial = d->sdl_gamepad
+              ? SDL_GetGamepadSerial(d->sdl_gamepad) : NULL;
+          SDL_JoystickConnectionState sdl_conn = d->sdl_gamepad
+              ? SDL_GetGamepadConnectionState(d->sdl_gamepad)
+              : SDL_JOYSTICK_CONNECTION_UNKNOWN;
+
+          ConttestCandidateMatch score = conttest_classify_candidate_pair(
+              udev_serial, udev_conn, sdl_serial, sdl_conn);
+          if (score == CONTTEST_MATCH_STRONG) {
+            strong_match = d;
+            strong_count++;
+          } else if (score == CONTTEST_MATCH_WEAK) {
+            weak_match = d;
+            weak_count++;
           }
-          p2 = udev_device_get_parent(p2);
-        }
-        p1 = udev_device_get_parent(p1);
-      }
-    }
-  }
-  if (u1)
-    udev_device_unref(u1);
-  if (u2)
-    udev_device_unref(u2);
-  return match;
-}
-
-static ConttestDevice *
-find_device_by_hardware_for_sdl(ConttestDeviceManager *self,
-                                const char *sdl_path) {
-  if (!sdl_path)
-    return NULL;
-  for (guint i = 0; i < self->devices->len; i++) {
-    ConttestDevice *d = g_ptr_array_index(self->devices, i);
-    if (d->has_evdev && d->evdev_syspath) {
-      if (is_same_hardware(self->udev, sdl_path, d->evdev_syspath))
-        return d;
-    }
-  }
-  return NULL;
-}
-
-static ConttestDevice *
-find_device_by_hardware_for_evdev(ConttestDeviceManager *self,
-                                  const char *evdev_syspath) {
-  if (!evdev_syspath)
-    return NULL;
-
-  /* First pass: topological match via udev parent chain (most reliable). */
-  for (guint i = 0; i < self->devices->len; i++) {
-    ConttestDevice *d = g_ptr_array_index(self->devices, i);
-    if (d->has_sdl && d->sdl_path) {
-      if (is_same_hardware(self->udev, d->sdl_path, evdev_syspath))
-        return d;
-    }
-  }
-
-  /* Second pass: for SDL devices without a devnode path (e.g. HIDAPI-backed
-   * controllers like DS3), fall back to VID/PID matching. Extract the udev
-   * device's VID/PID and compare against SDL's reported values. */
-  struct udev_device *udev_dev = udev_device_new_from_syspath(self->udev, evdev_syspath);
-  if (udev_dev) {
-    uint16_t udev_vid = 0, udev_pid = 0;
-    const char *vid_str = udev_device_get_property_value(udev_dev, "ID_VENDOR_ID");
-    const char *pid_str = udev_device_get_property_value(udev_dev, "ID_MODEL_ID");
-    if (vid_str) udev_vid = (uint16_t)g_ascii_strtoull(vid_str, NULL, 16);
-    if (pid_str) udev_pid = (uint16_t)g_ascii_strtoull(pid_str, NULL, 16);
-
-    if (udev_vid == 0 || udev_pid == 0) {
-      parse_vid_pid(udev_device_get_property_value(udev_dev, "PRODUCT"), '/',
-                    &udev_vid, &udev_pid);
-    }
-    if (udev_vid == 0 || udev_pid == 0) {
-      struct udev_device *h =
-          udev_device_get_parent_with_subsystem_devtype(udev_dev, "hid", NULL);
-      if (h)
-        parse_vid_pid(udev_device_get_property_value(h, "HID_ID"), ':',
-                      &udev_vid, &udev_pid);
-    }
-    udev_device_unref(udev_dev);
-
-    if (udev_vid != 0 && udev_pid != 0) {
-      for (guint i = 0; i < self->devices->len; i++) {
-        ConttestDevice *d = g_ptr_array_index(self->devices, i);
-        if (d->has_sdl && !d->has_evdev) {
-          uint16_t sdl_vid = SDL_GetGamepadVendorForID(d->sdl_id);
-          uint16_t sdl_pid = SDL_GetGamepadProductForID(d->sdl_id);
-          if (sdl_vid == udev_vid && sdl_pid == udev_pid)
-            return d;
         }
       }
     }
+
+    if (strong_count == 1)
+      return strong_match;
+    if (strong_count > 1)
+      return NULL;
+    if (weak_count == 1)
+      return weak_match;
   }
 
   return NULL;
 }
+
+static void refresh_and_emit_device(ConttestDeviceManager *self,
+                                    ConttestDevice *d,
+                                    gboolean force_update);
 
 static void check_empty_and_remove(ConttestDeviceManager *self,
                                    ConttestDevice *d) {
   if (!d->has_sdl && !d->has_evdev) {
-    g_ptr_array_remove(self->devices, d);
-    g_signal_emit(self, signals[SIGNAL_DEVICE_REMOVED], 0, d);
-    conttest_device_free(d);
+    g_autoptr(ConttestDevice) keep = g_object_ref(d);
+    gboolean was_visible = !keep->hidden;
+    g_ptr_array_remove(self->devices, keep);
+    if (was_visible) {
+      g_signal_emit(self, signals[SIGNAL_DEVICE_REMOVED], 0, keep);
+    }
   } else {
+    refresh_and_emit_device(self, d, TRUE);
+  }
+}
+
+static SDL_JoystickConnectionState
+device_cached_udev_connection_state(const ConttestDevice *d) {
+  if (d->has_evdev &&
+      d->evdev_meta.udev_conn != SDL_JOYSTICK_CONNECTION_UNKNOWN) {
+    return d->evdev_meta.udev_conn;
+  }
+  if (d->has_sdl &&
+      d->sdl_meta.udev_conn != SDL_JOYSTICK_CONNECTION_UNKNOWN) {
+    return d->sdl_meta.udev_conn;
+  }
+  return SDL_JOYSTICK_CONNECTION_UNKNOWN;
+}
+
+/* Worker-thread helper: opens a udev_device for a /dev/... node off the main
+ * loop. */
+static struct udev_device *worker_udev_new_from_devnode(struct udev *u,
+                                                       const char *devnode) {
+  if (!u || !devnode || !g_str_has_prefix(devnode, "/dev/"))
+    return NULL;
+  struct stat st;
+  if (stat(devnode, &st) != 0)
+    return NULL;
+  char type;
+  if (S_ISCHR(st.st_mode)) {
+    type = 'c';
+  } else if (S_ISBLK(st.st_mode)) {
+    type = 'b';
+  } else {
+    return NULL;
+  }
+  return udev_device_new_from_devnum(u, type, st.st_rdev);
+}
+
+/* Worker-thread helper: extracts all needed udev metadata from an already-opened
+ * udev_device in a single pass. */
+static void udev_extract_attach_meta(struct udev_device *dev,
+                                     UdevAttachMeta *out) {
+  udev_attach_meta_clear(out);
+  if (!dev)
+    return;
+  out->hw_keys = conttest_udev_collect_hw_keys(dev, &out->own_syspath);
+  out->udev_conn = conttest_resolve_connection_state_for_udev_device(dev);
+  struct udev_device *hid_parent =
+      udev_device_get_parent_with_subsystem_devtype(dev, "hid", NULL);
+  /* HID_UNIQ holds the Bluetooth address on wireless links; ID_SERIAL_SHORT
+   * is the USB iSerial. ID_SERIAL is skipped because without a serial suffix
+   * it is just vendor and model, shared by identical units. */
+  const char *serial = hid_parent
+      ? udev_device_get_property_value(hid_parent, "HID_UNIQ") : NULL;
+  if (!serial || !*serial)
+    serial = udev_device_get_property_value(dev, "ID_SERIAL_SHORT");
+  if (serial && *serial)
+    out->serial = g_strdup(serial);
+  out->is_virtual = conttest_udev_device_probe_virtual(dev, &out->virtual_uniq,
+                                                       &out->virtual_bus);
+  out->ip_hidden_devlink = conttest_udev_device_is_inputplumber_hidden(dev);
+  out->udev_dead = FALSE;
+}
+
+typedef struct {
+  char *syspath;
+  char *devnode;
+  char *name;
+  uint16_t vendor_id;
+  uint16_t product_id;
+  UdevAttachMeta meta;
+} UdevDeviceMeta;
+
+static void udev_device_meta_free(gpointer data) {
+  UdevDeviceMeta *m = data;
+  if (!m)
+    return;
+  g_free(m->syspath);
+  g_free(m->devnode);
+  g_free(m->name);
+  udev_attach_meta_clear(&m->meta);
+  g_free(m);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(UdevDeviceMeta, udev_device_meta_free)
+
+/* Worker-thread helper: inspects an evdev udev_device and returns extracted
+ * metadata if it is a /dev/input/event* joystick, or NULL otherwise. */
+static UdevDeviceMeta *udev_device_meta_extract_evdev(struct udev_device *dev) {
+  if (!dev)
+    return NULL;
+  const char *syspath = udev_device_get_syspath(dev);
+  const char *devnode = udev_device_get_devnode(dev);
+  if (!syspath || !devnode || strncmp(devnode, "/dev/input/event", 16) != 0)
+    return NULL;
+
+  const char *id_input_joystick =
+      udev_device_get_property_value(dev, "ID_INPUT_JOYSTICK");
+  if (!id_input_joystick || strcmp(id_input_joystick, "1") != 0)
+    return NULL;
+
+  const char *name = NULL;
+  struct udev_device *parent =
+      udev_device_get_parent_with_subsystem_devtype(dev, "input", NULL);
+  if (parent) {
+    name = udev_device_get_sysattr_value(parent, "name");
+  }
+  if (!name) {
+    name = udev_device_get_property_value(dev, "NAME");
+  }
+  if (!name)
+    name = "Unknown evdev";
+
+  char *clean_name = g_strdup(name);
+  size_t len = strlen(clean_name);
+  if (len >= 2 && clean_name[0] == '"' && clean_name[len - 1] == '"') {
+    clean_name[len - 1] = '\0';
+    memmove(clean_name, clean_name + 1, len - 1);
+  }
+
+  UdevDeviceMeta *m = g_new0(UdevDeviceMeta, 1);
+  m->syspath = g_strdup(syspath);
+  m->devnode = g_strdup(devnode);
+  m->name = clean_name;
+  conttest_extract_udev_vid_pid(dev, &m->vendor_id, &m->product_id);
+  udev_extract_attach_meta(dev, &m->meta);
+  return m;
+}
+
+typedef struct {
+  GWeakRef manager;
+  GWeakRef device;
+  char *arg;
+  char *arg2;
+  guint seq;
+} UdevTaskCtx;
+
+static UdevTaskCtx *udev_task_ctx_new_for_device(ConttestDeviceManager *self,
+                                                 ConttestDevice *device,
+                                                 const char *arg,
+                                                 const char *arg2,
+                                                 guint seq) {
+  UdevTaskCtx *ctx = g_new0(UdevTaskCtx, 1);
+  g_weak_ref_init(&ctx->manager, self);
+  g_weak_ref_init(&ctx->device, device);
+  ctx->arg = g_strdup(arg);
+  ctx->arg2 = g_strdup(arg2);
+  ctx->seq = seq;
+  return ctx;
+}
+
+static void udev_task_ctx_free(gpointer data) {
+  UdevTaskCtx *ctx = data;
+  if (!ctx)
+    return;
+  g_weak_ref_clear(&ctx->manager);
+  g_weak_ref_clear(&ctx->device);
+  g_free(ctx->arg);
+  g_free(ctx->arg2);
+  g_free(ctx);
+}
+
+typedef struct {
+  char *resolved_syspath;
+  gboolean syspath_alive;
+  SDL_PowerState state;
+  int percent;
+} Ds3BatteryResult;
+
+static void ds3_battery_result_free(gpointer data) {
+  Ds3BatteryResult *r = data;
+  if (!r)
+    return;
+  g_free(r->resolved_syspath);
+  g_free(r);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(Ds3BatteryResult, ds3_battery_result_free)
+
+static void ds3_battery_task_thread(GTask *task, gpointer source_object,
+                                    gpointer task_data,
+                                    GCancellable *cancellable) {
+  (void)source_object;
+  UdevTaskCtx *ctx = task_data;
+  Ds3BatteryResult *res = g_new0(Ds3BatteryResult, 1);
+  res->state = SDL_POWERSTATE_UNKNOWN;
+  res->percent = -1;
+
+  if (g_cancellable_is_cancelled(cancellable)) {
+    g_task_return_pointer(task, res, ds3_battery_result_free);
+    return;
+  }
+
+  /* arg = evdev_syspath, arg2 = cached battery_syspath (may be NULL). */
+  char *bat_path = g_strdup(ctx->arg2);
+  if (!bat_path && ctx->arg) {
+    struct udev *u = udev_new();
+    if (u) {
+      bat_path = probe_ds3_battery_syspath(u, ctx->arg);
+      udev_unref(u);
+    }
+  }
+
+  if (bat_path && !g_cancellable_is_cancelled(cancellable)) {
+    if (poll_ds3_battery_sysfs(bat_path, &res->state, &res->percent)) {
+      res->resolved_syspath = bat_path;
+      res->syspath_alive = TRUE;
+      g_task_return_pointer(task, res, ds3_battery_result_free);
+      return;
+    }
+    /* Cached battery_syspath vanished; retry resolving once from evdev. */
+    g_clear_pointer(&bat_path, g_free);
+    if (ctx->arg2 && ctx->arg) {
+      struct udev *u = udev_new();
+      if (u) {
+        bat_path = probe_ds3_battery_syspath(u, ctx->arg);
+        udev_unref(u);
+      }
+      if (bat_path && !g_cancellable_is_cancelled(cancellable) &&
+          poll_ds3_battery_sysfs(bat_path, &res->state, &res->percent)) {
+        res->resolved_syspath = bat_path;
+        res->syspath_alive = TRUE;
+        g_task_return_pointer(task, res, ds3_battery_result_free);
+        return;
+      }
+      g_clear_pointer(&bat_path, g_free);
+    }
+  }
+
+  g_free(bat_path);
+  g_task_return_pointer(task, res, ds3_battery_result_free);
+}
+
+static void schedule_ds3_battery_task(ConttestDeviceManager *self,
+                                      ConttestDevice *d,
+                                      gboolean force_probe);
+
+static void on_ds3_battery_task_done(GObject *source, GAsyncResult *res,
+                                     gpointer user_data) {
+  (void)source;
+  (void)user_data;
+  GTask *task = G_TASK(res);
+  UdevTaskCtx *ctx = g_task_get_task_data(task);
+  GError *err = NULL;
+  g_autoptr(Ds3BatteryResult) bat = NULL;
+  Ds3BatteryResult *raw_bat = g_task_propagate_pointer(task, &err);
+  g_clear_error(&err);
+  bat = raw_bat;
+
+  g_autoptr(ConttestDevice) d = g_weak_ref_get(&ctx->device);
+  if (!d)
+    return;
+
+  d->ds3_battery_in_flight = FALSE;
+
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(&ctx->manager);
+  if (!self || self->disposed || !self->devices || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable) ||
+      !g_ptr_array_find(self->devices, d, NULL) || !d->has_evdev ||
+      g_strcmp0(d->evdev_syspath, ctx->arg) != 0) {
+    return;
+  }
+
+  if (d->ds3_battery_probe_seq != ctx->seq) {
+    if (d->ds3_battery_rescan_pending && d->has_sdl &&
+        conttest_device_is_ds3(d)) {
+      d->ds3_battery_rescan_pending = FALSE;
+      schedule_ds3_battery_task(self, d, TRUE);
+    }
+    return;
+  }
+
+  gboolean rescan = d->ds3_battery_rescan_pending;
+  d->ds3_battery_rescan_pending = FALSE;
+  d->ds3_battery_state = DS3_BATTERY_PROBED;
+
+  if (!d->has_sdl || !conttest_device_is_ds3(d))
+    return;
+
+  gboolean changed = FALSE;
+  if (bat && bat->syspath_alive && bat->resolved_syspath) {
+    if (g_strcmp0(d->battery_syspath, bat->resolved_syspath) != 0) {
+      g_free(d->battery_syspath);
+      d->battery_syspath = g_strdup(bat->resolved_syspath);
+    }
+    if (bat->state != d->battery_state || bat->percent != d->battery_percent) {
+      d->battery_state = bat->state;
+      d->battery_percent = bat->percent;
+      changed = TRUE;
+    }
+  } else {
+    g_clear_pointer(&d->battery_syspath, g_free);
+    if (d->battery_state != SDL_POWERSTATE_UNKNOWN || d->battery_percent != -1) {
+      d->battery_state = SDL_POWERSTATE_UNKNOWN;
+      d->battery_percent = -1;
+      changed = TRUE;
+    }
+  }
+
+  if (changed && !d->hidden) {
     g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, d);
   }
-}
 
-/* Resolve connection type from udev for any device that has an evdev syspath
- * or an SDL devnode path. Returns SDL_JOYSTICK_CONNECTION_UNKNOWN if
- * the bustype cannot be determined. */
-static SDL_JoystickConnectionState
-resolve_connection_state_udev(ConttestDeviceManager *self,
-                               const ConttestDevice *d) {
-  struct udev_device *dev = NULL;
-  if (d->has_evdev && d->evdev_syspath)
-    dev = udev_device_new_from_syspath(self->udev, d->evdev_syspath);
-  else if (d->sdl_path)
-    dev = udev_device_from_devnode(self->udev, d->sdl_path);
-  if (!dev)
-    return SDL_JOYSTICK_CONNECTION_UNKNOWN;
-
-  SDL_JoystickConnectionState conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
-  struct udev_device *input_parent =
-      udev_device_get_parent_with_subsystem_devtype(dev, "input", NULL);
-  const char *bustype_str =
-      input_parent
-          ? udev_device_get_sysattr_value(input_parent, "id/bustype")
-          : NULL;
-  if (bustype_str) {
-    unsigned int bustype = (unsigned int)strtoul(bustype_str, NULL, 16);
-    conn = (bustype == 0x0003) ? SDL_JOYSTICK_CONNECTION_WIRED
-                               : SDL_JOYSTICK_CONNECTION_WIRELESS;
-  } else {
-    gboolean has_usb = udev_device_get_parent_with_subsystem_devtype(
-                           dev, "usb", NULL) != NULL;
-    conn = has_usb ? SDL_JOYSTICK_CONNECTION_WIRED
-                   : SDL_JOYSTICK_CONNECTION_WIRELESS;
+  if (rescan && !d->battery_syspath && !self->disposed &&
+      g_ptr_array_find(self->devices, d, NULL)) {
+    d->ds3_battery_state = DS3_BATTERY_UNPROBED;
+    schedule_ds3_battery_task(self, d, TRUE);
   }
-  udev_device_unref(dev);
-  return conn;
 }
 
-/* Poll battery for an SDL-attached device. Returns TRUE if state changed. */
+static void schedule_ds3_battery_task(ConttestDeviceManager *self,
+                                      ConttestDevice *d,
+                                      gboolean force_probe) {
+  if (self->disposed || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable) || !d->has_evdev ||
+      !d->evdev_syspath || !d->has_sdl)
+    return;
+
+  if (!force_probe && !d->battery_syspath &&
+      d->ds3_battery_state == DS3_BATTERY_PROBED)
+    return;
+
+  if (d->ds3_battery_in_flight) {
+    if (force_probe)
+      d->ds3_battery_rescan_pending = TRUE;
+    return;
+  }
+
+  if (!d->battery_syspath)
+    d->ds3_battery_state = DS3_BATTERY_PROBING;
+  d->ds3_battery_rescan_pending = FALSE;
+  d->ds3_battery_in_flight = TRUE;
+  guint seq = ++d->ds3_battery_probe_seq;
+
+  GTask *task =
+      g_task_new(NULL, self->cancellable, on_ds3_battery_task_done, NULL);
+  g_task_set_task_data(
+      task,
+      udev_task_ctx_new_for_device(self, d, d->evdev_syspath, d->battery_syspath,
+                                   seq),
+      udev_task_ctx_free);
+  g_task_run_in_thread(task, ds3_battery_task_thread);
+  g_object_unref(task);
+}
+
+/* Poll battery/connection state for an SDL-attached device. Sysfs I/O for DS3
+ * runs asynchronously off the main loop. Returns TRUE if cached state changed. */
 static gboolean device_poll_battery(ConttestDeviceManager *self,
                                     ConttestDevice *d) {
   if (!d->has_sdl || !d->sdl_gamepad)
     return FALSE;
 
-  int percent = -1;
-  SDL_PowerState state = SDL_POWERSTATE_UNKNOWN;
-
-  if (conttest_device_is_ds3(d)) {
-    /* Confirmed DS3 controllers use Linux power_supply exclusively. */
-    if (!d->battery_syspath) {
-      d->battery_syspath = resolve_ds3_battery_path(self, d);
-    }
-
-    if (d->battery_syspath) {
-      poll_ds3_battery_sysfs(d->battery_syspath, &state, &percent);
-    }
-  } else {
-    /* All other controllers use SDL. */
-    state = SDL_GetGamepadPowerInfo(d->sdl_gamepad, &percent);
-  }
-
   gboolean changed = FALSE;
 
-  if (state != d->battery_state || percent != d->battery_percent) {
-    d->battery_state = state;
-    d->battery_percent = percent;
-    changed = TRUE;
+  if (conttest_device_is_ds3(d)) {
+    /* Confirmed DS3 controllers use Linux power_supply exclusively, polled off
+     * the main thread. Preserve current values until the worker completes. */
+    schedule_ds3_battery_task(self, d, FALSE);
+  } else {
+    /* All other controllers use SDL. */
+    int percent = -1;
+    SDL_PowerState state = SDL_GetGamepadPowerInfo(d->sdl_gamepad, &percent);
+    if (state != d->battery_state || percent != d->battery_percent) {
+      d->battery_state = state;
+      d->battery_percent = percent;
+      changed = TRUE;
+    }
   }
 
   SDL_JoystickConnectionState conn =
       SDL_GetGamepadConnectionState(d->sdl_gamepad);
   if (conn == SDL_JOYSTICK_CONNECTION_UNKNOWN) {
-    conn = resolve_connection_state_udev(self, d);
+    conn = device_cached_udev_connection_state(d);
   }
   if (conn != d->connection_state) {
     d->connection_state = conn;
@@ -583,38 +1179,672 @@ static gboolean device_poll_battery(ConttestDeviceManager *self,
   return changed;
 }
 
+static gboolean device_has_dead_udev(const ConttestDevice *d) {
+  if (!d->has_evdev && d->has_sdl && d->sdl_meta.udev_dead)
+    return TRUE;
+  if (d->has_evdev && d->evdev_meta.udev_dead)
+    return TRUE;
+  return FALSE;
+}
+
+static gboolean device_refresh_virtual_state(ConttestDeviceManager *self,
+                                             ConttestDevice *d) {
+  /* If evdev has already vanished while waiting for SDL's removal event on
+   * the same disappearing /dev/ node, keep virtual metadata intact so the
+   * dying entry does not briefly flicker into a physical/tagless controller. */
+  if (d->virtual_kind != CONTTEST_VIRTUAL_NONE &&
+      device_has_dead_udev(d)) {
+    return FALSE;
+  }
+
+  const UdevAttachMeta *src_meta = NULL;
+  if (d->has_evdev && !d->evdev_meta.udev_dead && d->evdev_meta.own_syspath) {
+    src_meta = &d->evdev_meta;
+  } else if (d->has_sdl && !d->sdl_meta.udev_dead && d->sdl_meta.own_syspath) {
+    src_meta = &d->sdl_meta;
+  }
+
+  gboolean is_virtual = src_meta ? src_meta->is_virtual : FALSE;
+  const char *uniq = src_meta ? src_meta->virtual_uniq : NULL;
+  const char *vbus = src_meta ? src_meta->virtual_bus : NULL;
+
+  if (g_strcmp0(d->virtual_uniq, uniq) != 0) {
+    g_free(d->virtual_uniq);
+    d->virtual_uniq = g_strdup(uniq);
+  }
+
+  if (g_strcmp0(d->virtual_bus, vbus) != 0) {
+    g_free(d->virtual_bus);
+    d->virtual_bus = g_strdup(vbus);
+  }
+
+  ConttestVirtualKind new_kind = CONTTEST_VIRTUAL_NONE;
+  ConttestInputPlumberInfo *new_info = NULL;
+
+  if (is_virtual) {
+    new_info = conttest_inputplumber_monitor_match(
+        self->ip_monitor, d->name, d->vendor_id, d->product_id,
+        d->virtual_uniq, d->virtual_bus);
+    new_kind = new_info ? CONTTEST_VIRTUAL_INPUTPLUMBER
+                        : CONTTEST_VIRTUAL_GENERIC;
+  }
+
+  gboolean changed = (new_kind != d->virtual_kind) ||
+                     !conttest_inputplumber_info_equal(d->ip_info, new_info);
+
+  d->virtual_kind = new_kind;
+  conttest_inputplumber_info_free(d->ip_info);
+  d->ip_info = new_info;
+
+  return changed;
+}
+
+static gboolean compute_device_hidden(ConttestDeviceManager *self,
+                                      const ConttestDevice *d) {
+  /* Keep newly attached /dev/ SDL controllers hidden while their initial udev
+   * probe runs off-thread so duplicates or InputPlumber sources never flash. */
+  if (d->sdl_probe_pending)
+    return TRUE;
+
+  /* Never hide virtual devices; only physical source devices captured by
+   * InputPlumber are hidden to prevent broken duplicate entries. */
+  if (d->virtual_kind != CONTTEST_VIRTUAL_NONE)
+    return FALSE;
+
+  /* Do not unhide an already-hidden source device whose kernel node has just
+   * been removed while its SDL removal event is still pending. */
+  if (d->hidden && device_has_dead_udev(d))
+    return TRUE;
+
+  if (conttest_inputplumber_monitor_is_source_devnode(self->ip_monitor,
+                                                    d->evdev_devnode))
+    return TRUE;
+
+  if (conttest_inputplumber_monitor_is_source_devnode(self->ip_monitor,
+                                                    d->sdl_path))
+    return TRUE;
+
+  if (d->has_evdev && d->evdev_meta.ip_hidden_devlink)
+    return TRUE;
+
+  if (d->has_sdl && d->sdl_meta.ip_hidden_devlink)
+    return TRUE;
+
+  return FALSE;
+}
+
+static void device_emit_transition(ConttestDeviceManager *self,
+                                   ConttestDevice *d,
+                                   gboolean is_new,
+                                   gboolean was_hidden,
+                                   gboolean content_changed) {
+  if (is_new) {
+    if (!d->hidden) {
+      g_signal_emit(self, signals[SIGNAL_DEVICE_ADDED], 0, d);
+    }
+    return;
+  }
+
+  if (was_hidden && !d->hidden) {
+    g_signal_emit(self, signals[SIGNAL_DEVICE_ADDED], 0, d);
+  } else if (!was_hidden && d->hidden) {
+    g_signal_emit(self, signals[SIGNAL_DEVICE_REMOVED], 0, d);
+  } else if (!d->hidden && content_changed) {
+    g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, d);
+  }
+}
+
+static void refresh_and_emit_device(ConttestDeviceManager *self,
+                                    ConttestDevice *d,
+                                    gboolean force_update) {
+  gboolean was_hidden = d->hidden;
+  gboolean vchanged = device_refresh_virtual_state(self, d);
+  d->hidden = compute_device_hidden(self, d);
+  device_emit_transition(self, d, FALSE, was_hidden, force_update || vchanged);
+}
+
+static GPtrArray *snapshot_devices(ConttestDeviceManager *self) {
+  GPtrArray *snapshot = g_ptr_array_new_with_free_func(g_object_unref);
+  if (!self->devices)
+    return snapshot;
+  for (guint i = 0; i < self->devices->len; i++) {
+    ConttestDevice *d = g_ptr_array_index(self->devices, i);
+    g_ptr_array_add(snapshot, g_object_ref(d));
+  }
+  return snapshot;
+}
+
+static void schedule_sdl_sync(ConttestDeviceManager *self);
+
+typedef struct {
+  GWeakRef device;
+  char *evdev_syspath;
+  char *sdl_path;
+  gboolean check_evdev;
+  guint evdev_udev_seq;
+  gboolean did_evdev;
+  gboolean evdev_dead;
+  UdevAttachMeta evdev_meta;
+  gboolean check_sdl;
+  guint sdl_udev_seq;
+  gboolean did_sdl;
+  gboolean sdl_dead;
+  UdevAttachMeta sdl_meta;
+} UdevRefreshItem;
+
+static void udev_refresh_item_free(gpointer data) {
+  UdevRefreshItem *item = data;
+  if (!item)
+    return;
+  g_weak_ref_clear(&item->device);
+  g_free(item->evdev_syspath);
+  g_free(item->sdl_path);
+  udev_attach_meta_clear(&item->evdev_meta);
+  udev_attach_meta_clear(&item->sdl_meta);
+  g_free(item);
+}
+
+typedef struct {
+  GWeakRef manager;
+  GPtrArray *items; /* element: UdevRefreshItem* */
+} UdevRefreshTaskCtx;
+
+static void udev_refresh_task_ctx_free(gpointer data) {
+  UdevRefreshTaskCtx *ctx = data;
+  if (!ctx)
+    return;
+  g_weak_ref_clear(&ctx->manager);
+  g_clear_pointer(&ctx->items, g_ptr_array_unref);
+  g_free(ctx);
+}
+
+static void schedule_udev_refresh_all(ConttestDeviceManager *self);
+
+static void udev_refresh_thread(GTask *task, gpointer source_object,
+                                gpointer task_data,
+                                GCancellable *cancellable) {
+  (void)source_object;
+  UdevRefreshTaskCtx *ctx = task_data;
+  if (g_cancellable_is_cancelled(cancellable) || !ctx->items ||
+      ctx->items->len == 0) {
+    g_task_return_boolean(task, TRUE);
+    return;
+  }
+
+  struct udev *u = udev_new();
+  if (!u) {
+    g_task_return_boolean(task, FALSE);
+    return;
+  }
+
+  for (guint i = 0; i < ctx->items->len; i++) {
+    if (g_cancellable_is_cancelled(cancellable))
+      break;
+    UdevRefreshItem *item = g_ptr_array_index(ctx->items, i);
+    if (item->check_evdev && item->evdev_syspath) {
+      item->did_evdev = TRUE;
+      struct udev_device *dev =
+          udev_device_new_from_syspath(u, item->evdev_syspath);
+      if (dev) {
+        udev_extract_attach_meta(dev, &item->evdev_meta);
+        item->evdev_dead = FALSE;
+        udev_device_unref(dev);
+      } else {
+        item->evdev_dead = TRUE;
+      }
+    }
+    if (item->check_sdl && item->sdl_path) {
+      item->did_sdl = TRUE;
+      struct udev_device *dev =
+          worker_udev_new_from_devnode(u, item->sdl_path);
+      if (dev) {
+        udev_extract_attach_meta(dev, &item->sdl_meta);
+        item->sdl_dead = FALSE;
+        udev_device_unref(dev);
+      } else {
+        item->sdl_dead = TRUE;
+      }
+    }
+  }
+
+  udev_unref(u);
+  g_task_return_boolean(task, TRUE);
+}
+
+static void on_udev_refresh_done(GObject *source, GAsyncResult *res,
+                                 gpointer user_data) {
+  (void)source;
+  (void)user_data;
+  GTask *task = G_TASK(res);
+  UdevRefreshTaskCtx *ctx = g_task_get_task_data(task);
+  GError *err = NULL;
+  gboolean ok = g_task_propagate_boolean(task, &err);
+  g_clear_error(&err);
+
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(&ctx->manager);
+  if (!self || self->disposed || !self->devices || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable)) {
+    return;
+  }
+
+  self->udev_refresh_in_flight = FALSE;
+
+  gboolean needs_sdl_sync = FALSE;
+  if (ok && ctx->items) {
+    for (guint i = 0; i < ctx->items->len; i++) {
+      UdevRefreshItem *item = g_ptr_array_index(ctx->items, i);
+      g_autoptr(ConttestDevice) d = g_weak_ref_get(&item->device);
+      if (!d || !g_ptr_array_find(self->devices, d, NULL))
+        continue;
+
+      if (item->did_evdev && d->has_evdev &&
+          d->evdev_udev_seq == item->evdev_udev_seq &&
+          g_strcmp0(d->evdev_syspath, item->evdev_syspath) == 0) {
+        if (item->evdev_dead) {
+          d->evdev_meta.udev_dead = TRUE;
+        } else {
+          udev_attach_meta_move(&d->evdev_meta, &item->evdev_meta);
+        }
+      }
+
+      if (item->did_sdl && d->has_sdl && !d->sdl_probe_pending &&
+          d->sdl_udev_seq == item->sdl_udev_seq &&
+          g_strcmp0(d->sdl_path, item->sdl_path) == 0) {
+        if (item->sdl_dead) {
+          d->sdl_meta.udev_dead = TRUE;
+          needs_sdl_sync = TRUE;
+        } else {
+          udev_attach_meta_move(&d->sdl_meta, &item->sdl_meta);
+        }
+      }
+
+      refresh_and_emit_device(self, d, FALSE);
+      if (self->disposed || !self->devices)
+        return;
+    }
+  }
+
+  if (needs_sdl_sync)
+    schedule_sdl_sync(self);
+
+  if (self->udev_refresh_pending && !self->disposed) {
+    self->udev_refresh_pending = FALSE;
+    schedule_udev_refresh_all(self);
+  }
+}
+
+static void schedule_udev_refresh_all(ConttestDeviceManager *self) {
+  if (self->disposed || !self->devices || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable))
+    return;
+
+  if (self->udev_refresh_in_flight) {
+    self->udev_refresh_pending = TRUE;
+    return;
+  }
+
+  GPtrArray *items = g_ptr_array_new_with_free_func(udev_refresh_item_free);
+  for (guint i = 0; i < self->devices->len; i++) {
+    ConttestDevice *d = g_ptr_array_index(self->devices, i);
+    gboolean need_evdev = d->has_evdev && d->evdev_syspath != NULL;
+    gboolean need_sdl = d->has_sdl && !d->sdl_probe_pending && d->sdl_path &&
+                        g_str_has_prefix(d->sdl_path, "/dev/");
+    if (!need_evdev && !need_sdl)
+      continue;
+
+    UdevRefreshItem *item = g_new0(UdevRefreshItem, 1);
+    g_weak_ref_init(&item->device, d);
+    item->evdev_meta.udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+    item->sdl_meta.udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+    if (need_evdev) {
+      item->check_evdev = TRUE;
+      item->evdev_udev_seq = d->evdev_udev_seq;
+      item->evdev_syspath = g_strdup(d->evdev_syspath);
+    }
+    if (need_sdl) {
+      item->check_sdl = TRUE;
+      item->sdl_udev_seq = d->sdl_udev_seq;
+      item->sdl_path = g_strdup(d->sdl_path);
+    }
+    g_ptr_array_add(items, item);
+  }
+
+  if (items->len == 0) {
+    g_ptr_array_unref(items);
+    return;
+  }
+
+  self->udev_refresh_in_flight = TRUE;
+  self->udev_refresh_pending = FALSE;
+
+  UdevRefreshTaskCtx *ctx = g_new0(UdevRefreshTaskCtx, 1);
+  g_weak_ref_init(&ctx->manager, self);
+  ctx->items = items;
+
+  GTask *task =
+      g_task_new(NULL, self->cancellable, on_udev_refresh_done, NULL);
+  g_task_set_task_data(task, ctx, udev_refresh_task_ctx_free);
+  g_task_run_in_thread(task, udev_refresh_thread);
+  g_object_unref(task);
+}
+
+static void on_inputplumber_changed(ConttestInputPlumberMonitor *monitor,
+                                    gpointer user_data) {
+  (void)monitor;
+  ConttestDeviceManager *self = CONTTEST_DEVICE_MANAGER(user_data);
+  if (self->disposed || !self->devices)
+    return;
+
+  /* Apply in-memory updates immediately and coalesce an off-thread udev
+   * refresh for by-hidden devlinks and vanishing devnodes. */
+  g_autoptr(GPtrArray) snapshot = snapshot_devices(self);
+  gboolean needs_sdl_sync = FALSE;
+  for (guint i = 0; i < snapshot->len; i++) {
+    ConttestDevice *d = g_ptr_array_index(snapshot, i);
+    if (!self->devices || !g_ptr_array_find(self->devices, d, NULL))
+      continue;
+    refresh_and_emit_device(self, d, FALSE);
+    if (self->disposed || !self->devices)
+      return;
+    if (g_ptr_array_find(self->devices, d, NULL) && d->has_sdl &&
+        d->sdl_meta.udev_dead)
+      needs_sdl_sync = TRUE;
+  }
+  if (needs_sdl_sync)
+    schedule_sdl_sync(self);
+
+  schedule_udev_refresh_all(self);
+}
+
+typedef struct {
+  gboolean found;
+  UdevAttachMeta meta;
+} SdlProbeResult;
+
+static void sdl_probe_result_free(gpointer data) {
+  SdlProbeResult *r = data;
+  if (!r)
+    return;
+  udev_attach_meta_clear(&r->meta);
+  g_free(r);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(SdlProbeResult, sdl_probe_result_free)
+
+static void probe_sdl_udev_thread(GTask *task, gpointer source_object,
+                                  gpointer task_data,
+                                  GCancellable *cancellable) {
+  (void)source_object;
+  UdevTaskCtx *ctx = task_data;
+  SdlProbeResult *res = g_new0(SdlProbeResult, 1);
+  res->meta.udev_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+
+  if (!g_cancellable_is_cancelled(cancellable) && ctx->arg) {
+    struct udev *u = udev_new();
+    if (u) {
+      struct udev_device *dev = worker_udev_new_from_devnode(u, ctx->arg);
+      if (dev) {
+        res->found = TRUE;
+        udev_extract_attach_meta(dev, &res->meta);
+        udev_device_unref(dev);
+      }
+      udev_unref(u);
+    }
+  }
+
+  g_task_return_pointer(task, res, sdl_probe_result_free);
+}
+
+static void on_sdl_udev_probe_done(GObject *source, GAsyncResult *res,
+                                   gpointer user_data) {
+  (void)source;
+  (void)user_data;
+  GTask *task = G_TASK(res);
+  UdevTaskCtx *ctx = g_task_get_task_data(task);
+  GError *err = NULL;
+  g_autoptr(SdlProbeResult) probe = g_task_propagate_pointer(task, &err);
+  g_clear_error(&err);
+
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(&ctx->manager);
+  if (!self || self->disposed || !self->devices || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable))
+    return;
+
+  g_autoptr(ConttestDevice) d = g_weak_ref_get(&ctx->device);
+  if (!d || !g_ptr_array_find(self->devices, d, NULL) || !d->has_sdl ||
+      d->sdl_udev_seq != ctx->seq)
+    return;
+
+  if (d->has_sdl && d->sdl_gamepad && !device_sdl_attachment_is_live(d)) {
+    device_detach_sdl(d);
+    check_empty_and_remove(self, d);
+    if (!self->disposed)
+      schedule_sdl_sync(self);
+    return;
+  }
+
+  gboolean was_pending = d->sdl_probe_pending;
+  d->sdl_probe_pending = FALSE;
+
+  if (probe && probe->found) {
+    udev_attach_meta_move(&d->sdl_meta, &probe->meta);
+    d->sdl_udev_seq++;
+
+    ConttestDevice *existing = NULL;
+    if (was_pending && !d->has_evdev) {
+      const char *sdl_serial = d->sdl_gamepad
+          ? SDL_GetGamepadSerial(d->sdl_gamepad) : NULL;
+      SDL_JoystickConnectionState sdl_conn = d->sdl_gamepad
+          ? SDL_GetGamepadConnectionState(d->sdl_gamepad)
+          : SDL_JOYSTICK_CONNECTION_UNKNOWN;
+      existing = find_device_by_hardware_for_sdl(
+          self, d->sdl_path, d->sdl_meta.own_syspath,
+          (const char *const *)d->sdl_meta.hw_keys, d->vendor_id,
+          d->product_id, sdl_serial, sdl_conn);
+      if (existing == d)
+        existing = NULL;
+    }
+
+    if (existing) {
+      /* Transfer SDL ownership into the matching evdev device and drop the
+       * still-hidden placeholder without emitting spurious signals. A live
+       * attachment on `existing` was matched through its cached udev node and
+       * is replaced here. */
+      gboolean existing_was_hidden = existing->hidden;
+      gboolean was_rebind = existing->has_sdl;
+      device_set_name(existing, d->name);
+      existing->has_sdl = TRUE;
+      existing->sdl_id = d->sdl_id;
+      g_free(existing->sdl_path);
+      existing->sdl_path = g_steal_pointer(&d->sdl_path);
+      if (existing->sdl_gamepad) {
+        SDL_CloseGamepad(existing->sdl_gamepad);
+      }
+      existing->sdl_gamepad = d->sdl_gamepad;
+      if (was_rebind) {
+        existing->battery_state = SDL_POWERSTATE_UNKNOWN;
+        existing->battery_percent = -1;
+      }
+      d->sdl_gamepad = NULL;
+      d->has_sdl = FALSE;
+      d->sdl_id = 0;
+      d->sdl_udev_seq++;
+      udev_attach_meta_move(&existing->sdl_meta, &d->sdl_meta);
+      existing->sdl_udev_seq++;
+      if (existing->vendor_id == 0 || existing->product_id == 0) {
+        existing->vendor_id = d->vendor_id;
+        existing->product_id = d->product_id;
+      }
+      g_ptr_array_remove(self->devices, d);
+
+      device_poll_battery(self, existing);
+      device_refresh_virtual_state(self, existing);
+      existing->hidden = compute_device_hidden(self, existing);
+      device_emit_transition(self, existing, FALSE, existing_was_hidden, TRUE);
+      return;
+    }
+  }
+
+  if (!was_pending) {
+    if (probe && probe->found) {
+      gboolean changed = device_poll_battery(self, d);
+      refresh_and_emit_device(self, d, changed);
+    }
+    return;
+  }
+
+  device_poll_battery(self, d);
+  device_refresh_virtual_state(self, d);
+  d->hidden = compute_device_hidden(self, d);
+  device_emit_transition(self, d, TRUE, TRUE, TRUE);
+}
+
+static void schedule_sdl_udev_probe(ConttestDeviceManager *self,
+                                    ConttestDevice *d,
+                                    const char *sdl_path,
+                                    guint seq) {
+  if (self->disposed || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable))
+    return;
+
+  GTask *task =
+      g_task_new(NULL, self->cancellable, on_sdl_udev_probe_done, NULL);
+  g_task_set_task_data(
+      task, udev_task_ctx_new_for_device(self, d, sdl_path, NULL, seq),
+      udev_task_ctx_free);
+  g_task_run_in_thread(task, probe_sdl_udev_thread);
+  g_object_unref(task);
+}
+
+/* Refresh SDL-side udev metadata for an already visible device (typically an
+ * evdev node that SDL just attached to). The device is not hidden while this
+ * runs: sdl_probe_pending stays FALSE so no user-visible transition depends on
+ * it; on completion on_sdl_udev_probe_done() only refreshes the device. */
+static void schedule_sdl_meta_probe(ConttestDeviceManager *self,
+                                    ConttestDevice *d) {
+  if (!self || !d || self->disposed || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable) ||
+      !d->has_sdl || d->sdl_probe_pending ||
+      d->sdl_meta.own_syspath || !d->sdl_path ||
+      !g_str_has_prefix(d->sdl_path, "/dev/"))
+    return;
+
+  guint seq = ++d->sdl_udev_seq;
+  schedule_sdl_udev_probe(self, d, d->sdl_path, seq);
+}
+
+/* Bind a new SDL instance to a device, rebinding the handle when the instance
+ * ID changed, and announce the resulting state. */
+static void device_apply_sdl_attach(ConttestDeviceManager *self,
+                                    ConttestDevice *d, SDL_JoystickID id,
+                                    const char *name, const char *sdl_path,
+                                    uint16_t sdl_vid, uint16_t sdl_pid) {
+  gboolean was_hidden = d->hidden;
+  gboolean was_pending = d->sdl_probe_pending;
+  device_set_name(d, name);
+  device_attach_sdl(d, id, sdl_path);
+  if (d->vendor_id == 0 || d->product_id == 0) {
+    d->vendor_id = sdl_vid;
+    d->product_id = sdl_pid;
+  }
+
+  if (was_pending) {
+    /* The placeholder is still waiting for udev identity; re-arm the probe
+     * under a fresh sequence number and keep it hidden until it completes. */
+    guint seq = ++d->sdl_udev_seq;
+    schedule_sdl_udev_probe(self, d, d->sdl_path, seq);
+    return;
+  }
+
+  schedule_sdl_meta_probe(self, d);
+  device_poll_battery(self, d);
+  device_refresh_virtual_state(self, d);
+  d->hidden = compute_device_hidden(self, d);
+  device_emit_transition(self, d, FALSE, was_hidden, TRUE);
+}
+
 static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
+  if (self->disposed || !self->devices)
+    return;
+
+  /* SDL reuses instance IDs. A binding to this ID whose handle no longer
+   * backs live hardware is stale, so clear it and treat the event as a new
+   * instance instead of dropping it. */
+  ConttestDevice *bound = find_device_by_sdl_id(self, id);
+  if (bound) {
+    if (device_sdl_attachment_is_live(bound))
+      return;
+    device_detach_sdl(bound);
+    check_empty_and_remove(self, bound);
+    if (self->disposed || !self->devices)
+      return;
+  }
+
   const char *name = SDL_GetGamepadNameForID(id);
   if (!name)
     name = "Unknown Gamepad";
 
   const char *sdl_path = SDL_GetGamepadPathForID(id);
+  uint16_t sdl_vid = SDL_GetGamepadVendorForID(id);
+  uint16_t sdl_pid = SDL_GetGamepadProductForID(id);
 
-  /* Deduplicate: if another SDL gamepad with the same path is already tracked,
-   * this is the same physical device reported twice (e.g. WiiU GC adapter
-   * mirroring one controller across multiple ports). Ignore the duplicate. */
-  ConttestDevice *d = find_device_by_sdl_path(self, sdl_path);
-  if (d) return;
-
-  d = find_device_by_hardware_for_sdl(self, sdl_path);
-
-  gboolean is_new = FALSE;
-  if (!d) {
-    d = conttest_device_new(name);
-    g_ptr_array_add(self->devices, d);
-    is_new = TRUE;
-  } else {
-    device_set_name(d, name);
+  /* Deduplicate only dedicated /dev/input/event* nodes with matching identity
+   * so empty or shared multi-port adapter paths never coalesce distinct pads. */
+  ConttestDevice *d =
+      find_device_by_sdl_path(self, sdl_path, sdl_vid, sdl_pid, name);
+  if (d && d->sdl_id == id) {
+    /* A duplicate SDL add event can still be the first chance to populate
+     * sdl_meta for a device whose earlier probe found nothing. */
+    schedule_sdl_meta_probe(self, d);
+    return;
   }
 
+  g_autofree char *sdl_serial = NULL;
+  SDL_JoystickConnectionState sdl_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
+  /* Serial and connection type require an open handle; only the pathless
+   * VID/PID fallback below consumes them. */
+  if (!d && (!sdl_path || !g_str_has_prefix(sdl_path, "/dev/")) &&
+      sdl_vid != 0 && sdl_pid != 0) {
+    SDL_Gamepad *match_gamepad = SDL_OpenGamepad(id);
+    if (match_gamepad) {
+      const char *serial = SDL_GetGamepadSerial(match_gamepad);
+      if (serial && *serial)
+        sdl_serial = g_strdup(serial);
+      sdl_conn = SDL_GetGamepadConnectionState(match_gamepad);
+      SDL_CloseGamepad(match_gamepad);
+    }
+  }
+
+  if (!d)
+    d = find_device_by_hardware_for_sdl(self, sdl_path, NULL, NULL, sdl_vid,
+                                        sdl_pid, sdl_serial, sdl_conn);
+
+  if (d) {
+    device_apply_sdl_attach(self, d, id, name, sdl_path, sdl_vid, sdl_pid);
+    return;
+  }
+
+  d = conttest_device_new(name);
+  g_ptr_array_add(self->devices, d);
   device_attach_sdl(d, id, sdl_path);
-  device_poll_battery(self, d);
+  d->vendor_id = sdl_vid;
+  d->product_id = sdl_pid;
 
-  if (is_new) {
-    g_signal_emit(self, signals[SIGNAL_DEVICE_ADDED], 0, d);
-  } else {
-    g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, d);
+  if (sdl_path && g_str_has_prefix(sdl_path, "/dev/") && self->cancellable &&
+      !g_cancellable_is_cancelled(self->cancellable)) {
+    /* Defer emission for unmatched /dev/ paths until off-thread udev metadata
+     * tells us whether it matches an evdev node or is an InputPlumber node. */
+    d->sdl_probe_pending = TRUE;
+    d->hidden = TRUE;
+    guint seq = ++d->sdl_udev_seq;
+    schedule_sdl_udev_probe(self, d, sdl_path, seq);
+    return;
   }
+
+  device_poll_battery(self, d);
+  device_refresh_virtual_state(self, d);
+  d->hidden = compute_device_hidden(self, d);
+  device_emit_transition(self, d, TRUE, FALSE, TRUE);
 }
 
 static void handle_sdl_removed(ConttestDeviceManager *self, SDL_JoystickID id) {
@@ -625,249 +1855,655 @@ static void handle_sdl_removed(ConttestDeviceManager *self, SDL_JoystickID id) {
   }
 }
 
-/* Re-scan evdev devices via udev enumeration. Used as a fallback when the
- * udev netlink monitor is unavailable (e.g. inside a Flatpak sandbox). */
-static void handle_udev_add(ConttestDeviceManager *self, struct udev_device *dev);
+/* Shared helper applying off-thread extracted evdev udev metadata on main loop. */
+static void apply_probed_evdev_meta(ConttestDeviceManager *self,
+                                    UdevDeviceMeta *m) {
+  if (!self || self->disposed || !self->devices || !m || !m->syspath)
+    return;
 
-static void scan_evdev_devices(ConttestDeviceManager *self) {
-  if (!self->udev) return;
-  struct udev_enumerate *enumerate = udev_enumerate_new(self->udev);
-  if (!enumerate) return;
-  udev_enumerate_add_match_subsystem(enumerate, "input");
-  udev_enumerate_scan_devices(enumerate);
-  struct udev_list_entry *entry;
-  udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(enumerate)) {
-    const char *path = udev_list_entry_get_name(entry);
-    struct udev_device *dev = udev_device_new_from_syspath(self->udev, path);
-    if (dev) {
-      handle_udev_add(self, dev);
-      udev_device_unref(dev);
+  ConttestDevice *existing = find_device_by_evdev_syspath(self, m->syspath);
+  if (existing) {
+    gboolean changed = FALSE;
+    if (m->devnode && g_strcmp0(existing->evdev_devnode, m->devnode) != 0) {
+      g_free(existing->evdev_devnode);
+      existing->evdev_devnode = g_strdup(m->devnode);
+      changed = TRUE;
+    }
+    udev_attach_meta_move(&existing->evdev_meta, &m->meta);
+    existing->evdev_udev_seq++;
+    if (m->vendor_id != 0 && existing->vendor_id != m->vendor_id) {
+      existing->vendor_id = m->vendor_id;
+      changed = TRUE;
+    }
+    if (m->product_id != 0 && existing->product_id != m->product_id) {
+      existing->product_id = m->product_id;
+      changed = TRUE;
+    }
+    if (!existing->has_sdl &&
+        existing->connection_state == SDL_JOYSTICK_CONNECTION_UNKNOWN) {
+      SDL_JoystickConnectionState conn =
+          device_cached_udev_connection_state(existing);
+      if (conn != existing->connection_state) {
+        existing->connection_state = conn;
+        changed = TRUE;
+      }
+    }
+    if (device_poll_battery(self, existing))
+      changed = TRUE;
+    refresh_and_emit_device(self, existing, changed);
+    return;
+  }
+
+  ConttestDevice *d = find_device_by_hardware_for_evdev(
+      self, m->devnode, m->meta.own_syspath,
+      (const char *const *)m->meta.hw_keys, m->vendor_id, m->product_id,
+      m->meta.is_virtual, m->meta.serial, m->meta.udev_conn);
+
+  gboolean is_new = FALSE;
+  gboolean was_hidden = FALSE;
+  if (!d) {
+    d = conttest_device_new(m->name);
+    g_ptr_array_add(self->devices, d);
+    is_new = TRUE;
+  } else {
+    was_hidden = d->hidden;
+    /* Only update the name from evdev if SDL hasn't already provided a
+     * better (mapped) name. SDL names like "PS4 Controller" are preferred
+     * over raw evdev names like "Wireless Controller". */
+    if (!d->has_sdl)
+      device_set_name(d, m->name);
+    if (d->sdl_probe_pending) {
+      d->sdl_probe_pending = FALSE;
+      /* The placeholder's in-flight SDL probe is stale now that evdev has
+       * identified the device; invalidate it and fetch SDL metadata in the
+       * background so hidden/connection state is not left cold. */
+      d->sdl_udev_seq++;
+      schedule_sdl_meta_probe(self, d);
     }
   }
-  udev_enumerate_unref(enumerate);
 
-  /* Remove evdev devices whose syspath no longer exists. */
-  for (guint i = self->devices->len; i > 0; i--) {
-    ConttestDevice *d = g_ptr_array_index(self->devices, i - 1);
-    if (d->has_evdev && d->evdev_syspath) {
-      struct udev_device *dev = udev_device_new_from_syspath(self->udev, d->evdev_syspath);
-      if (!dev) {
-        device_detach_evdev(d);
-        check_empty_and_remove(self, d);
-      } else {
-        udev_device_unref(dev);
+  device_attach_evdev(d, m->syspath, m->devnode);
+  udev_attach_meta_move(&d->evdev_meta, &m->meta);
+  d->evdev_udev_seq++;
+
+  if (m->vendor_id != 0)
+    d->vendor_id = m->vendor_id;
+  if (m->product_id != 0)
+    d->product_id = m->product_id;
+
+  device_poll_battery(self, d);
+
+  /* For evdev-only devices SDL never sets connection_state, so use cached udev
+   * metadata directly. */
+  if (!d->has_sdl && d->connection_state == SDL_JOYSTICK_CONNECTION_UNKNOWN) {
+    d->connection_state = device_cached_udev_connection_state(d);
+  }
+
+  device_refresh_virtual_state(self, d);
+  d->hidden = compute_device_hidden(self, d);
+  device_emit_transition(self, d, is_new, was_hidden, TRUE);
+}
+
+/* Re-scan evdev devices asynchronously via a thread-local udev handle. Used on
+ * startup and as a fallback when the netlink monitor is unavailable (Flatpak). */
+static void schedule_evdev_scan(ConttestDeviceManager *self);
+
+typedef struct {
+  GWeakRef manager;
+  GPtrArray *known_syspaths; /* element: char* */
+  guint remove_seq;
+} EvdevScanTaskCtx;
+
+static void evdev_scan_task_ctx_free(gpointer data) {
+  EvdevScanTaskCtx *ctx = data;
+  if (!ctx)
+    return;
+  g_weak_ref_clear(&ctx->manager);
+  g_clear_pointer(&ctx->known_syspaths, g_ptr_array_unref);
+  g_free(ctx);
+}
+
+typedef struct {
+  GPtrArray *scanned;           /* element: UdevDeviceMeta* */
+  GPtrArray *vanished_syspaths; /* element: char* */
+  guint remove_seq;
+} EvdevScanResult;
+
+static void evdev_scan_result_free(gpointer data) {
+  EvdevScanResult *r = data;
+  if (!r)
+    return;
+  g_clear_pointer(&r->scanned, g_ptr_array_unref);
+  g_clear_pointer(&r->vanished_syspaths, g_ptr_array_unref);
+  g_free(r);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(EvdevScanResult, evdev_scan_result_free)
+
+static void scan_evdev_thread(GTask *task, gpointer source_object,
+                              gpointer task_data, GCancellable *cancellable) {
+  (void)source_object;
+  EvdevScanTaskCtx *ctx = task_data;
+  EvdevScanResult *res = g_new0(EvdevScanResult, 1);
+  res->scanned = g_ptr_array_new_with_free_func(udev_device_meta_free);
+  res->vanished_syspaths = g_ptr_array_new_with_free_func(g_free);
+  res->remove_seq = ctx->remove_seq;
+
+  if (g_cancellable_is_cancelled(cancellable)) {
+    g_task_return_pointer(task, res, evdev_scan_result_free);
+    return;
+  }
+
+  struct udev *u = udev_new();
+  if (u) {
+    g_autoptr(GHashTable) found_set =
+        g_hash_table_new(g_str_hash, g_str_equal);
+    struct udev_enumerate *enumerate = udev_enumerate_new(u);
+    if (enumerate) {
+      udev_enumerate_add_match_subsystem(enumerate, "input");
+      udev_enumerate_add_match_property(enumerate, "ID_INPUT_JOYSTICK", "1");
+      udev_enumerate_scan_devices(enumerate);
+      struct udev_list_entry *entry;
+      udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(enumerate)) {
+        if (g_cancellable_is_cancelled(cancellable))
+          break;
+        const char *path = udev_list_entry_get_name(entry);
+        struct udev_device *dev = udev_device_new_from_syspath(u, path);
+        if (dev) {
+          UdevDeviceMeta *meta = udev_device_meta_extract_evdev(dev);
+          if (meta) {
+            g_hash_table_add(found_set, meta->syspath);
+            g_ptr_array_add(res->scanned, meta);
+          }
+          udev_device_unref(dev);
+        }
+      }
+      udev_enumerate_unref(enumerate);
+    }
+
+    /* Check previously known evdev syspaths that were absent from enumeration
+     * on the worker thread so main loop never calls udev_device_new_from_syspath. */
+    if (!g_cancellable_is_cancelled(cancellable) && ctx->known_syspaths) {
+      for (guint i = 0; i < ctx->known_syspaths->len; i++) {
+        if (g_cancellable_is_cancelled(cancellable))
+          break;
+        const char *old_syspath = g_ptr_array_index(ctx->known_syspaths, i);
+        if (!g_hash_table_contains(found_set, old_syspath)) {
+          struct udev_device *dev = udev_device_new_from_syspath(u, old_syspath);
+          if (!dev) {
+            g_ptr_array_add(res->vanished_syspaths, g_strdup(old_syspath));
+          } else {
+            udev_device_unref(dev);
+          }
+        }
+      }
+    }
+
+    udev_unref(u);
+  }
+
+  g_task_return_pointer(task, res, evdev_scan_result_free);
+}
+
+static void on_evdev_scan_done(GObject *source, GAsyncResult *res,
+                               gpointer user_data) {
+  (void)source;
+  (void)user_data;
+  GTask *task = G_TASK(res);
+  EvdevScanTaskCtx *ctx = g_task_get_task_data(task);
+  GError *err = NULL;
+  g_autoptr(EvdevScanResult) scan_res = g_task_propagate_pointer(task, &err);
+  g_clear_error(&err);
+
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(&ctx->manager);
+  if (!self || self->disposed || !self->devices || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable))
+    return;
+
+  self->evdev_scan_in_flight = FALSE;
+
+  if (scan_res) {
+    if (scan_res->remove_seq != self->evdev_remove_seq) {
+      /* A netlink removal raced with the background scan; run a clean pass. */
+      self->evdev_rescan_pending = TRUE;
+    } else {
+      if (scan_res->vanished_syspaths) {
+        for (guint i = 0; i < scan_res->vanished_syspaths->len; i++) {
+          const char *gone = g_ptr_array_index(scan_res->vanished_syspaths, i);
+          ConttestDevice *d = find_device_by_evdev_syspath(self, gone);
+          if (d) {
+            device_detach_evdev(d);
+            check_empty_and_remove(self, d);
+            if (self->disposed || !self->devices)
+              return;
+          }
+        }
+      }
+
+      if (scan_res->scanned) {
+        for (guint i = 0; i < scan_res->scanned->len; i++) {
+          UdevDeviceMeta *meta = g_ptr_array_index(scan_res->scanned, i);
+          apply_probed_evdev_meta(self, meta);
+          if (self->disposed || !self->devices)
+            return;
+        }
       }
     }
   }
+
+  if (self->evdev_rescan_pending && !self->disposed) {
+    self->evdev_rescan_pending = FALSE;
+    schedule_evdev_scan(self);
+  }
 }
 
-static gboolean on_sdl_timer(gpointer user_data) {
-  ConttestDeviceManager *self = CONTTEST_DEVICE_MANAGER(user_data);
-  SDL_PumpEvents();
+static void schedule_evdev_scan(ConttestDeviceManager *self) {
+  if (self->disposed || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable))
+    return;
+
+  if (self->evdev_scan_in_flight) {
+    self->evdev_rescan_pending = TRUE;
+    return;
+  }
+
+  self->evdev_scan_in_flight = TRUE;
+
+  EvdevScanTaskCtx *ctx = g_new0(EvdevScanTaskCtx, 1);
+  g_weak_ref_init(&ctx->manager, self);
+  ctx->known_syspaths = g_ptr_array_new_with_free_func(g_free);
+  ctx->remove_seq = self->evdev_remove_seq;
+  if (self->devices) {
+    for (guint i = 0; i < self->devices->len; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (d->has_evdev && d->evdev_syspath) {
+        g_ptr_array_add(ctx->known_syspaths, g_strdup(d->evdev_syspath));
+      }
+    }
+  }
+
+  GTask *task = g_task_new(NULL, self->cancellable, on_evdev_scan_done, NULL);
+  g_task_set_task_data(task, ctx, evdev_scan_task_ctx_free);
+  g_task_run_in_thread(task, scan_evdev_thread);
+  g_object_unref(task);
+}
+
+static void poll_sdl_events(ConttestDeviceManager *self, gboolean force_pump) {
+  if (self->disposed || !self->devices)
+    return;
+
+  gint64 now = g_get_monotonic_time();
+  if (force_pump || last_sdl_pump_us == 0 ||
+      (now - last_sdl_pump_us) >= SDL_PUMP_COALESCE_US) {
+    conttest_sdl_pump_events_at(now);
+  }
 
   gboolean sdl_hotplug = FALSE;
-  SDL_Event event;
-  while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_GAMEPAD_ADDED,
-                        SDL_EVENT_GAMEPAD_REMOVED) > 0) {
-    sdl_hotplug = TRUE;
-    if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
-      handle_sdl_added(self, event.gdevice.which);
-    } else if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
-      handle_sdl_removed(self, event.gdevice.which);
+  SDL_Event events[64];
+  int n_events;
+  /* Drain the SDL event queue in batches so miscellaneous SDL events cannot
+   * accumulate up to SDL's 65,535-event cap. Removals are applied before
+   * additions: a fast replug can deliver both in one batch, and the new
+   * instance must be matched against the state that survives the removal. */
+  while (!self->disposed && self->devices &&
+         (n_events = SDL_PeepEvents(events, (int)G_N_ELEMENTS(events),
+                                    SDL_GETEVENT, SDL_EVENT_FIRST,
+                                    SDL_EVENT_LAST)) > 0) {
+    for (int pass = 0; pass < 2; pass++) {
+      for (int i = 0; i < n_events && !self->disposed && self->devices; i++) {
+        const SDL_Event *event = &events[i];
+        if (pass == 0 && event->type == SDL_EVENT_GAMEPAD_REMOVED) {
+          sdl_hotplug = TRUE;
+          handle_sdl_removed(self, event->gdevice.which);
+        } else if (pass == 1 && event->type == SDL_EVENT_GAMEPAD_ADDED) {
+          sdl_hotplug = TRUE;
+          handle_sdl_added(self, event->gdevice.which);
+        } else if (pass == 1 &&
+                   event->type == SDL_EVENT_JOYSTICK_BATTERY_UPDATED) {
+          ConttestDevice *d =
+              find_device_by_sdl_id(self, event->jbattery.which);
+          if (d && !d->hidden && device_poll_battery(self, d)) {
+            g_autoptr(ConttestDevice) keep = g_object_ref(d);
+            g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, keep);
+          }
+        }
+      }
+    }
+  }
+
+  if (self->disposed || !self->devices)
+    return;
+
+  /* Safety net: detach any open SDL gamepad that SDL now reports disconnected
+   * even if no removal event remained in the queue. Scan read-only first so
+   * the steady-state 20 Hz tick performs zero heap allocations or ref churn. */
+  gboolean has_disconnected_sdl = FALSE;
+  for (guint i = 0; i < self->devices->len; i++) {
+    ConttestDevice *d = g_ptr_array_index(self->devices, i);
+    if (d->has_sdl && d->sdl_gamepad && !device_sdl_attachment_is_live(d)) {
+      has_disconnected_sdl = TRUE;
+      break;
+    }
+  }
+
+  if (has_disconnected_sdl) {
+    g_autoptr(GPtrArray) snapshot = snapshot_devices(self);
+    for (guint i = 0; i < snapshot->len; i++) {
+      if (self->disposed || !self->devices)
+        return;
+      ConttestDevice *d = g_ptr_array_index(snapshot, i);
+      if (!g_ptr_array_find(self->devices, d, NULL))
+        continue;
+      if (d->has_sdl && d->sdl_gamepad &&
+          !device_sdl_attachment_is_live(d)) {
+        sdl_hotplug = TRUE;
+        device_detach_sdl(d);
+        check_empty_and_remove(self, d);
+      }
     }
   }
 
   /* Re-scan evdev devices on SDL hotplug. Needed because the udev netlink
    * monitor may be non-functional in sandboxed environments (Flatpak). */
-  if (sdl_hotplug) {
-    scan_evdev_devices(self);
+  if (sdl_hotplug && !self->disposed) {
+    schedule_evdev_scan(self);
+  }
+}
+
+static gboolean on_sdl_sync_idle(gpointer user_data) {
+  GWeakRef *wr = user_data;
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(wr);
+  if (!self || self->disposed)
+    return G_SOURCE_REMOVE;
+  self->sdl_sync_idle_id = 0;
+  poll_sdl_events(self, TRUE);
+  return G_SOURCE_REMOVE;
+}
+
+static void schedule_sdl_sync(ConttestDeviceManager *self) {
+  if (!self->disposed && !self->sdl_sync_idle_id) {
+    self->sdl_sync_idle_id = g_idle_add_full(
+        G_PRIORITY_HIGH_IDLE, on_sdl_sync_idle, manager_weak_ref_new(self),
+        manager_weak_ref_free);
+  }
+}
+
+static gboolean on_sdl_timer(gpointer user_data) {
+  GWeakRef *wr = user_data;
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(wr);
+  if (!self || self->disposed)
+    return G_SOURCE_REMOVE;
+  poll_sdl_events(self, FALSE);
+  return self->disposed ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
+}
+
+static gboolean on_battery_poll_timer(gpointer user_data) {
+  GWeakRef *wr = user_data;
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(wr);
+  if (!self || self->disposed || !self->devices)
+    return G_SOURCE_REMOVE;
+
+  g_autoptr(GPtrArray) snapshot = snapshot_devices(self);
+  for (guint i = 0; i < snapshot->len; i++) {
+    ConttestDevice *d = g_ptr_array_index(snapshot, i);
+    if (!self->devices || !g_ptr_array_find(self->devices, d, NULL))
+      continue;
+    if (!d->hidden && d->has_sdl && device_poll_battery(self, d)) {
+      g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, d);
+      if (self->disposed || !self->devices)
+        return G_SOURCE_REMOVE;
+    }
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static void probe_evdev_syspath_thread(GTask *task, gpointer source_object,
+                                       gpointer task_data,
+                                       GCancellable *cancellable) {
+  (void)source_object;
+  UdevTaskCtx *ctx = task_data;
+  if (g_cancellable_is_cancelled(cancellable) || !ctx->arg) {
+    g_task_return_pointer(task, NULL, NULL);
+    return;
   }
 
-  /* Periodically refresh battery state (~every 5s).
-   * Coupled to on_sdl_timer 50ms interval (100 ticks = 5000ms). */
-  if (++self->battery_poll_counter >= 100) {
-    self->battery_poll_counter = 0;
+  UdevDeviceMeta *meta = NULL;
+  struct udev *u = udev_new();
+  if (u) {
+    struct udev_device *dev = udev_device_new_from_syspath(u, ctx->arg);
+    if (dev) {
+      meta = udev_device_meta_extract_evdev(dev);
+      udev_device_unref(dev);
+    }
+    udev_unref(u);
+  }
+
+  g_task_return_pointer(task, meta, udev_device_meta_free);
+}
+
+static void on_evdev_probe_done(GObject *source, GAsyncResult *res,
+                                gpointer user_data) {
+  (void)source;
+  (void)user_data;
+  GTask *task = G_TASK(res);
+  UdevTaskCtx *ctx = g_task_get_task_data(task);
+  GError *err = NULL;
+  g_autoptr(UdevDeviceMeta) meta = g_task_propagate_pointer(task, &err);
+  g_clear_error(&err);
+
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(&ctx->manager);
+  if (!self || self->disposed || !self->devices || !self->evdev_seq_by_syspath)
+    return;
+
+  if (self->evdev_probes_in_flight > 0)
+    self->evdev_probes_in_flight--;
+
+  if (!self->cancellable || g_cancellable_is_cancelled(self->cancellable)) {
+    if (self->evdev_probes_in_flight == 0)
+      g_hash_table_remove_all(self->evdev_seq_by_syspath);
+    return;
+  }
+
+  gpointer val = NULL;
+  if (ctx->arg &&
+      g_hash_table_lookup_extended(self->evdev_seq_by_syspath, ctx->arg, NULL,
+                                   &val) &&
+      GPOINTER_TO_UINT(val) == ctx->seq) {
+    if (meta) {
+      apply_probed_evdev_meta(self, meta);
+    }
+  }
+
+  if (!self->disposed && self->evdev_seq_by_syspath &&
+      self->evdev_probes_in_flight == 0) {
+    g_hash_table_remove_all(self->evdev_seq_by_syspath);
+  }
+}
+
+static void schedule_evdev_probe(ConttestDeviceManager *self,
+                                 const char *syspath) {
+  if (self->disposed || !self->cancellable ||
+      g_cancellable_is_cancelled(self->cancellable) || !syspath ||
+      !self->evdev_seq_by_syspath)
+    return;
+
+  guint seq = ++self->evdev_seq;
+  g_hash_table_replace(self->evdev_seq_by_syspath, g_strdup(syspath),
+                       GUINT_TO_POINTER(seq));
+  self->evdev_probes_in_flight++;
+
+  GTask *task =
+      g_task_new(NULL, self->cancellable, on_evdev_probe_done, NULL);
+  g_task_set_task_data(
+      task, udev_task_ctx_new_for_device(self, NULL, syspath, NULL, seq),
+      udev_task_ctx_free);
+  g_task_run_in_thread(task, probe_evdev_syspath_thread);
+  g_object_unref(task);
+}
+
+static void handle_evdev_syspath_remove(ConttestDeviceManager *self,
+                                        const char *syspath) {
+  if (!syspath || self->disposed || !self->devices)
+    return;
+
+  self->evdev_remove_seq++;
+  if (self->evdev_seq_by_syspath && self->evdev_probes_in_flight > 0) {
+    /* Supersede any in-flight add/change probe for this disappearing syspath. */
+    g_hash_table_replace(self->evdev_seq_by_syspath, g_strdup(syspath),
+                         GUINT_TO_POINTER(++self->evdev_seq));
+  }
+
+  ConttestDevice *d = find_device_by_evdev_syspath(self, syspath);
+  if (d) {
+    gboolean still_has_sdl = d->has_sdl;
+    gboolean had_matching_sdl_node =
+        d->has_sdl && d->sdl_path && d->evdev_devnode &&
+        g_strcmp0(d->sdl_path, d->evdev_devnode) == 0;
+    device_detach_evdev(d);
+    if (had_matching_sdl_node) {
+      d->sdl_meta.udev_dead = TRUE;
+      d->sdl_udev_seq++;
+    }
+    check_empty_and_remove(self, d);
+    if (still_has_sdl && !self->disposed)
+      schedule_sdl_sync(self);
+  } else if (!self->disposed) {
+    /* An SDL placeholder still probing udev may belong to this vanishing node;
+     * force an SDL sync so disconnect state is reflected promptly. */
     for (guint i = 0; i < self->devices->len; i++) {
-      ConttestDevice *d = g_ptr_array_index(self->devices, i);
-      if (d->has_sdl && device_poll_battery(self, d)) {
-        g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, d);
+      ConttestDevice *cand = g_ptr_array_index(self->devices, i);
+      if (cand->has_sdl && cand->sdl_probe_pending) {
+        schedule_sdl_sync(self);
+        break;
       }
     }
   }
-
-  return G_SOURCE_CONTINUE;
 }
 
-static void handle_udev_add(ConttestDeviceManager *self,
-                            struct udev_device *dev) {
-  const char *syspath = udev_device_get_syspath(dev);
-  // Only care about evdev nodes /dev/input/eventX
-  const char *devnode = udev_device_get_devnode(dev);
-  if (!devnode || strncmp(devnode, "/dev/input/event", 16) != 0)
+static void handle_power_supply_event(ConttestDeviceManager *self,
+                                      const char *syspath,
+                                      const char *action) {
+  if (!syspath || self->disposed || !self->devices)
     return;
 
-  // Check if it's a joystick
-  const char *id_input_joystick =
-      udev_device_get_property_value(dev, "ID_INPUT_JOYSTICK");
-  if (!id_input_joystick || strcmp(id_input_joystick, "1") != 0)
+  if (g_strcmp0(action, "remove") == 0) {
+    g_autoptr(GPtrArray) snapshot = snapshot_devices(self);
+    for (guint i = 0; i < snapshot->len; i++) {
+      ConttestDevice *d = g_ptr_array_index(snapshot, i);
+      if (!self->devices || !g_ptr_array_find(self->devices, d, NULL))
+        continue;
+      if (d->battery_syspath && g_strcmp0(d->battery_syspath, syspath) == 0) {
+        device_reset_ds3_battery(d);
+        d->battery_state = SDL_POWERSTATE_UNKNOWN;
+        d->battery_percent = -1;
+        if (!d->hidden) {
+          g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, d);
+          if (self->disposed || !self->devices)
+            return;
+        }
+      }
+    }
     return;
-
-  /* Skip if this evdev device is already tracked. */
-  if (find_device_by_evdev_syspath(self, syspath))
-    return;
-
-  const char *name = NULL;
-  struct udev_device *parent =
-      udev_device_get_parent_with_subsystem_devtype(dev, "input", NULL);
-  if (parent) {
-    name = udev_device_get_sysattr_value(parent, "name");
   }
 
-  if (!name) {
-    name = udev_device_get_property_value(dev, "NAME");
-  }
-  if (!name)
-    name = "Unknown evdev";
-
-  // Strip surrounding quotes if present (e.g. NAME="Xbox Controller")
-  char *clean_name = g_strdup(name);
-  size_t len = strlen(clean_name);
-  if (len >= 2 && clean_name[0] == '"' && clean_name[len - 1] == '"') {
-    clean_name[len - 1] = '\0';
-    memmove(clean_name, clean_name + 1, len - 1); /* copies len-2 chars + new '\0' */
-  }
-
-  ConttestDevice *d = find_device_by_hardware_for_evdev(self, syspath);
-
-  gboolean is_new = FALSE;
-  if (!d) {
-    d = conttest_device_new(clean_name);
-    g_ptr_array_add(self->devices, d);
-    is_new = TRUE;
-  } else {
-    /* Only update the name from evdev if SDL hasn't already provided a
-     * better (mapped) name. SDL names like "PS4 Controller" are preferred
-     * over raw evdev names like "Wireless Controller". */
-    if (!d->has_sdl)
-      device_set_name(d, clean_name);
-  }
-
-  device_attach_evdev(d, syspath);
-
-  /* Harvest hardware identity.
-   * Bluetooth DS3s often lack ID_VENDOR_ID on the event node but have PRODUCT
-   * or a HID parent with HID_ID. */
-  const char *vid_str = udev_device_get_property_value(dev, "ID_VENDOR_ID");
-  const char *pid_str = udev_device_get_property_value(dev, "ID_MODEL_ID");
-  if (vid_str)
-    d->vendor_id = (uint16_t)g_ascii_strtoull(vid_str, NULL, 16);
-  if (pid_str)
-    d->product_id = (uint16_t)g_ascii_strtoull(pid_str, NULL, 16);
-
-  if (d->vendor_id == 0 || d->product_id == 0) {
-    parse_vid_pid(udev_device_get_property_value(dev, "PRODUCT"), '/',
-                  &d->vendor_id, &d->product_id);
-  }
-  if (d->vendor_id == 0 || d->product_id == 0) {
-    struct udev_device *h =
-        udev_device_get_parent_with_subsystem_devtype(dev, "hid", NULL);
-    if (h) {
-      parse_vid_pid(udev_device_get_property_value(h, "HID_ID"), ':',
-                    &d->vendor_id, &d->product_id);
+  if (g_strcmp0(action, "add") == 0 || g_strcmp0(action, "change") == 0) {
+    for (guint i = 0; i < self->devices->len; i++) {
+      ConttestDevice *d = g_ptr_array_index(self->devices, i);
+      if (!conttest_device_is_ds3(d) || !d->has_sdl)
+        continue;
+      if (d->battery_syspath && g_strcmp0(d->battery_syspath, syspath) == 0) {
+        schedule_ds3_battery_task(self, d, TRUE);
+      } else if (d->has_evdev && !d->battery_syspath) {
+        if (d->ds3_battery_state != DS3_BATTERY_PROBING)
+          d->ds3_battery_state = DS3_BATTERY_UNPROBED;
+        schedule_ds3_battery_task(self, d, TRUE);
+      }
     }
   }
-
-  /* Trigger immediate poll now that identity is established. */
-  device_poll_battery(self, d);
-
-  /* For evdev-only devices SDL never sets connection_state, so resolve it
-   * from udev directly. */
-  if (!d->has_sdl && d->connection_state == SDL_JOYSTICK_CONNECTION_UNKNOWN) {
-    d->connection_state = resolve_connection_state_udev(self, d);
-  }
-
-  if (is_new) {
-    g_signal_emit(self, signals[SIGNAL_DEVICE_ADDED], 0, d);
-  } else {
-    g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, d);
-  }
-
-  g_free(clean_name);
 }
 
-static void handle_udev_remove(ConttestDeviceManager *self,
-                               struct udev_device *dev) {
-  const char *syspath = udev_device_get_syspath(dev);
-  ConttestDevice *d = find_device_by_evdev_syspath(self, syspath);
-  if (d) {
-    device_detach_evdev(d);
-    check_empty_and_remove(self, d);
-  }
-}
-
-static gboolean on_udev_event(GIOChannel *source, GIOCondition condition,
+static gboolean on_udev_event(gint fd, GIOCondition condition,
                               gpointer user_data) {
-  (void)source;
-  (void)condition;
-  ConttestDeviceManager *self = CONTTEST_DEVICE_MANAGER(user_data);
+  (void)fd;
+  GWeakRef *wr = user_data;
+  g_autoptr(ConttestDeviceManager) self = g_weak_ref_get(wr);
+  if (!self || self->disposed || !self->udev_mon ||
+      (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL))) {
+    if (self)
+      self->udev_watch_id = 0;
+    return G_SOURCE_REMOVE;
+  }
 
-  struct udev_device *dev = udev_monitor_receive_device(self->udev_mon);
-  if (dev) {
+  struct udev_device *dev;
+  while (!self->disposed &&
+         (dev = udev_monitor_receive_device(self->udev_mon)) != NULL) {
+    const char *sub = udev_device_get_subsystem(dev);
     const char *action = udev_device_get_action(dev);
-    if (g_strcmp0(action, "add") == 0) {
-      handle_udev_add(self, dev);
+    const char *syspath = udev_device_get_syspath(dev);
+    if (g_strcmp0(sub, "power_supply") == 0) {
+      handle_power_supply_event(self, syspath, action);
+    } else if (g_strcmp0(action, "add") == 0 ||
+               g_strcmp0(action, "change") == 0) {
+      const char *devnode = udev_device_get_devnode(dev);
+      const char *id_input_joystick =
+          udev_device_get_property_value(dev, "ID_INPUT_JOYSTICK");
+      if (syspath && devnode && strncmp(devnode, "/dev/input/event", 16) == 0 &&
+          id_input_joystick && strcmp(id_input_joystick, "1") == 0) {
+        schedule_evdev_probe(self, syspath);
+      }
     } else if (g_strcmp0(action, "remove") == 0) {
-      handle_udev_remove(self, dev);
+      handle_evdev_syspath_remove(self, syspath);
     }
     udev_device_unref(dev);
   }
-  return G_SOURCE_CONTINUE;
+  return self->disposed ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
 }
 
 static void conttest_device_manager_init(ConttestDeviceManager *self) {
-  self->devices = g_ptr_array_new();
+  self->devices = g_ptr_array_new_with_free_func(g_object_unref);
+  self->cancellable = g_cancellable_new();
+  self->evdev_seq_by_syspath =
+      g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  self->ip_monitor = conttest_inputplumber_monitor_new();
+  g_signal_connect_object(self->ip_monitor, "changed",
+                          G_CALLBACK(on_inputplumber_changed), self, 0);
   self->udev = udev_new();
   if (self->udev) {
     self->udev_mon = udev_monitor_new_from_netlink(self->udev, "udev");
     if (self->udev_mon) {
       udev_monitor_filter_add_match_subsystem_devtype(self->udev_mon, "input",
                                                       NULL);
+      udev_monitor_filter_add_match_subsystem_devtype(self->udev_mon,
+                                                      "power_supply", NULL);
       udev_monitor_enable_receiving(self->udev_mon);
 
       int fd = udev_monitor_get_fd(self->udev_mon);
-      self->udev_channel = g_io_channel_unix_new(fd);
-      self->udev_watch_id =
-          g_io_add_watch(self->udev_channel, G_IO_IN, on_udev_event, self);
+      if (fd >= 0) {
+        self->udev_watch_id = g_unix_fd_add_full(
+            G_PRIORITY_DEFAULT, fd, G_IO_IN | G_IO_ERR | G_IO_HUP,
+            on_udev_event, manager_weak_ref_new(self), manager_weak_ref_free);
+      }
     } else {
       /* Netlink socket blocked (e.g. Flatpak sandbox). Evdev devices will
        * be discovered via re-scan when SDL fires hotplug events. */
       g_info("udev monitor unavailable — evdev hotplug via SDL re-scan");
     }
 
-    // Scan initial evdevs
-    struct udev_enumerate *enumerate = udev_enumerate_new(self->udev);
-    if (enumerate) {
-      udev_enumerate_add_match_subsystem(enumerate, "input");
-      udev_enumerate_scan_devices(enumerate);
-      struct udev_list_entry *devices, *dev_list_entry;
-      devices = udev_enumerate_get_list_entry(enumerate);
-      udev_list_entry_foreach(dev_list_entry, devices) {
-        const char *path = udev_list_entry_get_name(dev_list_entry);
-        struct udev_device *dev =
-            udev_device_new_from_syspath(self->udev, path);
-        if (dev) {
-          handle_udev_add(self, dev);
-          udev_device_unref(dev);
-        }
-      }
-      udev_enumerate_unref(enumerate);
-    }
+    /* Enumerate initial evdev devices asynchronously off the main thread. */
+    schedule_evdev_scan(self);
   }
 
-  self->sdl_timer_id = g_timeout_add(50, on_sdl_timer, self);
-  self->battery_poll_counter = 100; /* trigger immediate poll on first tick */
+  self->sdl_timer_id = g_timeout_add_full(
+      G_PRIORITY_DEFAULT, SDL_POLL_INTERVAL_MS, on_sdl_timer,
+      manager_weak_ref_new(self), manager_weak_ref_free);
+  self->battery_timer_id = g_timeout_add_seconds_full(
+      G_PRIORITY_DEFAULT, BATTERY_POLL_INTERVAL_SEC, on_battery_poll_timer,
+      manager_weak_ref_new(self), manager_weak_ref_free);
 
-  // Initial SDL scan
+  /* Initial SDL scan */
+  if (SDL_WasInit(SDL_INIT_GAMEPAD)) {
+    conttest_sdl_configure_events();
+  }
   int count = 0;
   SDL_JoystickID *gamepads = SDL_GetGamepads(&count);
   if (gamepads) {
@@ -880,17 +2516,32 @@ static void conttest_device_manager_init(ConttestDeviceManager *self) {
 
 static void conttest_device_manager_dispose(GObject *object) {
   ConttestDeviceManager *self = CONTTEST_DEVICE_MANAGER(object);
+  self->disposed = TRUE;
+
+  if (self->ip_monitor) {
+    g_signal_handlers_disconnect_by_data(self->ip_monitor, self);
+    g_object_run_dispose(G_OBJECT(self->ip_monitor));
+    g_clear_object(&self->ip_monitor);
+  }
+  if (self->cancellable) {
+    g_cancellable_cancel(self->cancellable);
+    g_clear_object(&self->cancellable);
+  }
+  if (self->sdl_sync_idle_id) {
+    g_source_remove(self->sdl_sync_idle_id);
+    self->sdl_sync_idle_id = 0;
+  }
   if (self->sdl_timer_id) {
     g_source_remove(self->sdl_timer_id);
     self->sdl_timer_id = 0;
   }
+  if (self->battery_timer_id) {
+    g_source_remove(self->battery_timer_id);
+    self->battery_timer_id = 0;
+  }
   if (self->udev_watch_id) {
     g_source_remove(self->udev_watch_id);
     self->udev_watch_id = 0;
-  }
-  if (self->udev_channel) {
-    g_io_channel_unref(self->udev_channel);
-    self->udev_channel = NULL;
   }
   if (self->udev_mon) {
     udev_monitor_unref(self->udev_mon);
@@ -900,13 +2551,8 @@ static void conttest_device_manager_dispose(GObject *object) {
     udev_unref(self->udev);
     self->udev = NULL;
   }
-  if (self->devices) {
-    for (guint i = 0; i < self->devices->len; i++) {
-      conttest_device_free(g_ptr_array_index(self->devices, i));
-    }
-    g_ptr_array_free(self->devices, TRUE);
-    self->devices = NULL;
-  }
+  g_clear_pointer(&self->evdev_seq_by_syspath, g_hash_table_unref);
+  g_clear_pointer(&self->devices, g_ptr_array_unref);
 
   G_OBJECT_CLASS(conttest_device_manager_parent_class)->dispose(object);
 }
@@ -918,13 +2564,13 @@ conttest_device_manager_class_init(ConttestDeviceManagerClass *klass) {
 
   signals[SIGNAL_DEVICE_ADDED] =
       g_signal_new("device-added", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
-                   0, NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_POINTER);
+                   0, NULL, NULL, NULL, G_TYPE_NONE, 1, CONTTEST_TYPE_DEVICE);
   signals[SIGNAL_DEVICE_REMOVED] = g_signal_new(
       "device-removed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL,
-      NULL, NULL, G_TYPE_NONE, 1, G_TYPE_POINTER);
+      NULL, NULL, G_TYPE_NONE, 1, CONTTEST_TYPE_DEVICE);
   signals[SIGNAL_DEVICE_UPDATED] = g_signal_new(
       "device-updated", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL,
-      NULL, NULL, G_TYPE_NONE, 1, G_TYPE_POINTER);
+      NULL, NULL, G_TYPE_NONE, 1, CONTTEST_TYPE_DEVICE);
 }
 
 ConttestDeviceManager *conttest_device_manager_new(void) {
@@ -934,13 +2580,21 @@ ConttestDeviceManager *conttest_device_manager_new(void) {
 void conttest_device_manager_foreach(ConttestDeviceManager *self,
                                      ConttestDeviceForeachFunc func,
                                      gpointer user_data) {
+  g_return_if_fail(CONTTEST_IS_DEVICE_MANAGER(self));
+  g_return_if_fail(func != NULL);
   if (!self->devices) return;
-  GPtrArray *snapshot = g_ptr_array_new();
+  g_autoptr(ConttestDeviceManager) self_guard = g_object_ref(self);
+  g_autoptr(GPtrArray) snapshot = g_ptr_array_new_with_free_func(g_object_unref);
   for (guint i = 0; i < self->devices->len; i++) {
-    g_ptr_array_add(snapshot, g_ptr_array_index(self->devices, i));
+    ConttestDevice *d = g_ptr_array_index(self->devices, i);
+    if (!d->hidden) {
+      g_ptr_array_add(snapshot, g_object_ref(d));
+    }
   }
   for (guint i = 0; i < snapshot->len; i++) {
-    func((ConttestDevice *)g_ptr_array_index(snapshot, i), user_data);
+    ConttestDevice *d = g_ptr_array_index(snapshot, i);
+    if (self->devices && !d->hidden && g_ptr_array_find(self->devices, d, NULL)) {
+      func(d, user_data);
+    }
   }
-  g_ptr_array_free(snapshot, TRUE);
 }

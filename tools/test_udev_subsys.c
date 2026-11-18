@@ -1,5 +1,5 @@
 /*
- * test_udev_subsys — walk the udev parent chain for input device nodes.
+ * test_udev_subsys: walk the udev parent chain for input device nodes.
  *
  * Useful for debugging hardware matching (USB vs Bluetooth detection).
  */

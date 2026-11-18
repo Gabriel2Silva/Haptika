@@ -1,116 +1,251 @@
+#define _POSIX_C_SOURCE 200809L
 #include "input_session.h"
 #include "input_viewer.h"
-#include <libevdev/libevdev.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <libevdev/libevdev.h>
+#include <math.h>
 #include <poll.h>
-#include <stdio.h>
+#include <unistd.h>
+
+/* Sub-pixel noise gate for 16-bit axes (~0.00049): lossless for 8-bit/10-bit
+ * pads and hats while suppressing +-1..8 LSB idle ADC jitter before waking GTK. */
+#define EVDEV_AXIS_NOISE_EPSILON (16.0f / 32768.0f)
+
+typedef struct {
+    double  scale;
+    double  offset;
+    float   min_clamp;
+    float   last_norm;
+    int32_t minimum;
+    int32_t maximum;
+    uint8_t valid;
+    uint8_t has_prev;
+} EvdevAbsAxisLut;
 
 typedef struct {
     struct libevdev *dev;
     int fd;
     ViewerSessionContext *ctx;
     gint *atomic_stop_flag;
+    EvdevAbsAxisLut abs_lut[ABS_CNT];
 } EvdevThreadData;
+
+static ConttestAbsAxisInfo read_abs_axis_info(struct libevdev *dev, unsigned int code) {
+    const struct input_absinfo *info = libevdev_has_event_code(dev, EV_ABS, code)
+        ? libevdev_get_abs_info(dev, code)
+        : NULL;
+    if (!info)
+        return (ConttestAbsAxisInfo){ .present = false };
+    return (ConttestAbsAxisInfo){
+        .present = true,
+        .minimum = info->minimum,
+        .maximum = info->maximum,
+        .value   = info->value,
+        .flat    = info->flat,
+        .fuzz    = info->fuzz,
+    };
+}
+
+static char *evdev_code_name(unsigned int type, unsigned int code, const char *prefix) {
+    const char *name = libevdev_event_code_get_name(type, code);
+    if (name)
+        return g_strdup(name);
+    return g_strdup_printf("%s_0x%x", prefix, code);
+}
+
+static void evdev_init_abs_lut(struct libevdev *dev,
+                               unsigned int code,
+                               gboolean is_trigger,
+                               EvdevAbsAxisLut *out) {
+    if (code >= ABS_CNT)
+        return;
+    const struct input_absinfo *info = libevdev_get_abs_info(dev, code);
+    if (!info)
+        return;
+
+    out->valid   = 1;
+    out->minimum = info->minimum;
+    out->maximum = info->maximum;
+
+    double range = (double)info->maximum - (double)info->minimum;
+    if (range <= 0.0) {
+        out->scale     = 0.0;
+        out->offset    = 0.0;
+        out->min_clamp = 0.0f;
+    } else if (is_trigger) {
+        out->scale     = 1.0 / range;
+        out->offset    = -(double)info->minimum / range;
+        out->min_clamp = 0.0f;
+    } else {
+        double half    = range * 0.5;
+        double center  = (double)info->minimum + half;
+        out->scale     = 1.0 / half;
+        out->offset    = -center / half;
+        out->min_clamp = -1.0f;
+    }
+}
+
+static gboolean evdev_push_event(EvdevAbsAxisLut abs_lut[ABS_CNT],
+                                 ViewerSessionContext *ctx,
+                                 unsigned int type,
+                                 unsigned int code,
+                                 int value,
+                                 gboolean force) {
+    if (type == EV_ABS) {
+        if (code >= ABS_CNT || !abs_lut[code].valid)
+            return FALSE;
+
+        EvdevAbsAxisLut *a = &abs_lut[code];
+        float norm;
+        if (a->maximum <= a->minimum) {
+            norm = 0.0f;
+        } else if (value <= a->minimum) {
+            norm = a->min_clamp;
+        } else if (value >= a->maximum) {
+            norm = 1.0f;
+        } else {
+            double d = (double)value * a->scale + a->offset;
+            norm = (float)CLAMP(d, (double)a->min_clamp, 1.0);
+        }
+
+        if (!force && a->has_prev) {
+            float prev = a->last_norm;
+            if (norm == prev)
+                return FALSE;
+            if (norm != 0.0f && fabsf(norm) < 1.0f &&
+                fabsf(norm - prev) <= EVDEV_AXIS_NOISE_EPSILON) {
+                return FALSE;
+            }
+        }
+        a->has_prev  = 1;
+        a->last_norm = norm;
+
+        ConttestInputEvent cev = {
+            .type       = INPUT_EVENT_AXIS,
+            .domain     = CONTTEST_ELEMENT_EVDEV_ABS,
+            .element_id = (int)code,
+            .axis_value = norm,
+        };
+        conttest_event_ring_push(&ctx->ring, &cev);
+        return TRUE;
+    }
+
+    if (type == EV_KEY) {
+        /* Ignore kernel key-repeat events (value == 2): button is already held. */
+        if (value == 2 || code > KEY_MAX)
+            return FALSE;
+        ConttestInputEvent cev = {
+            .type           = INPUT_EVENT_BUTTON,
+            .domain         = CONTTEST_ELEMENT_BUTTON,
+            .element_id     = (int)code,
+            .button_pressed = (unsigned int)(value != 0),
+        };
+        conttest_event_ring_push(&ctx->ring, &cev);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static gboolean evdev_push_snapshot(EvdevThreadData *data) {
+    gboolean pushed = FALSE;
+    for (unsigned int code = 0; code <= KEY_MAX; code++) {
+        if (!libevdev_has_event_code(data->dev, EV_KEY, code))
+            continue;
+        int val = libevdev_get_event_value(data->dev, EV_KEY, code);
+        if (evdev_push_event(data->abs_lut, data->ctx, EV_KEY, code, val, TRUE))
+            pushed = TRUE;
+    }
+    for (unsigned int code = 0; code <= ABS_MAX; code++) {
+        if (!libevdev_has_event_code(data->dev, EV_ABS, code))
+            continue;
+        int val = libevdev_get_event_value(data->dev, EV_ABS, code);
+        if (evdev_push_event(data->abs_lut, data->ctx, EV_ABS, code, val, TRUE))
+            pushed = TRUE;
+    }
+    return pushed;
+}
 
 static gpointer evdev_polling_thread(gpointer user_data) {
     EvdevThreadData *data = (EvdevThreadData *)user_data;
     struct pollfd pfd = { .fd = data->fd, .events = POLLIN };
 
     while (!g_atomic_int_get(data->atomic_stop_flag)) {
-        int ret = poll(&pfd, 1, 50); // poll with timeout to check stop flag
+        gboolean pushed = FALSE;
+
+        /* The drain asks for a resync after dropping events; republish the
+         * current hardware state so a lost release cannot leave an indicator
+         * stuck. The 50 ms poll timeout bounds the delay without extra wakeups. */
+        if (atomic_exchange_explicit(&data->ctx->ring.resync, false,
+                                     memory_order_relaxed)) {
+            if (evdev_push_snapshot(data))
+                pushed = TRUE;
+        }
+
+        int ret = poll(&pfd, 1, 50);
         if (ret < 0) {
+            if (errno == EINTR) {
+                if (pushed)
+                    conttest_event_ring_notify(data->ctx, conttest_input_viewer_drain_ring);
+                continue;
+            }
             break;
-        } else if (ret == 0) {
-            continue; // timeout
         }
 
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            break;
-        }
+        if (ret > 0) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+                break;
 
-        /* Collect all evdev events from this poll() cycle into a single batch,
-         * then post one g_idle_add_full(G_PRIORITY_DEFAULT) for the whole batch
-         * instead of one per event. Using DEFAULT priority matches the SDL3
-         * backend's responsiveness. */
-        ConttestInputEventBatch *batch = NULL;
-        struct input_event ev;
+            struct input_event ev;
+            int rc;
 
-        while (libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
-            ConttestInputEvent cev = { 0 };
-            cev.ctx = data->ctx;
-            gboolean valid = FALSE;
-
-            if (ev.type == EV_KEY) {
-                cev.type           = INPUT_EVENT_BUTTON;
-                cev.element_id     = ev.code;
-                cev.button_pressed = ev.value != 0;
-                valid = TRUE;
-            } else if (ev.type == EV_ABS) {
-                const struct input_absinfo *info = libevdev_get_abs_info(data->dev, ev.code);
-                if (info) {
-                    double norm = 0.0;
-                    double range = info->maximum - info->minimum;
-                    if (range != 0) {
-                        if (ev.code == ABS_Z || ev.code == ABS_RZ || ev.code == ABS_GAS || ev.code == ABS_BRAKE) {
-                            // Trigger (0 to max)
-                            norm = (double)(ev.value - info->minimum) / range;
-                        } else {
-                            // Axis (-1 to 1)
-                            double center = info->minimum + range / 2.0;
-                            norm = (ev.value - center) / (range / 2.0);
-                        }
+            do {
+                rc = libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+                    /* Drain kernel SYN_DROPPED sync stream before resuming normal reads. */
+                    while ((rc = libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_SYNC, &ev)) ==
+                           LIBEVDEV_READ_STATUS_SYNC) {
+                        if (evdev_push_event(data->abs_lut, data->ctx,
+                                             ev.type, ev.code, ev.value, FALSE))
+                            pushed = TRUE;
                     }
-                    cev.type       = INPUT_EVENT_AXIS;
-                    cev.element_id = ELEMENT_NS_EVDEV_ABS_BASE + ev.code;
-                    cev.axis_value = norm;
-                    valid = TRUE;
+                    if (rc == -EAGAIN)
+                        rc = LIBEVDEV_READ_STATUS_SUCCESS;
+                } else if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+                    if (evdev_push_event(data->abs_lut, data->ctx,
+                                         ev.type, ev.code, ev.value, FALSE))
+                        pushed = TRUE;
                 }
-            }
-
-            if (valid) {
-                if (!batch) {
-                    batch         = g_new0(ConttestInputEventBatch, 1);
-                    batch->ctx    = data->ctx;
-                    batch->events = g_array_new(FALSE, FALSE, sizeof(ConttestInputEvent));
-                }
-                g_array_append_val(batch->events, cev);
-            }
+            } while (rc == LIBEVDEV_READ_STATUS_SUCCESS &&
+                     !g_atomic_int_get(data->atomic_stop_flag));
         }
 
-        if (batch) {
-            g_atomic_int_inc(&data->ctx->ref_count);
-            g_idle_add_full(G_PRIORITY_DEFAULT, conttest_input_viewer_handle_event_batch, batch, NULL);
-        }
+        if (pushed)
+            conttest_event_ring_notify(data->ctx, conttest_input_viewer_drain_ring);
     }
 
-    if (g_atomic_int_dec_and_test(&data->ctx->ref_count)) {
-        g_free(data->ctx);
-    }
+    viewer_session_context_unref(data->ctx);
     return NULL;
 }
 
 static void free_evdev_session(ConttestInputSession *session) {
     EvdevThreadData *data = (EvdevThreadData *)session->impl_data;
-    if (data->dev) {
+    if (data->dev)
         libevdev_free(data->dev);
-    }
-    if (data->fd >= 0) {
+    if (data->fd >= 0)
         close(data->fd);
-    }
     g_free(data);
 }
 
-ConttestInputSession *conttest_input_session_evdev_start(const char *syspath, ViewerSessionContext *ctx) {
-    char devnode[256];
-    // Convert syspath to devnode, e.g. /sys/class/input/event0 to /dev/input/event0
-    char *basename = g_path_get_basename(syspath);
-    snprintf(devnode, sizeof(devnode), "/dev/input/%s", basename);
-    g_free(basename);
+ConttestInputSession *conttest_input_session_evdev_start(const char *devnode,
+                                                         ViewerSessionContext *ctx) {
+    if (!devnode || !ctx)
+        return NULL;
 
-    int fd = open(devnode, O_RDONLY | O_NONBLOCK);
-    if (fd < 0) return NULL;
+    int fd = open(devnode, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return NULL;
 
     struct libevdev *dev = NULL;
     if (libevdev_new_from_fd(fd, &dev) < 0) {
@@ -128,45 +263,81 @@ ConttestInputSession *conttest_input_session_evdev_start(const char *syspath, Vi
     data->atomic_stop_flag = &session->atomic_stop_flag;
     session->impl_data     = data;
 
-    // Detect capabilities
-    ConttestInputElementDef *defs = g_new0(ConttestInputElementDef, KEY_MAX + ABS_MAX + 2);
-    int num = 0;
+    gboolean z_rz_right_stick = FALSE;
+    gboolean rx_ry_triggers = FALSE;
+    conttest_evdev_classify_axes(read_abs_axis_info(dev, ABS_Z),
+                                 read_abs_axis_info(dev, ABS_RZ),
+                                 read_abs_axis_info(dev, ABS_RX),
+                                 read_abs_axis_info(dev, ABS_RY),
+                                 &z_rz_right_stick, &rx_ry_triggers);
 
-    for (int i = 0; i <= KEY_MAX; i++) {
-        if (libevdev_has_event_code(dev, EV_KEY, i)) {
-            defs[num].element_id = i;
-            defs[num].name = g_strdup(libevdev_event_code_get_name(EV_KEY, i));
-            num++;
-        }
+    int max_defs = 0;
+    for (unsigned int code = 0; code <= KEY_MAX; code++) {
+        if (libevdev_has_event_code(dev, EV_KEY, code))
+            max_defs++;
+    }
+    for (unsigned int code = 0; code <= ABS_MAX; code++) {
+        if (libevdev_has_event_code(dev, EV_ABS, code))
+            max_defs++;
     }
 
-    for (int i = 0; i <= ABS_MAX; i++) {
-        if (libevdev_has_event_code(dev, EV_ABS, i)) {
-            defs[num].element_id = ELEMENT_NS_EVDEV_ABS_BASE + i;
-            // Provide sensible defaults for standard sticks
-            if (i == ABS_X || i == ABS_RX) defs[num].is_stick_x = TRUE;
-            if (i == ABS_Y || i == ABS_RY) defs[num].is_stick_y = TRUE;
-            if (i == ABS_X || i == ABS_Y)  defs[num].stick_id   = 0;
-            if (i == ABS_RX || i == ABS_RY) defs[num].stick_id  = 1;
+    ConttestInputElementDef *defs = max_defs > 0
+        ? g_new0(ConttestInputElementDef, (gsize)max_defs)
+        : NULL;
+    int num = 0;
 
-            /* HAT axes: treat each hat as a stick pair so the D-pad renders
-             * on the analog stick widget. ABS_HAT0=2, ABS_HAT1=3, etc. */
-            if (i >= ABS_HAT0X && i <= ABS_HAT3Y) {
-                int hat_index = (i - ABS_HAT0X) / 2;
-                int is_x      = (i - ABS_HAT0X) % 2 == 0;
-                defs[num].stick_id   = 2 + hat_index; /* hats start at stick slot 2 */
-                defs[num].is_stick_x = is_x;
-                defs[num].is_stick_y = !is_x;
-            }
+    for (unsigned int code = 0; code <= KEY_MAX; code++) {
+        if (!libevdev_has_event_code(dev, EV_KEY, code))
+            continue;
+        defs[num].domain = CONTTEST_ELEMENT_BUTTON;
+        defs[num].element_id = (int)code;
+        defs[num].name = evdev_code_name(EV_KEY, code, "BTN");
+        num++;
+    }
 
-            if (i == ABS_Z || i == ABS_RZ || i == ABS_GAS || i == ABS_BRAKE) {
-                defs[num].is_trigger = TRUE;
-            }
+    for (unsigned int code = 0; code <= ABS_MAX; code++) {
+        if (!libevdev_has_event_code(dev, EV_ABS, code))
+            continue;
 
-            defs[num].is_axis = TRUE;
-            defs[num].name    = g_strdup(libevdev_event_code_get_name(EV_ABS, i));
-            num++;
+        defs[num].domain     = CONTTEST_ELEMENT_EVDEV_ABS;
+        defs[num].element_id = (int)code;
+        defs[num].is_axis    = TRUE;
+        defs[num].name       = evdev_code_name(EV_ABS, code, "ABS");
+
+        gboolean is_trig = (code == ABS_GAS || code == ABS_BRAKE);
+        if (code == ABS_X || code == ABS_Y) {
+            defs[num].is_stick_x = (code == ABS_X);
+            defs[num].is_stick_y = (code == ABS_Y);
+            defs[num].stick_id = 0;
+        } else if (z_rz_right_stick && (code == ABS_Z || code == ABS_RZ)) {
+            defs[num].is_stick_x = (code == ABS_Z);
+            defs[num].is_stick_y = (code == ABS_RZ);
+            defs[num].stick_id = 1;
+        } else if (!rx_ry_triggers && (code == ABS_RX || code == ABS_RY)) {
+            defs[num].is_stick_x = (code == ABS_RX);
+            defs[num].is_stick_y = (code == ABS_RY);
+            defs[num].stick_id = 1;
+        } else if (code == ABS_Z || code == ABS_RZ ||
+                   (rx_ry_triggers && (code == ABS_RX || code == ABS_RY))) {
+            is_trig = TRUE;
         }
+
+        /* Map hat pairs into analog stick widgets after Left/Right sticks. */
+        if (code >= ABS_HAT0X && code <= ABS_HAT3Y) {
+            unsigned int offset = code - ABS_HAT0X;
+            defs[num].stick_id   = 2 + (int)(offset / 2u);
+            defs[num].is_stick_x = (offset % 2u) == 0;
+            defs[num].is_stick_y = (offset % 2u) != 0;
+        }
+
+        if (is_trig) {
+            defs[num].is_trigger = TRUE;
+        } else if (!defs[num].is_stick_x && !defs[num].is_stick_y) {
+            /* Generic non-stick, non-trigger axes are normalized to [-1, 1]. */
+            defs[num].is_bipolar = TRUE;
+        }
+        evdev_init_abs_lut(dev, code, is_trig, &data->abs_lut[code]);
+        num++;
     }
 
     ConttestInputLayout *layout = g_new0(ConttestInputLayout, 1);
@@ -174,10 +345,14 @@ ConttestInputSession *conttest_input_session_evdev_start(const char *syspath, Vi
     layout->num_elements = num;
     layout->ctx          = ctx;
 
-    g_atomic_int_inc(&ctx->ref_count);
+    viewer_session_context_ref(ctx);
     g_main_context_invoke(NULL, conttest_input_viewer_handle_layout, layout);
 
-    g_atomic_int_inc(&ctx->ref_count);
+    /* Seed the ring with current EV_KEY / EV_ABS hardware state before polling begins. */
+    if (evdev_push_snapshot(data))
+        conttest_event_ring_notify(ctx, conttest_input_viewer_drain_ring);
+
+    viewer_session_context_ref(ctx);
     session->thread = g_thread_new("evdev_poll", evdev_polling_thread, data);
 
     return session;

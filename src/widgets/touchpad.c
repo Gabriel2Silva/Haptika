@@ -1,134 +1,219 @@
 #include "touchpad.h"
-#include <pango/pangocairo.h>
+#include "drawing_utils.h"
+#include <glib/gi18n.h>
 #include <math.h>
 
-/* DS4 touchpad aspect ratio: 1920 x 943 ≈ 2.035 : 1 */
-#define TOUCHPAD_ASPECT (1920.0 / 943.0)
+/* DS4/DualSense touchpad aspect ratio: 1920 x 943 ~ 2.035 : 1 */
+#define TOUCHPAD_MIN_WIDTH  200
+#define TOUCHPAD_MIN_HEIGHT  98
+#define TOUCHPAD_NAT_WIDTH  200
+#define TOUCHPAD_NAT_HEIGHT  98
+
+typedef struct {
+    gboolean active;
+    float    x;
+    float    y;
+} TouchpadFingerState;
 
 struct _ConttestTouchpad {
-    GtkWidget parent_instance;
-    GtkWidget *drawing_area;
-    gboolean   finger_active;
-    float      finger_x; /* normalized 0–1 */
-    float      finger_y; /* normalized 0–1 */
-    PangoLayout *layout;
+    GtkWidget           parent_instance;
+    GtkWidget          *label;
+    GskPath            *plate_path;
+    GskStroke          *plate_stroke;
+    int                 cached_canvas_w;
+    int                 cached_canvas_h;
+    int                 canvas_w;
+    int                 canvas_h;
+    TouchpadFingerState fingers[CONTTEST_TOUCHPAD_MAX_FINGERS];
 };
 
 G_DEFINE_TYPE(ConttestTouchpad, conttest_touchpad, GTK_TYPE_WIDGET)
 
-static void draw_touchpad(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
-    ConttestTouchpad *self = CONTTEST_TOUCHPAD(user_data);
-    (void)area;
-
-    const double pad   = 2.0;
-    const double r     = 8.0; /* corner radius */
-    const double x0    = pad, y0 = pad;
-    const double w     = width  - pad * 2;
-    const double h     = height - pad * 2;
-
-    /* Rounded rectangle */
-    cairo_new_sub_path(cr);
-    cairo_arc(cr, x0 + w - r, y0 + r,     r, -G_PI_2, 0);
-    cairo_arc(cr, x0 + w - r, y0 + h - r, r,  0,      G_PI_2);
-    cairo_arc(cr, x0 + r,     y0 + h - r, r,  G_PI_2, G_PI);
-    cairo_arc(cr, x0 + r,     y0 + r,     r,  G_PI,   3 * G_PI_2);
-    cairo_close_path(cr);
-
-    cairo_set_source_rgba(cr, 0.5, 0.5, 0.5, 0.15);
-    cairo_fill_preserve(cr);
-    cairo_set_source_rgba(cr, 0.5, 0.5, 0.5, 0.4);
-    cairo_set_line_width(cr, 1.5);
-    cairo_stroke(cr);
-
-    /* Finger dot */
-    if (self->finger_active) {
-        const double dot_r = MIN(w, h) * 0.12;
-        double cx = x0 + dot_r + self->finger_x * (w - dot_r * 2);
-        double cy = y0 + dot_r + self->finger_y * (h - dot_r * 2);
-
-        cairo_set_source_rgba(cr, 0.13, 0.59, 0.95, 0.75);
-        cairo_arc(cr, cx, cy, dot_r, 0, 2 * G_PI);
-        cairo_fill(cr);
-
-        cairo_set_source_rgba(cr, 0.2, 0.75, 1.0, 0.9);
-        cairo_set_line_width(cr, 1.5);
-        cairo_arc(cr, cx, cy, dot_r, 0, 2 * G_PI);
-        cairo_stroke(cr);
-    }
-
-    /* Label */
-    if (self->layout) {
-        pango_cairo_update_layout(cr, self->layout);
-        int text_width;
-        pango_layout_get_pixel_size(self->layout, &text_width, NULL);
-
-        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.5);
-        cairo_move_to(cr, x0 + (w - text_width) / 2.0, y0 + h + 4.0);
-        pango_cairo_show_layout(cr, self->layout);
-    }
-}
-
 static void conttest_touchpad_dispose(GObject *object) {
     ConttestTouchpad *self = CONTTEST_TOUCHPAD(object);
-    if (self->drawing_area) {
-        gtk_widget_unparent(self->drawing_area);
-        self->drawing_area = NULL;
-    }
-    g_clear_object(&self->layout);
+    g_clear_pointer(&self->plate_path, gsk_path_unref);
+    g_clear_pointer(&self->plate_stroke, gsk_stroke_free);
+    g_clear_pointer(&self->label, gtk_widget_unparent);
     G_OBJECT_CLASS(conttest_touchpad_parent_class)->dispose(object);
 }
 
-static void conttest_touchpad_measure(GtkWidget *widget, GtkOrientation orientation,
-                                      int for_size, int *minimum, int *natural,
-                                      int *minimum_baseline, int *natural_baseline) {
-    (void)widget; (void)minimum_baseline; (void)natural_baseline;
-    if (orientation == GTK_ORIENTATION_HORIZONTAL) {
-        int base = (for_size > 0) ? (int)(for_size * TOUCHPAD_ASPECT) : 200;
-        *minimum = *natural = base;
-    } else {
-        int base = (for_size > 0) ? (int)(for_size / TOUCHPAD_ASPECT) : 98;
-        *minimum = *natural = base;
-    }
+static void conttest_touchpad_measure(GtkWidget *widget,
+                                      GtkOrientation orientation,
+                                      int for_size,
+                                      int *minimum,
+                                      int *natural,
+                                      int *minimum_baseline,
+                                      int *natural_baseline) {
+    ConttestTouchpad *self = CONTTEST_TOUCHPAD(widget);
+    conttest_captioned_widget_measure(self->label, orientation, for_size,
+                                      TOUCHPAD_MIN_WIDTH, TOUCHPAD_MIN_HEIGHT,
+                                      TOUCHPAD_NAT_WIDTH, TOUCHPAD_NAT_HEIGHT,
+                                      minimum, natural,
+                                      minimum_baseline, natural_baseline);
 }
 
-static void conttest_touchpad_size_allocate(GtkWidget *widget, int width, int height, int baseline) {
+static void conttest_touchpad_size_allocate(GtkWidget *widget,
+                                            int width,
+                                            int height,
+                                            int baseline) {
+    (void)baseline;
     ConttestTouchpad *self = CONTTEST_TOUCHPAD(widget);
-    gtk_widget_size_allocate(self->drawing_area,
-                             &(GtkAllocation){0, 0, width, height}, baseline);
+    conttest_captioned_widget_allocate(self->label, width, height,
+                                       &self->canvas_w, &self->canvas_h);
+}
+
+static void conttest_touchpad_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
+    ConttestTouchpad *self = CONTTEST_TOUCHPAD(widget);
+
+    const float pad = 2.0f;
+    const float r = 8.0f;
+    float max_w = MIN((float)self->canvas_w, (float)TOUCHPAD_NAT_WIDTH) - pad * 2.0f;
+    float max_h = (float)self->canvas_h - pad * 2.0f;
+    float plate_w = max_w;
+    float plate_h = MIN(max_h, plate_w * ((float)TOUCHPAD_NAT_HEIGHT / (float)TOUCHPAD_NAT_WIDTH));
+    float x0 = ((float)self->canvas_w - plate_w) * 0.5f;
+    float y0 = pad + (max_h - plate_h) * 0.5f;
+
+    if (plate_w > r * 2.0f && plate_h > r * 2.0f) {
+        GdkRGBA fg;
+        gtk_widget_get_color(widget, &fg);
+
+        GdkRGBA accent;
+        conttest_widget_get_accent_color(&accent);
+        gboolean hc = conttest_widget_get_high_contrast();
+
+        if (!self->plate_stroke)
+            self->plate_stroke = gsk_stroke_new(1.5f);
+
+        if (!self->plate_path ||
+            self->cached_canvas_w != self->canvas_w ||
+            self->cached_canvas_h != self->canvas_h) {
+            g_clear_pointer(&self->plate_path, gsk_path_unref);
+            GskRoundedRect rr;
+            gsk_rounded_rect_init_from_rect(&rr,
+                                            &GRAPHENE_RECT_INIT(x0, y0, plate_w, plate_h),
+                                            r);
+            GskPathBuilder *plate_builder = gsk_path_builder_new();
+            gsk_path_builder_add_rounded_rect(plate_builder, &rr);
+            self->plate_path = gsk_path_builder_free_to_path(plate_builder);
+            self->cached_canvas_w = self->canvas_w;
+            self->cached_canvas_h = self->canvas_h;
+        }
+
+        GdkRGBA fill_col = fg;
+        fill_col.alpha *= hc ? 0.16f : 0.10f;
+        gtk_snapshot_append_fill(snapshot, self->plate_path, GSK_FILL_RULE_WINDING, &fill_col);
+
+        GdkRGBA stroke_col = fg;
+        stroke_col.alpha *= hc ? 0.60f : 0.35f;
+        gtk_snapshot_append_stroke(snapshot, self->plate_path, self->plate_stroke, &stroke_col);
+
+        /* Active touch contacts (multi-finger): GPU rounded-rect clips & borders */
+        float dot_r = MIN(plate_w, plate_h) * 0.12f;
+        for (guint i = 0; i < CONTTEST_TOUCHPAD_MAX_FINGERS; i++) {
+            const TouchpadFingerState *finger = &self->fingers[i];
+            if (!finger->active)
+                continue;
+
+            float cx = x0 + dot_r + finger->x * (plate_w - dot_r * 2.0f);
+            float cy = y0 + dot_r + finger->y * (plate_h - dot_r * 2.0f);
+
+            GskRoundedRect dot_rr;
+            gsk_rounded_rect_init_from_rect(
+                &dot_rr,
+                &GRAPHENE_RECT_INIT(cx - dot_r, cy - dot_r,
+                                    dot_r * 2.0f, dot_r * 2.0f),
+                dot_r);
+
+            GdkRGBA dot_col = accent;
+            dot_col.alpha *= (i == 0) ? 0.85f : 0.65f;
+            gtk_snapshot_push_rounded_clip(snapshot, &dot_rr);
+            gtk_snapshot_append_color(snapshot, &dot_col, &dot_rr.bounds);
+            gtk_snapshot_pop(snapshot);
+
+            float sw = (i == 0) ? 1.5f : 2.0f;
+            float ring_outer_r = dot_r + sw * 0.5f;
+            GskRoundedRect ring_rr;
+            gsk_rounded_rect_init_from_rect(
+                &ring_rr,
+                &GRAPHENE_RECT_INIT(cx - ring_outer_r, cy - ring_outer_r,
+                                    ring_outer_r * 2.0f, ring_outer_r * 2.0f),
+                ring_outer_r);
+            GdkRGBA ring_col = (i == 0) ? fg : accent;
+            ring_col.alpha *= (i == 0) ? (hc ? 0.85f : 0.28f) : 0.95f;
+            const float ring_widths[4] = { sw, sw, sw, sw };
+            const GdkRGBA ring_colors[4] = { ring_col, ring_col, ring_col, ring_col };
+            gtk_snapshot_append_border(snapshot, &ring_rr, ring_widths, ring_colors);
+
+            if (i > 0) {
+                /* Secondary contacts get an outer concentric halo for quick disambiguation */
+                float halo_outer_r = dot_r + 3.5f;
+                GskRoundedRect halo_rr;
+                gsk_rounded_rect_init_from_rect(
+                    &halo_rr,
+                    &GRAPHENE_RECT_INIT(cx - halo_outer_r, cy - halo_outer_r,
+                                        halo_outer_r * 2.0f, halo_outer_r * 2.0f),
+                    halo_outer_r);
+                GdkRGBA halo_col = accent;
+                halo_col.alpha *= 0.45f;
+                const float halo_widths[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+                const GdkRGBA halo_colors[4] = { halo_col, halo_col, halo_col, halo_col };
+                gtk_snapshot_append_border(snapshot, &halo_rr, halo_widths, halo_colors);
+            }
+        }
+    }
+
+    if (self->label && gtk_widget_get_visible(self->label))
+        gtk_widget_snapshot_child(widget, self->label, snapshot);
 }
 
 static void conttest_touchpad_init(ConttestTouchpad *self) {
-    self->drawing_area = gtk_drawing_area_new();
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(self->drawing_area), draw_touchpad, self, NULL);
-    gtk_widget_set_parent(self->drawing_area, GTK_WIDGET(self));
-
-    self->layout = gtk_widget_create_pango_layout(GTK_WIDGET(self), "Touchpad");
-    PangoFontDescription *desc = pango_font_description_from_string("Sans 10");
-    pango_layout_set_font_description(self->layout, desc);
-    pango_font_description_free(desc);
+    self->label = conttest_captioned_widget_create_label(GTK_WIDGET(self), _("Touchpad"));
+    conttest_widget_connect_style_redraw(GTK_WIDGET(self));
 }
 
 static void conttest_touchpad_class_init(ConttestTouchpadClass *klass) {
     GObjectClass *oclass = G_OBJECT_CLASS(klass);
     GtkWidgetClass *wclass = GTK_WIDGET_CLASS(klass);
-    oclass->dispose        = conttest_touchpad_dispose;
-    wclass->measure        = conttest_touchpad_measure;
-    wclass->size_allocate  = conttest_touchpad_size_allocate;
+
+    oclass->dispose = conttest_touchpad_dispose;
+    wclass->measure = conttest_touchpad_measure;
+    wclass->size_allocate = conttest_touchpad_size_allocate;
+    wclass->snapshot = conttest_touchpad_snapshot;
 
     gtk_widget_class_set_accessible_role(wclass, GTK_ACCESSIBLE_ROLE_IMG);
 }
 
 GtkWidget *conttest_touchpad_new(void) {
-    GtkWidget *w = GTK_WIDGET(g_object_new(CONTTEST_TYPE_TOUCHPAD, NULL));
-    gtk_accessible_update_property(GTK_ACCESSIBLE(w),
-        GTK_ACCESSIBLE_PROPERTY_LABEL, "Touchpad",
-        -1);
-    return w;
+    return GTK_WIDGET(g_object_new(CONTTEST_TYPE_TOUCHPAD, NULL));
 }
 
 void conttest_touchpad_set_finger(ConttestTouchpad *self, gboolean active, float x, float y) {
-    self->finger_active = active;
-    self->finger_x = x;
-    self->finger_y = y;
-    gtk_widget_queue_draw(self->drawing_area);
+    conttest_touchpad_set_finger_indexed(self, 0, active, x, y);
+}
+
+void conttest_touchpad_set_finger_indexed(ConttestTouchpad *self,
+                                          guint finger_idx,
+                                          gboolean active,
+                                          float x,
+                                          float y) {
+    g_return_if_fail(CONTTEST_IS_TOUCHPAD(self));
+    g_return_if_fail(finger_idx < CONTTEST_TOUCHPAD_MAX_FINGERS);
+
+    TouchpadFingerState *slot = &self->fingers[finger_idx];
+    float fx = !isfinite(x) ? 0.5f : CLAMP(x, 0.0f, 1.0f);
+    float fy = !isfinite(y) ? 0.5f : CLAMP(y, 0.0f, 1.0f);
+
+    if (!active && !slot->active)
+        return;
+    if (active && slot->active &&
+        fabsf(fx - slot->x) < 0.001f &&
+        fabsf(fy - slot->y) < 0.001f) {
+        return;
+    }
+
+    slot->active = active;
+    slot->x = fx;
+    slot->y = fy;
+    gtk_widget_queue_draw(GTK_WIDGET(self));
 }

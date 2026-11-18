@@ -302,16 +302,55 @@ static void device_set_name(ConttestDevice *d, const char *name) {
   }
 }
 
+static gboolean device_sdl_attachment_is_live(const ConttestDevice *d) {
+  /* SDL keeps an opened gamepad alive after removal and may still report it
+   * as connected. Releasing the handle late lets SDL enumerate the replayed
+   * hardware through the generic joystick driver, which drops touchpad and
+   * battery support; treat a missing cached udev node as a dead attachment. */
+  if (!d->has_sdl || !d->sdl_gamepad || !SDL_GamepadConnected(d->sdl_gamepad))
+    return FALSE;
+  if (d->sdl_meta.own_syspath && access(d->sdl_meta.own_syspath, F_OK) != 0)
+    return FALSE;
+  return TRUE;
+}
+
+/* A live attachment is still replaceable when the incoming instance was probed
+ * from the same udev node: one node cannot back two gamepads, so a new instance
+ * ID for it is a re-enumeration of the previous attachment. */
+static gboolean device_sdl_attachment_is_replaceable(
+    const ConttestDevice *d, const char *incoming_sdl_syspath) {
+  if (!d->has_sdl)
+    return TRUE;
+  if (!device_sdl_attachment_is_live(d))
+    return TRUE;
+  return incoming_sdl_syspath && d->sdl_meta.own_syspath &&
+         g_strcmp0(d->sdl_meta.own_syspath, incoming_sdl_syspath) == 0;
+}
+
 static void device_attach_sdl(ConttestDevice *d, SDL_JoystickID id,
                               const char *sdl_path) {
+  gboolean rebind = d->has_sdl && d->sdl_id != id;
+
   d->has_sdl = TRUE;
-  d->sdl_id = id;
-  if (g_strcmp0(d->sdl_path, sdl_path) != 0) {
+  /* Instance IDs are not stable across re-enumeration, and the cached path
+   * metadata belongs to the previous ID. Invalidate it before rebinding. */
+  if (rebind || g_strcmp0(d->sdl_path, sdl_path) != 0) {
     g_free(d->sdl_path);
     d->sdl_path = g_strdup(sdl_path);
     udev_attach_meta_clear(&d->sdl_meta);
     d->sdl_udev_seq++;
   }
+  if (rebind) {
+    if (d->sdl_gamepad) {
+      SDL_CloseGamepad(d->sdl_gamepad);
+      d->sdl_gamepad = NULL;
+    }
+    d->battery_state = SDL_POWERSTATE_UNKNOWN;
+    d->battery_percent = -1;
+    g_debug("Rebinding \"%s\" from SDL instance %u to %u", d->name,
+            (unsigned)d->sdl_id, (unsigned)id);
+  }
+  d->sdl_id = id;
   /* Keep a handle open so battery polling has warm driver data. */
   if (!d->sdl_gamepad) {
     d->sdl_gamepad = SDL_OpenGamepad(id);
@@ -319,6 +358,9 @@ static void device_attach_sdl(ConttestDevice *d, SDL_JoystickID id,
 }
 
 static void device_detach_sdl(ConttestDevice *d) {
+  if (d->has_sdl)
+    g_debug("Detaching \"%s\" from SDL instance %u", d->name,
+            (unsigned)d->sdl_id);
   d->has_sdl = FALSE;
   d->sdl_id = 0;
   g_free(d->sdl_path);
@@ -557,28 +599,48 @@ static ConttestDevice *find_device_by_hardware_for_sdl(
     const char *sdl_serial,
     SDL_JoystickConnectionState sdl_conn) {
   /* Fast path in memory: a /dev/input/event* devnode maps 1:1 to a tracked
-   * evdev device. */
+   * evdev device. A stale SDL attachment on the candidate is replaceable:
+   * re-enumeration can hand the same hardware a new instance ID. */
   if (sdl_path && *sdl_path) {
     for (guint i = 0; i < self->devices->len; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
-      if (d->has_evdev && !d->has_sdl && d->evdev_devnode &&
-          g_strcmp0(d->evdev_devnode, sdl_path) == 0) {
+      if (d->has_evdev &&
+          device_sdl_attachment_is_replaceable(d, sdl_own_syspath) &&
+          d->evdev_devnode && g_strcmp0(d->evdev_devnode, sdl_path) == 0) {
         return d;
       }
     }
   }
 
-  /* Topological match in memory via cached udev hardware ancestor keys. */
+  /* Topological match in memory via cached udev hardware ancestor keys.
+   * Only a unique candidate may be merged: keys shared by several pads (USB
+   * receivers, multi-port adapters) must not be resolved by array order, and
+   * the serial/connection data has to agree where both sides provide it. */
   if (sdl_own_syspath || sdl_hw_keys) {
-    for (guint i = 0; i < self->devices->len; i++) {
+    guint count = self->devices->len;
+    g_autofree gboolean *matches = g_new0(gboolean, count);
+    g_autofree gboolean *live = g_new0(gboolean, count);
+    for (guint i = 0; i < count; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
-      if (d->has_evdev && !d->has_sdl &&
-          conttest_hw_keys_match(sdl_own_syspath, sdl_hw_keys,
+      if (!d->has_evdev ||
+          !device_sdl_attachment_is_replaceable(d, sdl_own_syspath))
+        continue;
+      if (conttest_classify_candidate_pair(
+              sdl_serial, sdl_conn, d->evdev_meta.serial,
+              d->evdev_meta.udev_conn) == CONTTEST_MATCH_REJECT)
+        continue;
+      if (conttest_hw_keys_match(sdl_own_syspath, sdl_hw_keys,
                                  d->evdev_meta.own_syspath,
                                  (const char *const *)d->evdev_meta.hw_keys)) {
-        return d;
+        matches[i] = TRUE;
+        live[i] = d->evdev_devnode && access(d->evdev_devnode, F_OK) == 0;
       }
     }
+    int idx = conttest_select_unique_candidate(matches, live, count);
+    if (idx >= 0)
+      return g_ptr_array_index(self->devices, (guint)idx);
+    /* Ambiguous or no key match: the serial/VID/PID pass below can still
+     * identify the peripheral unambiguously. */
   }
 
   /* Second pass: VID/PID fallback for SDL devices without a /dev/ devnode
@@ -594,7 +656,9 @@ static ConttestDevice *find_device_by_hardware_for_sdl(
 
     for (guint i = 0; i < self->devices->len; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
-      if (d->has_evdev && !d->has_sdl && !d->evdev_meta.is_virtual &&
+      if (d->has_evdev &&
+          device_sdl_attachment_is_replaceable(d, sdl_own_syspath) &&
+          !d->evdev_meta.is_virtual &&
           d->virtual_kind == CONTTEST_VIRTUAL_NONE &&
           d->vendor_id == sdl_vid && d->product_id == sdl_pid) {
         ConttestCandidateMatch score = conttest_classify_candidate_pair(
@@ -642,17 +706,32 @@ static ConttestDevice *find_device_by_hardware_for_evdev(
     }
   }
 
-  /* First pass: topological match in memory via cached udev ancestor keys. */
+  /* First pass: topological match in memory via cached udev ancestor keys.
+   * Only a unique candidate may be merged; several split SDL entries can
+   * share keys during a reconnect, and receivers expose one shared node for
+   * multiple pads. The live attachment disambiguates a stale leftover. */
   if (evdev_own_syspath || evdev_hw_keys) {
-    for (guint i = 0; i < self->devices->len; i++) {
+    guint count = self->devices->len;
+    g_autofree gboolean *matches = g_new0(gboolean, count);
+    g_autofree gboolean *live = g_new0(gboolean, count);
+    for (guint i = 0; i < count; i++) {
       ConttestDevice *d = g_ptr_array_index(self->devices, i);
-      if (d->has_sdl && !d->has_evdev &&
-          conttest_hw_keys_match(d->sdl_meta.own_syspath,
+      if (!d->has_sdl || d->has_evdev)
+        continue;
+      if (conttest_classify_candidate_pair(
+              udev_serial, udev_conn, d->sdl_meta.serial,
+              d->sdl_meta.udev_conn) == CONTTEST_MATCH_REJECT)
+        continue;
+      if (conttest_hw_keys_match(d->sdl_meta.own_syspath,
                                  (const char *const *)d->sdl_meta.hw_keys,
                                  evdev_own_syspath, evdev_hw_keys)) {
-        return d;
+        matches[i] = TRUE;
+        live[i] = device_sdl_attachment_is_live(d);
       }
     }
+    int idx = conttest_select_unique_candidate(matches, live, count);
+    if (idx >= 0)
+      return g_ptr_array_index(self->devices, (guint)idx);
   }
 
   /* Second pass: for SDL devices without a devnode path, fall back to VID/PID.
@@ -1536,7 +1615,7 @@ static void on_sdl_udev_probe_done(GObject *source, GAsyncResult *res,
       d->sdl_udev_seq != ctx->seq)
     return;
 
-  if (d->sdl_gamepad && !SDL_GamepadConnected(d->sdl_gamepad)) {
+  if (d->has_sdl && d->sdl_gamepad && !device_sdl_attachment_is_live(d)) {
     device_detach_sdl(d);
     check_empty_and_remove(self, d);
     if (!self->disposed)
@@ -1562,14 +1641,17 @@ static void on_sdl_udev_probe_done(GObject *source, GAsyncResult *res,
           self, d->sdl_path, d->sdl_meta.own_syspath,
           (const char *const *)d->sdl_meta.hw_keys, d->vendor_id,
           d->product_id, sdl_serial, sdl_conn);
-      if (existing == d || (existing && existing->has_sdl))
+      if (existing == d)
         existing = NULL;
     }
 
     if (existing) {
-      /* Transfer SDL ownership into the matching evdev-only device and drop
-       * the still-hidden placeholder without emitting spurious signals. */
+      /* Transfer SDL ownership into the matching evdev device and drop the
+       * still-hidden placeholder without emitting spurious signals. A live
+       * attachment on `existing` was matched through its cached udev node and
+       * is replaced here. */
       gboolean existing_was_hidden = existing->hidden;
+      gboolean was_rebind = existing->has_sdl;
       device_set_name(existing, d->name);
       existing->has_sdl = TRUE;
       existing->sdl_id = d->sdl_id;
@@ -1579,6 +1661,10 @@ static void on_sdl_udev_probe_done(GObject *source, GAsyncResult *res,
         SDL_CloseGamepad(existing->sdl_gamepad);
       }
       existing->sdl_gamepad = d->sdl_gamepad;
+      if (was_rebind) {
+        existing->battery_state = SDL_POWERSTATE_UNKNOWN;
+        existing->battery_percent = -1;
+      }
       d->sdl_gamepad = NULL;
       d->has_sdl = FALSE;
       d->sdl_id = 0;
@@ -1647,9 +1733,52 @@ static void schedule_sdl_meta_probe(ConttestDeviceManager *self,
   schedule_sdl_udev_probe(self, d, d->sdl_path, seq);
 }
 
-static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
-  if (self->disposed || !self->devices || find_device_by_sdl_id(self, id))
+/* Bind a new SDL instance to a device, rebinding the handle when the instance
+ * ID changed, and announce the resulting state. */
+static void device_apply_sdl_attach(ConttestDeviceManager *self,
+                                    ConttestDevice *d, SDL_JoystickID id,
+                                    const char *name, const char *sdl_path,
+                                    uint16_t sdl_vid, uint16_t sdl_pid) {
+  gboolean was_hidden = d->hidden;
+  gboolean was_pending = d->sdl_probe_pending;
+  device_set_name(d, name);
+  device_attach_sdl(d, id, sdl_path);
+  if (d->vendor_id == 0 || d->product_id == 0) {
+    d->vendor_id = sdl_vid;
+    d->product_id = sdl_pid;
+  }
+
+  if (was_pending) {
+    /* The placeholder is still waiting for udev identity; re-arm the probe
+     * under a fresh sequence number and keep it hidden until it completes. */
+    guint seq = ++d->sdl_udev_seq;
+    schedule_sdl_udev_probe(self, d, d->sdl_path, seq);
     return;
+  }
+
+  schedule_sdl_meta_probe(self, d);
+  device_poll_battery(self, d);
+  device_refresh_virtual_state(self, d);
+  d->hidden = compute_device_hidden(self, d);
+  device_emit_transition(self, d, FALSE, was_hidden, TRUE);
+}
+
+static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
+  if (self->disposed || !self->devices)
+    return;
+
+  /* SDL reuses instance IDs. A binding to this ID whose handle no longer
+   * backs live hardware is stale, so clear it and treat the event as a new
+   * instance instead of dropping it. */
+  ConttestDevice *bound = find_device_by_sdl_id(self, id);
+  if (bound) {
+    if (device_sdl_attachment_is_live(bound))
+      return;
+    device_detach_sdl(bound);
+    check_empty_and_remove(self, bound);
+    if (self->disposed || !self->devices)
+      return;
+  }
 
   const char *name = SDL_GetGamepadNameForID(id);
   if (!name)
@@ -1663,7 +1792,7 @@ static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
    * so empty or shared multi-port adapter paths never coalesce distinct pads. */
   ConttestDevice *d =
       find_device_by_sdl_path(self, sdl_path, sdl_vid, sdl_pid, name);
-  if (d) {
+  if (d && d->sdl_id == id) {
     /* A duplicate SDL add event can still be the first chance to populate
      * sdl_meta for a device whose earlier probe found nothing. */
     schedule_sdl_meta_probe(self, d);
@@ -1674,7 +1803,7 @@ static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
   SDL_JoystickConnectionState sdl_conn = SDL_JOYSTICK_CONNECTION_UNKNOWN;
   /* Serial and connection type require an open handle; only the pathless
    * VID/PID fallback below consumes them. */
-  if ((!sdl_path || !g_str_has_prefix(sdl_path, "/dev/")) &&
+  if (!d && (!sdl_path || !g_str_has_prefix(sdl_path, "/dev/")) &&
       sdl_vid != 0 && sdl_pid != 0) {
     SDL_Gamepad *match_gamepad = SDL_OpenGamepad(id);
     if (match_gamepad) {
@@ -1686,22 +1815,12 @@ static void handle_sdl_added(ConttestDeviceManager *self, SDL_JoystickID id) {
     }
   }
 
-  d = find_device_by_hardware_for_sdl(self, sdl_path, NULL, NULL, sdl_vid,
-                                      sdl_pid, sdl_serial, sdl_conn);
+  if (!d)
+    d = find_device_by_hardware_for_sdl(self, sdl_path, NULL, NULL, sdl_vid,
+                                        sdl_pid, sdl_serial, sdl_conn);
 
   if (d) {
-    gboolean was_hidden = d->hidden;
-    device_set_name(d, name);
-    device_attach_sdl(d, id, sdl_path);
-    if (d->vendor_id == 0 || d->product_id == 0) {
-      d->vendor_id = sdl_vid;
-      d->product_id = sdl_pid;
-    }
-    schedule_sdl_meta_probe(self, d);
-    device_poll_battery(self, d);
-    device_refresh_virtual_state(self, d);
-    d->hidden = compute_device_hidden(self, d);
-    device_emit_transition(self, d, FALSE, was_hidden, TRUE);
+    device_apply_sdl_attach(self, d, id, name, sdl_path, sdl_vid, sdl_pid);
     return;
   }
 
@@ -2023,26 +2142,30 @@ static void poll_sdl_events(ConttestDeviceManager *self, gboolean force_pump) {
   SDL_Event events[64];
   int n_events;
   /* Drain the SDL event queue in batches so miscellaneous SDL events cannot
-   * accumulate up to SDL's 65,535-event cap. */
+   * accumulate up to SDL's 65,535-event cap. Removals are applied before
+   * additions: a fast replug can deliver both in one batch, and the new
+   * instance must be matched against the state that survives the removal. */
   while (!self->disposed && self->devices &&
          (n_events = SDL_PeepEvents(events, (int)G_N_ELEMENTS(events),
                                     SDL_GETEVENT, SDL_EVENT_FIRST,
                                     SDL_EVENT_LAST)) > 0) {
-    for (int i = 0; i < n_events && !self->disposed && self->devices; i++) {
-      const SDL_Event *event = &events[i];
-      if (event->type == SDL_EVENT_GAMEPAD_ADDED) {
-        if (!find_device_by_sdl_id(self, event->gdevice.which)) {
+    for (int pass = 0; pass < 2; pass++) {
+      for (int i = 0; i < n_events && !self->disposed && self->devices; i++) {
+        const SDL_Event *event = &events[i];
+        if (pass == 0 && event->type == SDL_EVENT_GAMEPAD_REMOVED) {
+          sdl_hotplug = TRUE;
+          handle_sdl_removed(self, event->gdevice.which);
+        } else if (pass == 1 && event->type == SDL_EVENT_GAMEPAD_ADDED) {
           sdl_hotplug = TRUE;
           handle_sdl_added(self, event->gdevice.which);
-        }
-      } else if (event->type == SDL_EVENT_GAMEPAD_REMOVED) {
-        sdl_hotplug = TRUE;
-        handle_sdl_removed(self, event->gdevice.which);
-      } else if (event->type == SDL_EVENT_JOYSTICK_BATTERY_UPDATED) {
-        ConttestDevice *d = find_device_by_sdl_id(self, event->jbattery.which);
-        if (d && !d->hidden && device_poll_battery(self, d)) {
-          g_autoptr(ConttestDevice) keep = g_object_ref(d);
-          g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, keep);
+        } else if (pass == 1 &&
+                   event->type == SDL_EVENT_JOYSTICK_BATTERY_UPDATED) {
+          ConttestDevice *d =
+              find_device_by_sdl_id(self, event->jbattery.which);
+          if (d && !d->hidden && device_poll_battery(self, d)) {
+            g_autoptr(ConttestDevice) keep = g_object_ref(d);
+            g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, keep);
+          }
         }
       }
     }
@@ -2057,7 +2180,7 @@ static void poll_sdl_events(ConttestDeviceManager *self, gboolean force_pump) {
   gboolean has_disconnected_sdl = FALSE;
   for (guint i = 0; i < self->devices->len; i++) {
     ConttestDevice *d = g_ptr_array_index(self->devices, i);
-    if (d->has_sdl && d->sdl_gamepad && !SDL_GamepadConnected(d->sdl_gamepad)) {
+    if (d->has_sdl && d->sdl_gamepad && !device_sdl_attachment_is_live(d)) {
       has_disconnected_sdl = TRUE;
       break;
     }
@@ -2071,7 +2194,8 @@ static void poll_sdl_events(ConttestDeviceManager *self, gboolean force_pump) {
       ConttestDevice *d = g_ptr_array_index(snapshot, i);
       if (!g_ptr_array_find(self->devices, d, NULL))
         continue;
-      if (d->has_sdl && d->sdl_gamepad && !SDL_GamepadConnected(d->sdl_gamepad)) {
+      if (d->has_sdl && d->sdl_gamepad &&
+          !device_sdl_attachment_is_live(d)) {
         sdl_hotplug = TRUE;
         device_detach_sdl(d);
         check_empty_and_remove(self, d);

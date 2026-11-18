@@ -9,6 +9,11 @@ gboolean conttest_vid_pid_is_ds3(uint16_t vid, uint16_t pid);
 gboolean conttest_vid_pid_is_ds4(uint16_t vid, uint16_t pid);
 gboolean conttest_vid_pid_is_ds5(uint16_t vid, uint16_t pid);
 
+/* Map a raw SDL joystick axis index beyond the standard gamepad axes to a
+ * DualShock 3 pressure channel (0..9: Cross, Circle, Square, Triangle, L1, R1,
+ * Up, Down, Left, Right). Returns -1 for other hardware and axis indices. */
+int conttest_ds3_pressure_axis_index(uint16_t vid, uint16_t pid, int axis_index);
+
 /* Parse VID and PID out of sysfs PRODUCT ("3/54c/ce6/8111") or HID_ID ("0005:0000054C:000009CC"). */
 gboolean conttest_parse_vid_pid(const char *str, char sep, uint16_t *v, uint16_t *p);
 
@@ -38,12 +43,16 @@ gboolean conttest_hw_keys_match(const char *own_a,
                                 const char *own_b,
                                 const char * const *keys_b);
 
-/* Check whether an SDL device node path and an evdev syspath belong to the same
- * physical device. Performs synchronous udev/sysfs lookups; call only from a
- * worker thread or unit tests, never from the GTK main loop. */
-gboolean conttest_udev_is_same_hardware(struct udev *udev,
-                                        const char *sdl_path,
-                                        const char *evdev_syspath);
+/* Select the single candidate a hardware-key match may safely identify.
+ * `matches` marks the entries whose keys matched and `preferred` marks the
+ * ones still believed live (may be NULL). A live entry only wins when it is
+ * the only live match; stale entries are used only when no live entry matched
+ * and exactly one stale entry did. Returns the index or -1 when the best class
+ * is ambiguous. Shared keys (USB receivers, multi-port adapters) must refuse
+ * the merge instead of picking the first entry. */
+int conttest_select_unique_candidate(const gboolean *matches,
+                                     const gboolean *preferred,
+                                     guint count);
 
 typedef enum {
     CONTTEST_MATCH_REJECT = 0,
@@ -70,14 +79,5 @@ SDL_JoystickConnectionState conttest_resolve_connection_state_from_props(
 /* Resolve connection type from an already-opened udev device. */
 SDL_JoystickConnectionState conttest_resolve_connection_state_for_udev_device(
     struct udev_device *dev);
-
-/* Resolve connection type from udev for an evdev syspath or SDL devnode path.
- * Performs synchronous udev/sysfs lookups; call only from a worker thread or
- * unit tests, never from the GTK main loop. */
-SDL_JoystickConnectionState conttest_resolve_connection_state_udev(
-    struct udev *udev,
-    gboolean has_evdev,
-    const char *evdev_syspath,
-    const char *sdl_path);
 
 G_END_DECLS

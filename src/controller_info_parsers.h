@@ -8,6 +8,7 @@ G_BEGIN_DECLS
 /* --- DualShock 3 --- */
 
 gboolean conttest_ds3_oui_is_genuine(const char *bt_addr);
+/* Test-only accessors for the built-in OUI allowlist. */
 gsize conttest_ds3_oui_count(void);
 const char *conttest_ds3_oui_get(gsize index);
 

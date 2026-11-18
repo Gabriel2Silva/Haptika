@@ -344,13 +344,3 @@ void conttest_snapshot_circular_indicator_cached(GtkWidget *widget,
     if (!cache)
         conttest_circular_indicator_cache_clear(&temp_cache);
 }
-
-void conttest_snapshot_circular_indicator(GtkWidget *widget,
-                                          GtkSnapshot *snapshot,
-                                          float canvas_w,
-                                          float canvas_h,
-                                          float x,
-                                          float y) {
-    conttest_snapshot_circular_indicator_cached(widget, snapshot, NULL,
-                                                canvas_w, canvas_h, x, y);
-}

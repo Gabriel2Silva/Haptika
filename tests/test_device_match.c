@@ -55,15 +55,13 @@ static void test_connection_state_classification(void) {
                     ==, SDL_JOYSTICK_CONNECTION_WIRED);
     g_assert_cmpint(conttest_resolve_connection_state_from_props("", FALSE, TRUE),
                     ==, SDL_JOYSTICK_CONNECTION_WIRELESS);
+    /* A Bluetooth controller behind a USB Bluetooth adapter has a USB ancestor
+     * too; the Bluetooth link wins. */
+    g_assert_cmpint(conttest_resolve_connection_state_from_props(NULL, TRUE, TRUE),
+                    ==, SDL_JOYSTICK_CONNECTION_WIRELESS);
     g_assert_cmpint(conttest_resolve_connection_state_from_props(NULL, FALSE, FALSE),
                     ==, SDL_JOYSTICK_CONNECTION_UNKNOWN);
 
-    struct udev *udev = udev_new();
-    g_assert_nonnull(udev);
-    g_assert_false(conttest_udev_is_same_hardware(udev, NULL, "/sys/nonexistent"));
-    g_assert_cmpint(conttest_resolve_connection_state_udev(udev, TRUE, "/sys/nonexistent", NULL),
-                    ==, SDL_JOYSTICK_CONNECTION_UNKNOWN);
-    udev_unref(udev);
 }
 
 static void test_inputplumber_fnv1a_and_mac_uniq(void) {
@@ -435,6 +433,39 @@ static void test_hw_keys_matching(void) {
     g_assert_false(conttest_hw_keys_match(
         bt_pad1_evdev[0].syspath, (const char * const *)bt1_ev_keys,
         bt_pad2_hidraw[0].syspath, (const char * const *)bt2_hr_keys));
+
+    /* USB receiver hosting two pads: both event nodes sit under the same hid
+     * and usb_interface ancestors, so key matching cannot tell them apart.
+     * Both match the receiver's hidraw node; caller must refuse the ambiguity
+     * (see conttest_select_unique_candidate). */
+    static const MockAncestor rx_pad1_evdev[] = {
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001/input/input40/event30", "input", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001/input/input40", "input", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001", "hid", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0", "usb", "usb_interface" },
+    };
+    static const MockAncestor rx_pad2_evdev[] = {
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001/input/input41/event31", "input", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001/input/input41", "input", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001", "hid", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0", "usb", "usb_interface" },
+    };
+    static const MockAncestor rx_hidraw[] = {
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001/hidraw/hidraw6", "hidraw", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0/0003:057E:0337.0001", "hid", NULL },
+        { "/sys/devices/pci0/usb1/1-3/1-3:1.0", "usb", "usb_interface" },
+    };
+
+    g_auto(GStrv) rx1_ev_keys = collect_mock_hw_keys(rx_pad1_evdev, G_N_ELEMENTS(rx_pad1_evdev));
+    g_auto(GStrv) rx2_ev_keys = collect_mock_hw_keys(rx_pad2_evdev, G_N_ELEMENTS(rx_pad2_evdev));
+    g_auto(GStrv) rx_hr_keys = collect_mock_hw_keys(rx_hidraw, G_N_ELEMENTS(rx_hidraw));
+
+    g_assert_true(conttest_hw_keys_match(
+        rx_pad1_evdev[0].syspath, (const char * const *)rx1_ev_keys,
+        rx_hidraw[0].syspath, (const char * const *)rx_hr_keys));
+    g_assert_true(conttest_hw_keys_match(
+        rx_pad2_evdev[0].syspath, (const char * const *)rx2_ev_keys,
+        rx_hidraw[0].syspath, (const char * const *)rx_hr_keys));
 }
 
 static void test_serial_and_candidate_corroboration(void) {
@@ -555,6 +586,150 @@ static void test_inputplumber_dbus_signal_filtering(void) {
         "org.freedesktop.DBus.Properties", "PropertiesChanged", NULL, &ver_inv));
 }
 
+static void test_ds3_pressure_axis_mapping(void) {
+    /* Only DualShock 3 IDs and the ten raw axes after the standard six are
+     * pressure channels; everything else stays a generic axis. */
+    g_assert_cmpint(conttest_ds3_pressure_axis_index(SONY_VID, DS3_PID, 5), ==, -1);
+    g_assert_cmpint(conttest_ds3_pressure_axis_index(SONY_VID, DS3_PID, 6), ==, 0);
+    g_assert_cmpint(conttest_ds3_pressure_axis_index(SONY_VID, DS3_PID, 15), ==, 9);
+    g_assert_cmpint(conttest_ds3_pressure_axis_index(SONY_VID, DS3_PID, 16), ==, -1);
+
+    g_assert_cmpint(conttest_ds3_pressure_axis_index(SONY_VID, DS4_PID_V2, 6), ==, -1);
+    g_assert_cmpint(conttest_ds3_pressure_axis_index(SONY_VID, DS5_PID_V1, 6), ==, -1);
+    g_assert_cmpint(conttest_ds3_pressure_axis_index(0x045e, 0x028e, 6), ==, -1);
+}
+
+static void test_candidate_selection(void) {
+    /* Single match, live or stale, is accepted. */
+    const gboolean one_match[] = { TRUE };
+    const gboolean one_live[] = { TRUE };
+    const gboolean one_stale[] = { FALSE };
+    g_assert_cmpint(conttest_select_unique_candidate(one_match, one_live, 1), ==, 0);
+    g_assert_cmpint(conttest_select_unique_candidate(one_match, one_stale, 1), ==, 0);
+    g_assert_cmpint(conttest_select_unique_candidate(one_match, NULL, 1), ==, 0);
+
+    /* No match at all. */
+    const gboolean none_match[] = { FALSE, FALSE };
+    g_assert_cmpint(conttest_select_unique_candidate(none_match, one_live, 2), ==, -1);
+    g_assert_cmpint(conttest_select_unique_candidate(NULL, NULL, 2), ==, -1);
+    g_assert_cmpint(conttest_select_unique_candidate(one_match, one_live, 0), ==, -1);
+
+    /* A stale leftover next to the live attachment it was re-enumerated into:
+     * the live entry wins. This is the reconnect case. */
+    const gboolean split_match[] = { TRUE, TRUE };
+    const gboolean split_live[] = { FALSE, TRUE };
+    g_assert_cmpint(conttest_select_unique_candidate(split_match, split_live, 2), ==, 1);
+
+    /* Two live pads behind one receiver share every hardware key: refuse
+     * instead of merging into whichever comes first. */
+    const gboolean receiver_match[] = { TRUE, TRUE, FALSE };
+    const gboolean receiver_live[] = { TRUE, TRUE, TRUE };
+    g_assert_cmpint(conttest_select_unique_candidate(receiver_match, receiver_live, 3), ==, -1);
+
+    /* Two stale leftovers are equally ambiguous. */
+    const gboolean stale_match[] = { TRUE, TRUE };
+    const gboolean stale_live[] = { FALSE, FALSE };
+    g_assert_cmpint(conttest_select_unique_candidate(stale_match, stale_live, 2), ==, -1);
+}
+
+static void test_inputplumber_malformed_property_types(void) {
+    /* Every property uses the wrong variant type inside an otherwise valid
+     * GetManagedObjects signature. Parsing must ignore them, not crash, and
+     * must not produce candidates or hidden source devnodes. */
+    GVariantBuilder objs;
+    g_variant_builder_init(&objs, G_VARIANT_TYPE("a{oa{sa{sv}}}"));
+
+    {
+        GVariantBuilder p;
+        g_variant_builder_init(&p, G_VARIANT_TYPE("a{sv}"));
+        g_variant_builder_add(&p, "{sv}", "Name", g_variant_new_uint32(7));
+        g_variant_builder_add(&p, "{sv}", "PersistentId", g_variant_new_boolean(TRUE));
+        g_variant_builder_add(&p, "{sv}", "ProfileName", g_variant_new_uint32(3));
+        g_variant_builder_add(&p, "{sv}", "SourceDevicePaths",
+                              g_variant_new_string("/dev/input/event9"));
+        g_variant_builder_add(&p, "{sv}", "TargetDevices", g_variant_new_uint32(1));
+        g_variant_builder_add(&p, "{sv}", "OutputCapabilities",
+                              g_variant_new_string("rumble"));
+        g_variant_builder_add(&p, "{sv}", "InterceptMode", g_variant_new_string("bogus"));
+        add_managed_object(&objs, "/org/shadowblip/Input/CompositeDevice0",
+                           "org.shadowblip.Input.CompositeDevice",
+                           g_variant_builder_end(&p));
+    }
+    {
+        GVariantBuilder p;
+        g_variant_builder_init(&p, G_VARIANT_TYPE("a{sv}"));
+        g_variant_builder_add(&p, "{sv}", "DeviceType", g_variant_new_uint32(1));
+        g_variant_builder_add(&p, "{sv}", "Name", g_variant_new_uint32(2));
+        add_managed_object(&objs, "/org/shadowblip/Input/Target/target0",
+                           "org.shadowblip.Input.Target",
+                           g_variant_builder_end(&p));
+    }
+    {
+        GVariantBuilder p;
+        g_variant_builder_init(&p, G_VARIANT_TYPE("a{sv}"));
+        g_variant_builder_add(&p, "{sv}", "DevicePath", g_variant_new_uint32(4));
+        g_variant_builder_add(&p, "{sv}", "Name", g_variant_new_uint32(5));
+        add_managed_object(&objs, "/org/shadowblip/Input/Source/udev0",
+                           "org.shadowblip.Input.Source.UdevDevice",
+                           g_variant_builder_end(&p));
+    }
+
+    GVariant *reply = g_variant_new("(@a{oa{sa{sv}}})",
+                                    g_variant_builder_end(&objs));
+    g_variant_ref_sink(reply);
+    GHashTable *devnodes = NULL;
+    GPtrArray *candidates =
+        conttest_inputplumber_parse_managed_objects(reply, "0.84.0", &devnodes);
+    g_assert_cmpuint(candidates->len, ==, 0);
+    g_assert_nonnull(devnodes);
+    g_assert_cmpuint(g_hash_table_size(devnodes), ==, 0);
+    g_ptr_array_unref(candidates);
+    g_hash_table_destroy(devnodes);
+    g_variant_unref(reply);
+
+    /* A valid gamepad target with malformed optional properties must still be
+     * reported, with the malformed fields left at their defaults. */
+    g_variant_builder_init(&objs, G_VARIANT_TYPE("a{oa{sa{sv}}}"));
+    {
+        GVariantBuilder p;
+        g_variant_builder_init(&p, G_VARIANT_TYPE("a{sv}"));
+        g_variant_builder_add(&p, "{sv}", "Name", g_variant_new_uint32(7));
+        g_variant_builder_add(&p, "{sv}", "InterceptMode", g_variant_new_string("bogus"));
+        const char *tgts[] = { "/org/shadowblip/Input/Target/target0", NULL };
+        add_prop_strv(&p, "TargetDevices", tgts);
+        add_managed_object(&objs, "/org/shadowblip/Input/CompositeDevice0",
+                           "org.shadowblip.Input.CompositeDevice",
+                           g_variant_builder_end(&p));
+    }
+    {
+        GVariantBuilder p;
+        g_variant_builder_init(&p, G_VARIANT_TYPE("a{sv}"));
+        add_prop_str(&p, "DeviceType", "ds5");
+        g_variant_builder_add(&p, "{sv}", "Name", g_variant_new_uint32(2));
+        add_managed_object(&objs, "/org/shadowblip/Input/Target/target0",
+                           "org.shadowblip.Input.Target",
+                           g_variant_builder_end(&p));
+    }
+
+    reply = g_variant_new("(@a{oa{sa{sv}}})", g_variant_builder_end(&objs));
+    g_variant_ref_sink(reply);
+    devnodes = NULL;
+    candidates =
+        conttest_inputplumber_parse_managed_objects(reply, "0.84.0", &devnodes);
+    g_assert_cmpuint(candidates->len, ==, 1);
+    ConttestInputPlumberInfo *info = g_ptr_array_index(candidates, 0);
+    g_assert_cmpstr(info->target_type, ==, "ds5");
+    g_assert_null(info->composite_name);
+    g_assert_null(info->target_name);
+    g_assert_cmpuint(info->intercept_mode, ==, 0);
+    g_assert_cmpuint(info->output_caps->len, ==, 0);
+    g_assert_nonnull(devnodes);
+    g_assert_cmpuint(g_hash_table_size(devnodes), ==, 0);
+    g_ptr_array_unref(candidates);
+    g_hash_table_destroy(devnodes);
+    g_variant_unref(reply);
+}
+
 int main(int argc, char *argv[]) {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/device_match/vid_pid_predicates_and_parsing",
@@ -571,5 +746,11 @@ int main(int argc, char *argv[]) {
                     test_hw_keys_matching);
     g_test_add_func("/device_match/serial_and_candidate_corroboration",
                     test_serial_and_candidate_corroboration);
+    g_test_add_func("/device_match/candidate_selection",
+                    test_candidate_selection);
+    g_test_add_func("/device_match/ds3_pressure_axis_mapping",
+                    test_ds3_pressure_axis_mapping);
+    g_test_add_func("/device_match/inputplumber_malformed_property_types",
+                    test_inputplumber_malformed_property_types);
     return g_test_run();
 }

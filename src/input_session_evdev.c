@@ -43,6 +43,7 @@ static ConttestAbsAxisInfo read_abs_axis_info(struct libevdev *dev, unsigned int
         .maximum = info->maximum,
         .value   = info->value,
         .flat    = info->flat,
+        .fuzz    = info->fuzz,
     };
 }
 
@@ -89,7 +90,8 @@ static gboolean evdev_push_event(EvdevAbsAxisLut abs_lut[ABS_CNT],
                                  ViewerSessionContext *ctx,
                                  unsigned int type,
                                  unsigned int code,
-                                 int value) {
+                                 int value,
+                                 gboolean force) {
     if (type == EV_ABS) {
         if (code >= ABS_CNT || !abs_lut[code].valid)
             return FALSE;
@@ -107,7 +109,7 @@ static gboolean evdev_push_event(EvdevAbsAxisLut abs_lut[ABS_CNT],
             norm = (float)CLAMP(d, (double)a->min_clamp, 1.0);
         }
 
-        if (a->has_prev) {
+        if (!force && a->has_prev) {
             float prev = a->last_norm;
             if (norm == prev)
                 return FALSE;
@@ -146,45 +148,78 @@ static gboolean evdev_push_event(EvdevAbsAxisLut abs_lut[ABS_CNT],
     return FALSE;
 }
 
+static gboolean evdev_push_snapshot(EvdevThreadData *data) {
+    gboolean pushed = FALSE;
+    for (unsigned int code = 0; code <= KEY_MAX; code++) {
+        if (!libevdev_has_event_code(data->dev, EV_KEY, code))
+            continue;
+        int val = libevdev_get_event_value(data->dev, EV_KEY, code);
+        if (evdev_push_event(data->abs_lut, data->ctx, EV_KEY, code, val, TRUE))
+            pushed = TRUE;
+    }
+    for (unsigned int code = 0; code <= ABS_MAX; code++) {
+        if (!libevdev_has_event_code(data->dev, EV_ABS, code))
+            continue;
+        int val = libevdev_get_event_value(data->dev, EV_ABS, code);
+        if (evdev_push_event(data->abs_lut, data->ctx, EV_ABS, code, val, TRUE))
+            pushed = TRUE;
+    }
+    return pushed;
+}
+
 static gpointer evdev_polling_thread(gpointer user_data) {
     EvdevThreadData *data = (EvdevThreadData *)user_data;
     struct pollfd pfd = { .fd = data->fd, .events = POLLIN };
 
     while (!g_atomic_int_get(data->atomic_stop_flag)) {
+        gboolean pushed = FALSE;
+
+        /* The drain asks for a resync after dropping events; republish the
+         * current hardware state so a lost release cannot leave an indicator
+         * stuck. The 50 ms poll timeout bounds the delay without extra wakeups. */
+        if (atomic_exchange_explicit(&data->ctx->ring.resync, false,
+                                     memory_order_relaxed)) {
+            if (evdev_push_snapshot(data))
+                pushed = TRUE;
+        }
+
         int ret = poll(&pfd, 1, 50);
         if (ret < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
+                if (pushed)
+                    conttest_event_ring_notify(data->ctx, conttest_input_viewer_drain_ring);
                 continue;
+            }
             break;
         }
-        if (ret == 0)
-            continue;
 
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-            break;
+        if (ret > 0) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+                break;
 
-        gboolean pushed = FALSE;
-        struct input_event ev;
-        int rc;
+            struct input_event ev;
+            int rc;
 
-        do {
-            rc = libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-            if (rc == LIBEVDEV_READ_STATUS_SYNC) {
-                /* Drain kernel SYN_DROPPED sync stream before resuming normal reads. */
-                while ((rc = libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_SYNC, &ev)) ==
-                       LIBEVDEV_READ_STATUS_SYNC) {
+            do {
+                rc = libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+                    /* Drain kernel SYN_DROPPED sync stream before resuming normal reads. */
+                    while ((rc = libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_SYNC, &ev)) ==
+                           LIBEVDEV_READ_STATUS_SYNC) {
+                        if (evdev_push_event(data->abs_lut, data->ctx,
+                                             ev.type, ev.code, ev.value, FALSE))
+                            pushed = TRUE;
+                    }
+                    if (rc == -EAGAIN)
+                        rc = LIBEVDEV_READ_STATUS_SUCCESS;
+                } else if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
                     if (evdev_push_event(data->abs_lut, data->ctx,
-                                         ev.type, ev.code, ev.value))
+                                         ev.type, ev.code, ev.value, FALSE))
                         pushed = TRUE;
                 }
-                if (rc == -EAGAIN)
-                    rc = LIBEVDEV_READ_STATUS_SUCCESS;
-            } else if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-                if (evdev_push_event(data->abs_lut, data->ctx,
-                                     ev.type, ev.code, ev.value))
-                    pushed = TRUE;
-            }
-        } while (rc == LIBEVDEV_READ_STATUS_SUCCESS && !g_atomic_int_get(data->atomic_stop_flag));
+            } while (rc == LIBEVDEV_READ_STATUS_SUCCESS &&
+                     !g_atomic_int_get(data->atomic_stop_flag));
+        }
 
         if (pushed)
             conttest_event_ring_notify(data->ctx, conttest_input_viewer_drain_ring);
@@ -314,22 +349,7 @@ ConttestInputSession *conttest_input_session_evdev_start(const char *devnode,
     g_main_context_invoke(NULL, conttest_input_viewer_handle_layout, layout);
 
     /* Seed the ring with current EV_KEY / EV_ABS hardware state before polling begins. */
-    gboolean has_initial = FALSE;
-    for (unsigned int code = 0; code <= KEY_MAX; code++) {
-        if (!libevdev_has_event_code(dev, EV_KEY, code))
-            continue;
-        int val = libevdev_get_event_value(dev, EV_KEY, code);
-        if (evdev_push_event(data->abs_lut, ctx, EV_KEY, code, val))
-            has_initial = TRUE;
-    }
-    for (unsigned int code = 0; code <= ABS_MAX; code++) {
-        if (!libevdev_has_event_code(dev, EV_ABS, code))
-            continue;
-        int val = libevdev_get_event_value(dev, EV_ABS, code);
-        if (evdev_push_event(data->abs_lut, ctx, EV_ABS, code, val))
-            has_initial = TRUE;
-    }
-    if (has_initial)
+    if (evdev_push_snapshot(data))
         conttest_event_ring_notify(ctx, conttest_input_viewer_drain_ring);
 
     viewer_session_context_ref(ctx);

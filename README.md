@@ -31,9 +31,9 @@ compatibility.
 
 SDL3 is the default. It provides a standard gamepad mapping, vibration, touchpad and
 motion sensor access, and battery telemetry. It is the best choice for most controllers.
-SDL3 state is sampled on a 1 ms main-thread timer; GTK still paints on the display frame
-clock, so the visualizers update at the monitor refresh rate while short presses between
-frames are not missed.
+SDL3 state is sampled every millisecond while input is changing, then backs off to 4 ms after a quarter
+second without changes; GTK still paints on the display frame clock, so the visualizers update at the
+monitor refresh rate while short presses between frames are not missed.
 
 The raw evdev backend exposes every button and axis reported by `libevdev` without a
 mapping layer. This is useful for older or unusual controllers, for checking what the
@@ -117,6 +117,8 @@ every controller ever released, so contributions are very welcome.
 
 - [SDL3](https://libsdl.org/) for the gamepad abstraction layer
 - [libevdev](https://freedesktop.org/wiki/Software/libevdev/) for raw evdev access
+- [Controllercons](https://controllercons.github.io) by Kieran McClung for the controller and
+  console icons (SIL Open Font License 1.1)
 - [dualshock-tools](https://dualshock-tools.github.io/) for DS4 reverse engineering reference
 - [dualsensectl](https://github.com/nowrep/dualsensectl) for DualSense reverse engineering reference
 - [DsHidMini](https://github.com/nefarius/DsHidMini) for DualShock 3 OUI database
@@ -130,3 +132,8 @@ works, change it to suit your controller, and share it with other people. If you
 on, the GPLv3 makes sure the next person receives the same freedoms you did.
 
 See [LICENSE](LICENSE) for the full text.
+
+The controller and console icons under `data/icons/` are third-party artwork from
+[Controllercons](https://controllercons.github.io), licensed under the SIL Open Font
+License 1.1. They are not covered by the GPL. See `data/icons/NOTICE.md` and
+`data/icons/OFL.txt`.

@@ -27,7 +27,8 @@ struct _ConttestWindow {
     ConttestDeviceManager *device_manager;
     GSettings *settings;
 
-    /* Currently visible device in the viewer (borrowed from manager). */
+    /* Strong reference to the device shown in the viewer; cleared when leaving
+     * the viewer or when the device disappears. */
     ConttestDevice *active_device;
     ConttestBackend active_backend;
 
@@ -219,6 +220,8 @@ static GtkWidget *build_menu_button(ConttestWindow *self) {
     GtkWidget *btn = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(btn), "open-menu-symbolic");
     gtk_widget_set_tooltip_text(btn, _("Main Menu"));
+    gtk_accessible_update_property(GTK_ACCESSIBLE(btn),
+                                   GTK_ACCESSIBLE_PROPERTY_LABEL, _("Main Menu"), -1);
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(btn), G_MENU_MODEL(menu));
     g_object_unref(menu);
 
@@ -339,6 +342,8 @@ static void conttest_window_init(ConttestWindow *self) {
 
     self->view_controller_info_btn = gtk_button_new_from_icon_name("haptika-help-about-symbolic");
     gtk_widget_set_tooltip_text(self->view_controller_info_btn, _("Controller Info"));
+    gtk_accessible_update_property(GTK_ACCESSIBLE(self->view_controller_info_btn),
+                                   GTK_ACCESSIBLE_PROPERTY_LABEL, _("Controller Info"), -1);
     gtk_widget_add_css_class(self->view_controller_info_btn, "flat");
     gtk_widget_set_visible(self->view_controller_info_btn, FALSE);
     g_signal_connect(self->view_controller_info_btn, "clicked", G_CALLBACK(on_controller_info_clicked), self);
@@ -346,6 +351,8 @@ static void conttest_window_init(ConttestWindow *self) {
 
     self->view_inputplumber_info_btn = gtk_button_new_from_icon_name("haptika-inputplumber-symbolic");
     gtk_widget_set_tooltip_text(self->view_inputplumber_info_btn, _("InputPlumber Info"));
+    gtk_accessible_update_property(GTK_ACCESSIBLE(self->view_inputplumber_info_btn),
+                                   GTK_ACCESSIBLE_PROPERTY_LABEL, _("InputPlumber Info"), -1);
     gtk_widget_add_css_class(self->view_inputplumber_info_btn, "flat");
     gtk_widget_set_visible(self->view_inputplumber_info_btn, FALSE);
     g_signal_connect(self->view_inputplumber_info_btn, "clicked", G_CALLBACK(on_inputplumber_info_clicked), self);
@@ -392,10 +399,15 @@ static void update_header_battery(ConttestWindow *self) {
 
     SDL_JoystickConnectionState conn = conttest_device_get_connection_state(self->active_device);
     if (conn != SDL_JOYSTICK_CONNECTION_UNKNOWN) {
-        const char *conn_icon = (conn == SDL_JOYSTICK_CONNECTION_WIRELESS)
+        gboolean wireless = (conn == SDL_JOYSTICK_CONNECTION_WIRELESS);
+        const char *conn_icon = wireless
             ? "haptika-bluetooth-symbolic"
             : "haptika-usb-symbolic";
         gtk_image_set_from_icon_name(GTK_IMAGE(self->view_connection_icon), conn_icon);
+        gtk_accessible_update_property(
+            GTK_ACCESSIBLE(self->view_connection_icon),
+            GTK_ACCESSIBLE_PROPERTY_LABEL,
+            wireless ? _("Connected via Bluetooth") : _("Connected via USB"), -1);
         gtk_widget_set_visible(self->view_connection_icon, TRUE);
     } else {
         gtk_widget_set_visible(self->view_connection_icon, FALSE);
@@ -471,6 +483,14 @@ void conttest_window_show_selector(ConttestWindow *self) {
     adw_navigation_view_pop_to_page(ADW_NAVIGATION_VIEW(self->nav_view), ADW_NAVIGATION_PAGE(self->selector_page));
 }
 
+void conttest_window_handle_session_lost(ConttestWindow *self) {
+    g_return_if_fail(CONTTEST_IS_WINDOW(self));
+    /* The backend lost its device while the viewer was open; do not leave the
+     * user on a page that no longer receives input. */
+    conttest_window_show_selector(self);
+    conttest_window_show_toast(self, _("Controller disconnected."));
+}
+
 static gboolean backend_target_available(const ConttestDevice *device,
                                          ConttestBackend backend) {
     if (backend == CONTTEST_BACKEND_SDL3) {
@@ -487,9 +507,11 @@ static void apply_viewer_header(ConttestWindow *self, ConttestDevice *device, Co
 
     gboolean has_both = conttest_device_get_has_sdl(device) && conttest_device_get_has_evdev(device);
     if (has_both) {
-        const char *tooltip = (backend == CONTTEST_BACKEND_SDL3)
+        const char *label = (backend == CONTTEST_BACKEND_SDL3)
             ? _("Switch to evdev") : _("Switch to SDL3");
-        gtk_widget_set_tooltip_text(self->view_backend_btn, tooltip);
+        gtk_widget_set_tooltip_text(self->view_backend_btn, label);
+        gtk_accessible_update_property(GTK_ACCESSIBLE(self->view_backend_btn),
+                                       GTK_ACCESSIBLE_PROPERTY_LABEL, label, -1);
         gtk_widget_set_visible(self->view_backend_btn, TRUE);
     } else {
         gtk_widget_set_visible(self->view_backend_btn, FALSE);

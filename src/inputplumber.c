@@ -3,7 +3,6 @@
 #include "inputplumber_logic.h"
 #include <gio/gio.h>
 #include <string.h>
-#include <sys/stat.h>
 
 #define IP_BUS_NAME        "org.shadowblip.InputPlumber"
 #define IP_ROOT_PATH       "/org/shadowblip/InputPlumber"
@@ -13,24 +12,13 @@
 #define IP_IFACE_TARGET    "org.shadowblip.Input.Target"
 #define IP_IFACE_UDEV      "org.shadowblip.Input.Source.UdevDevice"
 
-/* --- Sysfs / udev virtual & hidden detection --- */
+/* Reconnect backoff after the system bus or InputPlumber disappears. The GLib
+ * bus singleton is unusable once its connection closes, so recovery always
+ * opens a new connection to the bus address. */
+#define IP_BUS_RETRY_MIN_MS 1000
+#define IP_BUS_RETRY_MAX_MS 30000
 
-static struct udev_device *resolve_udev_device(struct udev *udev,
-                                               const char *syspath,
-                                               const char *devnode) {
-    if (!udev) return NULL;
-    if (syspath) {
-        return udev_device_new_from_syspath(udev, syspath);
-    }
-    if (devnode) {
-        struct stat st;
-        if (stat(devnode, &st) == 0) {
-            return udev_device_new_from_devnum(
-                udev, S_ISBLK(st.st_mode) ? 'b' : 'c', st.st_rdev);
-        }
-    }
-    return NULL;
-}
+/* --- Sysfs / udev virtual & hidden detection --- */
 
 gboolean conttest_udev_device_probe_virtual(struct udev_device *dev,
                                             char **out_uniq,
@@ -93,22 +81,6 @@ gboolean conttest_udev_device_probe_virtual(struct udev_device *dev,
     return TRUE;
 }
 
-gboolean conttest_udev_probe_virtual(struct udev *udev,
-                                     const char *syspath,
-                                     const char *devnode,
-                                     char **out_uniq,
-                                     char **out_virtual_bus) {
-    if (out_uniq) *out_uniq = NULL;
-    if (out_virtual_bus) *out_virtual_bus = NULL;
-
-    struct udev_device *dev = resolve_udev_device(udev, syspath, devnode);
-    if (!dev) return FALSE;
-
-    gboolean is_virtual = conttest_udev_device_probe_virtual(dev, out_uniq, out_virtual_bus);
-    udev_device_unref(dev);
-    return is_virtual;
-}
-
 gboolean conttest_udev_device_is_inputplumber_hidden(struct udev_device *dev) {
     if (!dev) return FALSE;
 
@@ -121,17 +93,6 @@ gboolean conttest_udev_device_is_inputplumber_hidden(struct udev_device *dev) {
             break;
         }
     }
-    return hidden;
-}
-
-gboolean conttest_udev_is_inputplumber_hidden(struct udev *udev,
-                                              const char *syspath,
-                                              const char *devnode) {
-    struct udev_device *dev = resolve_udev_device(udev, syspath, devnode);
-    if (!dev) return FALSE;
-
-    gboolean hidden = conttest_udev_device_is_inputplumber_hidden(dev);
-    udev_device_unref(dev);
     return hidden;
 }
 
@@ -149,6 +110,11 @@ struct _ConttestInputPlumberMonitor {
     guint sub_iface_removed;
     guint sub_props_changed;
     guint refresh_debounce_id;
+    guint bus_retry_id;
+    guint bus_retry_attempt;
+    gboolean bus_get_in_flight;
+    gboolean bus_closed_pending;
+    gulong bus_closed_handler;
 
     guint refresh_seq;
     guint pending_calls;
@@ -510,21 +476,87 @@ static void on_ip_dbus_signal(GDBusConnection *conn,
     schedule_refresh(self);
 }
 
-static void on_bus_ready(GObject *source, GAsyncResult *res, gpointer user_data) {
+static void schedule_bus_retry(ConttestInputPlumberMonitor *self);
+static void request_bus(ConttestInputPlumberMonitor *self);
+
+/* Subscriptions belong to the closed connection and cannot be reused. */
+static void drop_bus(ConttestInputPlumberMonitor *self) {
+    if (self->bus && self->bus_closed_handler) {
+        g_signal_handler_disconnect(self->bus, self->bus_closed_handler);
+        self->bus_closed_handler = 0;
+    }
+    self->sub_name_owner = 0;
+    self->sub_iface_added = 0;
+    self->sub_iface_removed = 0;
+    self->sub_props_changed = 0;
+    g_clear_object(&self->bus);
+    self->bus_get_in_flight = FALSE;
+    self->bus_closed_pending = FALSE;
+}
+
+static void bus_closed_closure_free(gpointer data, GClosure *closure) {
+    (void)closure;
+    monitor_weak_ref_free(data);
+}
+
+static gboolean on_bus_lost_idle(gpointer user_data) {
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
+    if (!self || self->disposed || !self->bus_closed_pending)
+        return G_SOURCE_REMOVE;
+
+    drop_bus(self);
+    cancel_pending_refresh(self);
+    clear_snapshot(self);
+    schedule_bus_retry(self);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_bus_closed(GDBusConnection *conn,
+                          gboolean remote_peer_vanished,
+                          GError *error,
+                          gpointer user_data) {
+    (void)conn; (void)remote_peer_vanished; (void)error;
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
+    if (!self || self->disposed || !self->bus || self->bus_closed_pending)
+        return;
+
+    /* Dropping the last connection reference inside its own "closed" emission
+     * can finalize the emitter while GLib is still walking its handlers.
+     * Tear down from the next main-loop iteration instead. */
+    self->bus_closed_pending = TRUE;
+    g_idle_add_full(G_PRIORITY_DEFAULT, on_bus_lost_idle,
+                    monitor_weak_ref_new(self), monitor_weak_ref_free);
+}
+
+static void on_bus_connected(GObject *source, GAsyncResult *res, gpointer user_data) {
     (void)source;
     GWeakRef *wr = user_data;
     g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
     monitor_weak_ref_free(wr);
 
     GError *err = NULL;
-    GDBusConnection *bus = g_bus_get_finish(res, &err);
-    if (!self || self->disposed || !bus) {
+    GDBusConnection *bus = g_dbus_connection_new_for_address_finish(res, &err);
+    if (!self || self->disposed) {
         if (bus) g_object_unref(bus);
         g_clear_error(&err);
         return;
     }
 
+    self->bus_get_in_flight = FALSE;
+    if (!bus) {
+        g_clear_error(&err);
+        schedule_bus_retry(self);
+        return;
+    }
+
+    self->bus_retry_attempt = 0;
+    self->bus_closed_pending = FALSE;
     self->bus = bus;
+    self->bus_closed_handler = g_signal_connect_data(
+        bus, "closed", G_CALLBACK(on_bus_closed),
+        monitor_weak_ref_new(self), bus_closed_closure_free, 0);
 
     self->sub_name_owner = g_dbus_connection_signal_subscribe(
         bus,
@@ -577,10 +609,60 @@ static void on_bus_ready(GObject *source, GAsyncResult *res, gpointer user_data)
     start_refresh(self);
 }
 
+static void request_bus(ConttestInputPlumberMonitor *self) {
+    if (!self || self->disposed || self->bus || self->bus_get_in_flight)
+        return;
+
+    GError *err = NULL;
+    g_autofree char *address =
+        g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SYSTEM, self->cancellable, &err);
+    if (!address) {
+        g_clear_error(&err);
+        schedule_bus_retry(self);
+        return;
+    }
+
+    self->bus_get_in_flight = TRUE;
+    g_dbus_connection_new_for_address(
+        address,
+        G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
+            G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
+        NULL, self->cancellable, on_bus_connected,
+        monitor_weak_ref_new(self));
+}
+
+static gboolean on_bus_retry_timeout(gpointer user_data) {
+    GWeakRef *wr = user_data;
+    g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
+    if (!self || self->disposed)
+        return G_SOURCE_REMOVE;
+    self->bus_retry_id = 0;
+    request_bus(self);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_bus_retry(ConttestInputPlumberMonitor *self) {
+    if (!self || self->disposed || self->bus || self->bus_retry_id)
+        return;
+
+    guint shift = MIN(self->bus_retry_attempt, 5u);
+    guint delay = MIN(IP_BUS_RETRY_MIN_MS << shift, IP_BUS_RETRY_MAX_MS);
+    if (self->bus_retry_attempt < 32)
+        self->bus_retry_attempt++;
+
+    self->bus_retry_id = g_timeout_add_full(
+        G_PRIORITY_DEFAULT, delay, on_bus_retry_timeout,
+        monitor_weak_ref_new(self), monitor_weak_ref_free);
+}
+
 static void conttest_inputplumber_monitor_dispose(GObject *object) {
     ConttestInputPlumberMonitor *self = CONTTEST_INPUTPLUMBER_MONITOR(object);
 
     self->disposed = TRUE;
+    if (self->bus_retry_id) {
+        g_source_remove(self->bus_retry_id);
+        self->bus_retry_id = 0;
+    }
     cancel_pending_refresh(self);
 
     if (self->cancellable) {
@@ -588,14 +670,22 @@ static void conttest_inputplumber_monitor_dispose(GObject *object) {
         g_clear_object(&self->cancellable);
     }
     if (self->bus) {
-        if (self->sub_name_owner)
-            g_dbus_connection_signal_unsubscribe(self->bus, self->sub_name_owner);
-        if (self->sub_iface_added)
-            g_dbus_connection_signal_unsubscribe(self->bus, self->sub_iface_added);
-        if (self->sub_iface_removed)
-            g_dbus_connection_signal_unsubscribe(self->bus, self->sub_iface_removed);
-        if (self->sub_props_changed)
-            g_dbus_connection_signal_unsubscribe(self->bus, self->sub_props_changed);
+        if (self->bus_closed_handler) {
+            g_signal_handler_disconnect(self->bus, self->bus_closed_handler);
+            self->bus_closed_handler = 0;
+        }
+        /* A closed connection has already dropped its subscriptions; calling
+         * unsubscribe then double-disconnects GDBus' internal handlers. */
+        if (!g_dbus_connection_is_closed(self->bus)) {
+            if (self->sub_name_owner)
+                g_dbus_connection_signal_unsubscribe(self->bus, self->sub_name_owner);
+            if (self->sub_iface_added)
+                g_dbus_connection_signal_unsubscribe(self->bus, self->sub_iface_added);
+            if (self->sub_iface_removed)
+                g_dbus_connection_signal_unsubscribe(self->bus, self->sub_iface_removed);
+            if (self->sub_props_changed)
+                g_dbus_connection_signal_unsubscribe(self->bus, self->sub_props_changed);
+        }
         self->sub_name_owner = self->sub_iface_added = self->sub_iface_removed = self->sub_props_changed = 0;
         g_clear_object(&self->bus);
     }
@@ -621,7 +711,7 @@ static void conttest_inputplumber_monitor_init(ConttestInputPlumberMonitor *self
     self->version_dirty = TRUE;
     self->candidates = g_ptr_array_new_with_free_func((GDestroyNotify)conttest_inputplumber_info_free);
     self->source_devnodes = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    g_bus_get(G_BUS_TYPE_SYSTEM, self->cancellable, on_bus_ready, monitor_weak_ref_new(self));
+    request_bus(self);
 }
 
 ConttestInputPlumberMonitor *conttest_inputplumber_monitor_new(void) {

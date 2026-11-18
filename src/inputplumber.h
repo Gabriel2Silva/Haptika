@@ -50,23 +50,9 @@ gboolean conttest_udev_device_probe_virtual(struct udev_device *dev,
                                             char **out_uniq,
                                             char **out_virtual_bus);
 
-/* Convenience wrapper opening syspath or devnode via udev. Performs
- * synchronous udev/sysfs lookups; call only from a worker thread or unit tests. */
-gboolean conttest_udev_probe_virtual(struct udev *udev,
-                                     const char *syspath,
-                                     const char *devnode,
-                                     char **out_uniq,
-                                     char **out_virtual_bus);
-
 /* Returns TRUE if an already-opened udev device carries an InputPlumber
  * hidden devlink (/dev/inputplumber/by-hidden/...). */
 gboolean conttest_udev_device_is_inputplumber_hidden(struct udev_device *dev);
-
-/* Convenience wrapper opening syspath or devnode via udev. Performs
- * synchronous udev/sysfs lookups; call only from a worker thread or unit tests. */
-gboolean conttest_udev_is_inputplumber_hidden(struct udev *udev,
-                                              const char *syspath,
-                                              const char *devnode);
 
 #define CONTTEST_TYPE_INPUTPLUMBER_MONITOR (conttest_inputplumber_monitor_get_type())
 G_DECLARE_FINAL_TYPE(ConttestInputPlumberMonitor, conttest_inputplumber_monitor,

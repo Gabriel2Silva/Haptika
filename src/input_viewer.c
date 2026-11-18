@@ -486,6 +486,19 @@ void conttest_input_viewer_refresh_device(ConttestInputViewer *self,
     sync_action_controls(self);
 }
 
+void conttest_input_viewer_session_lost(ConttestInputViewer *self,
+                                        ViewerSessionContext *ctx) {
+    g_return_if_fail(CONTTEST_IS_INPUT_VIEWER(self));
+    /* Ignore a late report from a session the user already left or replaced. */
+    if (!ctx || ctx != self->current_ctx || !self->active_session)
+        return;
+
+    ConttestWindow *window = self->window;
+    conttest_input_viewer_stop(self);
+    if (window)
+        conttest_window_handle_session_lost(window);
+}
+
 void conttest_input_viewer_stop(ConttestInputViewer *self) {
     if (self->sensors_enabled && self->rumble_sdl_id != 0) {
         SDL_Gamepad *gp = SDL_GetGamepadFromID(self->rumble_sdl_id);
@@ -714,8 +727,10 @@ gboolean conttest_input_viewer_drain_ring(gpointer data) {
                 apply_input_event(self, &ev);
         }
 
-        if (atomic_exchange_explicit(&ring->overflow, false, memory_order_relaxed)) {
-            g_debug("Evdev event ring overflowed; dropped excess events");
+        unsigned int dropped = conttest_event_ring_note_overflow(ring);
+        if (dropped > 0) {
+            g_debug("Evdev event ring overflowed; dropped %u event(s), resync requested",
+                    dropped);
         }
 
         /* Re-arm coalescing flag under seq_cst, then verify no producer pushed

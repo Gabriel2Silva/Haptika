@@ -92,6 +92,19 @@ static void test_ring_capacity_and_overflow(void) {
     ConttestInputEvent extra = { .type = INPUT_EVENT_BUTTON, .element_id = 999999 };
     g_assert_false(conttest_event_ring_push(&ring, &extra));
     g_assert_true(atomic_load(&ring.overflow));
+    g_assert_cmpuint(atomic_load(&ring.dropped), ==, 1u);
+
+    /* Further drops keep counting so the drain can report how much was lost. */
+    g_assert_false(conttest_event_ring_push(&ring, &extra));
+    g_assert_cmpuint(atomic_load(&ring.dropped), ==, 2u);
+
+    /* The consumer's overflow check reports the lost count and requests a
+     * backend resync, then clears both flags. */
+    g_assert_cmpuint(conttest_event_ring_note_overflow(&ring), ==, 2u);
+    g_assert_true(atomic_load(&ring.resync));
+    g_assert_false(atomic_load(&ring.overflow));
+    g_assert_cmpuint(atomic_load(&ring.dropped), ==, 0u);
+    g_assert_cmpuint(conttest_event_ring_note_overflow(&ring), ==, 0u);
 
     ConttestInputEvent out = {0};
     g_assert_true(conttest_event_ring_pop(&ring, &out));
@@ -224,6 +237,51 @@ static void test_evdev_axis_classification(void) {
         (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0 },
         (ConttestAbsAxisInfo){ .present = false },
         (ConttestAbsAxisInfo){ .present = false },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_false(z_rz_stick);
+    g_assert_false(rx_ry_trig);
+
+    /* Static range width: a wide Z/RZ pair against a narrow RX/RY pair marks
+     * Z/RZ as the stick even when both are held away from rest at open. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 32000, .value = 31000 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 32000, .value = 500 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0 },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_true(z_rz_stick);
+    g_assert_true(rx_ry_trig);
+
+    /* A deadzone on Z/RZ only resolves the same layout when ranges match,
+     * regardless of the values at open. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 240, .flat = 8 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 20, .flat = 8 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0, .flat = 0 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 0, .flat = 0 },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_true(z_rz_stick);
+    g_assert_true(rx_ry_trig);
+
+    /* DS3-style Z/RZ pair with a deadzone is a stick even off-centre. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 30, .flat = 8 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 220, .flat = 8 },
+        (ConttestAbsAxisInfo){ .present = false },
+        (ConttestAbsAxisInfo){ .present = false },
+        &z_rz_stick, &rx_ry_trig);
+    g_assert_true(z_rz_stick);
+    g_assert_false(rx_ry_trig);
+
+    /* Documented limitation: with identical ranges, no deadzone and both pairs
+     * held away from rest, the remaining rest-value heuristic cannot classify
+     * the layout. The default keeps RX/RY as the stick (hid-playstation, xpad),
+     * which is wrong only for the legacy hid-sony DS4 layout. */
+    conttest_evdev_classify_axes(
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 200 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 60 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 180 },
+        (ConttestAbsAxisInfo){ .present = true, .minimum = 0, .maximum = 255, .value = 70 },
         &z_rz_stick, &rx_ry_trig);
     g_assert_false(z_rz_stick);
     g_assert_false(rx_ry_trig);

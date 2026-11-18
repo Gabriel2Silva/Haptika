@@ -98,10 +98,13 @@ static void present_sdl_error_window(GtkApplication *app, const char *error_mess
     adw_status_page_set_icon_name(ADW_STATUS_PAGE(status), "dialog-error-symbolic");
     adw_status_page_set_title(ADW_STATUS_PAGE(status),
                               _("Failed to Initialize Controller Backend"));
-    adw_status_page_set_description(ADW_STATUS_PAGE(status),
-                                    (error_message && *error_message)
-                                        ? error_message
-                                        : _("SDL3 gamepad initialization failed."));
+    const char *message = (error_message && *error_message)
+        ? error_message
+        : _("SDL3 gamepad initialization failed.");
+    /* SDL error strings can contain markup characters; the description is
+     * Pango markup. */
+    g_autofree char *escaped = g_markup_escape_text(message, -1);
+    adw_status_page_set_description(ADW_STATUS_PAGE(status), escaped);
 
     GtkWidget *quit_btn = gtk_button_new_with_label(_("Quit"));
     gtk_widget_add_css_class(quit_btn, "pill");

@@ -14,6 +14,7 @@ G_DECLARE_FINAL_TYPE(ConttestWindow, conttest_window, CONTTEST, WINDOW, AdwAppli
 GtkWidget *conttest_window_new(GtkApplication *app);
 
 void conttest_window_show_selector(ConttestWindow *self);
+void conttest_window_handle_session_lost(ConttestWindow *self);
 void conttest_window_show_input_viewer(ConttestWindow *self, ConttestDevice *device, ConttestBackend backend);
 void conttest_window_show_toast(ConttestWindow *self, const char *message);
 void conttest_window_apply_theme(const char *style);

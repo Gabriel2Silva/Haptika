@@ -1,10 +1,10 @@
 project('haptika', 'c',
-  version: '1.0.0',
+  version: '2.0.0',
   license: 'GPL-3.0-or-later',
   meson_version: '>= 0.63.0',
   default_options: [
     'c_std=c11',
-    'warning_level=2'
+    'warning_level=3'
   ]
 )
 
@@ -28,7 +28,10 @@ evdev_dep = dependency('libevdev', version: '>=1.11.0')
 udev_dep = dependency('libudev', version: '>=249')
 threads_dep = dependency('threads')
 m_dep = cc.find_library('m', required : false)
-pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire'))
+# PipeWire and SPA headers are not warning-clean under -Wpedantic; keep them
+# out of the project's warning set.
+pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire'),
+  include_type: 'system')
 
 gnome = import('gnome')
 i18n = import('i18n')
@@ -44,6 +47,15 @@ config_h = configure_file(output: 'haptika-config.h', configuration: conf)
 resources = gnome.compile_resources('haptika-resources',
   'data/haptika.gresource.xml',
   source_dir: 'data',
+)
+
+# The embedded gresource blob exceeds the ISO C99 minimum string length. Keep
+# -Woverlength-strings active for project code and build the generated source
+# as its own translation unit with that warning disabled.
+resources_lib = static_library('haptika-resources', resources,
+  dependencies: [glib_dep, gio_dep],
+  c_args: ['-Wno-overlength-strings'],
+  install: false,
 )
 
 src_files = [
@@ -82,8 +94,9 @@ if pipewire_dep.found()
 endif
 
 executable('haptika',
-  src_files, resources, config_h,
+  src_files, config_h,
   dependencies: haptika_deps,
+  link_whole: resources_lib,
   include_directories: include_directories('.'),
   install: true
 )
@@ -102,6 +115,10 @@ install_data('data/icons/hicolor/scalable/apps/io.github.gabriel2silva.Haptika.s
 
 install_data('data/icons/hicolor/symbolic/apps/io.github.gabriel2silva.Haptika-symbolic.svg',
   install_dir: get_option('datadir') / 'icons/hicolor/symbolic/apps'
+)
+
+install_data('data/icons/NOTICE.md', 'data/icons/OFL.txt',
+  install_dir: get_option('datadir') / 'doc' / meson.project_name()
 )
 
 install_data('data/io.github.gabriel2silva.Haptika.gschema.xml',
@@ -165,6 +182,25 @@ test_device_match_exe = executable('unit_test_device_match',
   install: false,
 )
 test('unit-device-match', test_device_match_exe, suite: 'unit')
+
+test_device_manager_exe = executable('unit_test_device_manager',
+  ['tests/test_device_manager.c', 'src/device_manager.c',
+   'src/device_matching.c', 'src/inputplumber.c',
+   'src/inputplumber_logic.c'],
+  dependencies: [sdl3_dep, udev_dep, gio_dep, glib_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-device-manager', test_device_manager_exe, suite: 'unit')
+
+test_inputplumber_monitor_exe = executable('unit_test_inputplumber_monitor',
+  ['tests/test_inputplumber_monitor.c', 'src/inputplumber.c',
+   'src/inputplumber_logic.c'],
+  dependencies: [gio_dep, glib_dep, udev_dep],
+  include_directories: unit_inc,
+  install: false,
+)
+test('unit-inputplumber-monitor', test_inputplumber_monitor_exe, suite: 'unit')
 
 if pipewire_dep.found()
   test_speaker_exe = executable('unit_test_speaker',

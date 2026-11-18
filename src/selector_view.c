@@ -235,13 +235,16 @@ static void update_row_battery(RowContext *ctx, const ConttestDevice *device) {
     if (ctx->virtual_icon) {
         if (conttest_device_get_virtual_kind(device) == CONTTEST_VIRTUAL_INPUTPLUMBER) {
             const ConttestInputPlumberInfo *ip = conttest_device_get_inputplumber_info(device);
+            char *label = NULL;
             if (ip && ip->composite_name && *ip->composite_name) {
-                char *tip = g_strdup_printf(_("InputPlumber virtual device (%s)"), ip->composite_name);
-                gtk_widget_set_tooltip_text(ctx->virtual_icon, tip);
-                g_free(tip);
+                label = g_strdup_printf(_("InputPlumber virtual device (%s)"), ip->composite_name);
             } else {
-                gtk_widget_set_tooltip_text(ctx->virtual_icon, _("InputPlumber virtual device"));
+                label = g_strdup(_("InputPlumber virtual device"));
             }
+            gtk_widget_set_tooltip_text(ctx->virtual_icon, label);
+            gtk_accessible_update_property(GTK_ACCESSIBLE(ctx->virtual_icon),
+                                           GTK_ACCESSIBLE_PROPERTY_LABEL, label, -1);
+            g_free(label);
             gtk_widget_set_visible(ctx->virtual_icon, TRUE);
         } else {
             gtk_widget_set_visible(ctx->virtual_icon, FALSE);
@@ -251,10 +254,15 @@ static void update_row_battery(RowContext *ctx, const ConttestDevice *device) {
     if (ctx->connection_icon) {
         SDL_JoystickConnectionState conn = conttest_device_get_connection_state(device);
         if (conn != SDL_JOYSTICK_CONNECTION_UNKNOWN) {
-            const char *conn_icon = (conn == SDL_JOYSTICK_CONNECTION_WIRELESS)
+            gboolean wireless = (conn == SDL_JOYSTICK_CONNECTION_WIRELESS);
+            const char *conn_icon = wireless
                 ? "haptika-bluetooth-symbolic"
                 : "haptika-usb-symbolic";
             gtk_image_set_from_icon_name(GTK_IMAGE(ctx->connection_icon), conn_icon);
+            gtk_accessible_update_property(
+                GTK_ACCESSIBLE(ctx->connection_icon),
+                GTK_ACCESSIBLE_PROPERTY_LABEL,
+                wireless ? _("Connected via Bluetooth") : _("Connected via USB"), -1);
             gtk_widget_set_visible(ctx->connection_icon, TRUE);
         } else {
             gtk_widget_set_visible(ctx->connection_icon, FALSE);

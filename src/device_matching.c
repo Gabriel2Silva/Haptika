@@ -3,19 +3,6 @@
 #include <errno.h>
 #include <linux/input.h>
 #include <stdlib.h>
-#include <sys/stat.h>
-
-static struct udev_device *udev_device_from_devnode(struct udev *udev,
-                                                    const char *path) {
-    if (!udev || !path)
-        return NULL;
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        return udev_device_new_from_devnum(udev, S_ISBLK(st.st_mode) ? 'b' : 'c',
-                                           st.st_rdev);
-    }
-    return NULL;
-}
 
 gboolean conttest_vid_pid_is_ds3(uint16_t vid, uint16_t pid) {
     return vid == SONY_VID && pid == DS3_PID;
@@ -32,6 +19,16 @@ gboolean conttest_vid_pid_is_ds5(uint16_t vid, uint16_t pid) {
     return vid == SONY_VID &&
            (pid == DS5_PID_V1 ||
             pid == DS5_PID_V2);
+}
+
+int conttest_ds3_pressure_axis_index(uint16_t vid, uint16_t pid, int axis_index) {
+    if (!conttest_vid_pid_is_ds3(vid, pid))
+        return -1;
+    /* Indices 6..15 follow the standard gamepad axes: Cross, Circle, Square,
+     * Triangle, L1, R1, Up, Down, Left, Right. */
+    if (axis_index < 6 || axis_index > 15)
+        return -1;
+    return axis_index - 6;
 }
 
 gboolean conttest_parse_vid_pid(const char *str, char sep, uint16_t *v, uint16_t *p) {
@@ -101,6 +98,20 @@ gboolean conttest_extract_udev_vid_pid(struct udev_device *dev,
         if (h)
             conttest_parse_vid_pid(udev_device_get_property_value(h, "HID_ID"), ':',
                                    vid, pid);
+    }
+    /* Virtual input devices (uinput, remappers) carry no ID_VENDOR_ID/HID_ID
+     * properties; the kernel IDs on the input parent are the only identity. */
+    if (*vid == 0 || *pid == 0) {
+        struct udev_device *input =
+            udev_device_get_parent_with_subsystem_devtype(dev, "input", NULL);
+        const char *v = input
+            ? udev_device_get_sysattr_value(input, "id/vendor") : NULL;
+        const char *p = input
+            ? udev_device_get_sysattr_value(input, "id/product") : NULL;
+        if (*vid == 0 && v)
+            *vid = (uint16_t)g_ascii_strtoull(v, NULL, 16);
+        if (*pid == 0 && p)
+            *pid = (uint16_t)g_ascii_strtoull(p, NULL, 16);
     }
 
     return (*vid != 0 && *pid != 0);
@@ -179,29 +190,36 @@ gboolean conttest_hw_keys_match(const char *own_a,
     return FALSE;
 }
 
-gboolean conttest_udev_is_same_hardware(struct udev *udev,
-                                        const char *sdl_path,
-                                        const char *evdev_syspath) {
-    if (!udev || !sdl_path || !evdev_syspath)
-        return FALSE;
+int conttest_select_unique_candidate(const gboolean *matches,
+                                     const gboolean *preferred,
+                                     guint count) {
+    int live_index = -1;
+    guint live_count = 0;
+    int stale_index = -1;
+    guint stale_count = 0;
 
-    struct udev_device *u1 = udev_device_from_devnode(udev, sdl_path);
-    struct udev_device *u2 = udev_device_new_from_syspath(udev, evdev_syspath);
-    gboolean match = FALSE;
+    if (!matches)
+        return -1;
 
-    if (u1 && u2) {
-        g_autofree char *own1 = NULL;
-        g_autofree char *own2 = NULL;
-        g_auto(GStrv) keys1 = conttest_udev_collect_hw_keys(u1, &own1);
-        g_auto(GStrv) keys2 = conttest_udev_collect_hw_keys(u2, &own2);
-        match = conttest_hw_keys_match(own1, (const char * const *)keys1,
-                                       own2, (const char * const *)keys2);
+    for (guint i = 0; i < count; i++) {
+        if (!matches[i])
+            continue;
+        if (preferred && preferred[i]) {
+            live_index = (int)i;
+            live_count++;
+        } else {
+            stale_index = (int)i;
+            stale_count++;
+        }
     }
-    if (u1)
-        udev_device_unref(u1);
-    if (u2)
-        udev_device_unref(u2);
-    return match;
+
+    if (live_count == 1)
+        return live_index;
+    if (live_count > 1)
+        return -1;
+    if (stale_count == 1)
+        return stale_index;
+    return -1;
 }
 
 gboolean conttest_serial_is_usable(const char *serial) {
@@ -284,10 +302,12 @@ SDL_JoystickConnectionState conttest_resolve_connection_state_from_props(
         return SDL_JOYSTICK_CONNECTION_UNKNOWN;
     }
 
-    if (has_usb_parent)
-        return SDL_JOYSTICK_CONNECTION_WIRED;
+    /* A Bluetooth peripheral can sit above a USB Bluetooth adapter, so a
+     * Bluetooth link ancestor takes precedence over any USB parent. */
     if (has_bt_parent)
         return SDL_JOYSTICK_CONNECTION_WIRELESS;
+    if (has_usb_parent)
+        return SDL_JOYSTICK_CONNECTION_WIRED;
     return SDL_JOYSTICK_CONNECTION_UNKNOWN;
 }
 
@@ -306,32 +326,11 @@ SDL_JoystickConnectionState conttest_resolve_connection_state_for_udev_device(
     gboolean has_usb_parent = FALSE;
     gboolean has_bt_parent = FALSE;
     if (!bustype_str || !*bustype_str) {
+        /* Resolve both: the classifier prefers the Bluetooth link when a USB
+         * Bluetooth adapter also appears in the parent chain. */
+        has_bt_parent = udev_device_get_parent_with_subsystem_devtype(dev, "bluetooth", NULL) != NULL;
         has_usb_parent = udev_device_get_parent_with_subsystem_devtype(dev, "usb", NULL) != NULL;
-        if (!has_usb_parent)
-            has_bt_parent = udev_device_get_parent_with_subsystem_devtype(dev, "bluetooth", NULL) != NULL;
     }
 
     return conttest_resolve_connection_state_from_props(bustype_str, has_usb_parent, has_bt_parent);
-}
-
-SDL_JoystickConnectionState conttest_resolve_connection_state_udev(
-    struct udev *udev,
-    gboolean has_evdev,
-    const char *evdev_syspath,
-    const char *sdl_path) {
-    if (!udev)
-        return SDL_JOYSTICK_CONNECTION_UNKNOWN;
-
-    struct udev_device *dev = NULL;
-    if (has_evdev && evdev_syspath)
-        dev = udev_device_new_from_syspath(udev, evdev_syspath);
-    else if (sdl_path && *sdl_path)
-        dev = udev_device_from_devnode(udev, sdl_path);
-    if (!dev)
-        return SDL_JOYSTICK_CONNECTION_UNKNOWN;
-
-    SDL_JoystickConnectionState conn =
-        conttest_resolve_connection_state_for_udev_device(dev);
-    udev_device_unref(dev);
-    return conn;
 }

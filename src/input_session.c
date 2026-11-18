@@ -31,6 +31,7 @@ gboolean conttest_event_ring_push(ConttestEventRing *ring, const ConttestInputEv
 
     if (next == head) {
         atomic_store_explicit(&ring->overflow, true, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ring->dropped, 1u, memory_order_relaxed);
         return FALSE;
     }
 
@@ -52,6 +53,18 @@ gboolean conttest_event_ring_pop(ConttestEventRing *ring, ConttestInputEvent *ou
     return TRUE;
 }
 
+unsigned int conttest_event_ring_note_overflow(ConttestEventRing *ring) {
+    unsigned int dropped =
+        atomic_exchange_explicit(&ring->dropped, 0u, memory_order_relaxed);
+    atomic_store_explicit(&ring->overflow, false, memory_order_relaxed);
+    if (dropped > 0) {
+        /* The consumer side asks the backend to republish its state so a lost
+         * release cannot leave an indicator stuck. */
+        atomic_store_explicit(&ring->resync, true, memory_order_relaxed);
+    }
+    return dropped;
+}
+
 ViewerSessionContext *viewer_session_context_new(ConttestInputViewer *viewer) {
     void *mem = NULL;
     if (posix_memalign(&mem, 64, sizeof(ViewerSessionContext)) != 0 || !mem) {
@@ -71,6 +84,8 @@ ViewerSessionContext *viewer_session_context_new(ConttestInputViewer *viewer) {
     atomic_init(&ctx->ring.tail, 0u);
     atomic_init(&ctx->ring.overflow, false);
     atomic_init(&ctx->ring.scheduled, false);
+    atomic_init(&ctx->ring.resync, false);
+    atomic_init(&ctx->ring.dropped, 0u);
 
     GSource *src = g_source_new(&ring_drain_source_funcs, sizeof(GSource));
     g_source_set_priority(src, G_PRIORITY_DEFAULT);
@@ -112,6 +127,26 @@ static gboolean abs_is_nonneg(ConttestAbsAxisInfo a) {
     return a.present && a.minimum >= 0 && a.maximum > a.minimum;
 }
 
+static gboolean abs_has_deadzone(ConttestAbsAxisInfo a) {
+    return a.present && a.flat > 0;
+}
+
+static gboolean abs_pair_has_deadzone(ConttestAbsAxisInfo a, ConttestAbsAxisInfo b) {
+    return abs_has_deadzone(a) || abs_has_deadzone(b);
+}
+
+static int64_t abs_range_width(ConttestAbsAxisInfo a) {
+    if (!a.present || a.maximum <= a.minimum)
+        return 0;
+    return (int64_t)a.maximum - (int64_t)a.minimum;
+}
+
+static int64_t abs_pair_range_width(ConttestAbsAxisInfo a, ConttestAbsAxisInfo b) {
+    int64_t width_a = abs_range_width(a);
+    int64_t width_b = abs_range_width(b);
+    return width_a > width_b ? width_a : width_b;
+}
+
 static gboolean abs_is_at_minimum(ConttestAbsAxisInfo a) {
     if (!a.present || a.maximum <= a.minimum)
         return FALSE;
@@ -150,25 +185,38 @@ void conttest_evdev_classify_axes(ConttestAbsAxisInfo z,
             z_rz_stick = TRUE;
             rx_ry_trig = TRUE;
         } else {
-            gboolean rx_has_flat = (rx.present && rx.flat > 0) || (ry.present && ry.flat > 0);
-            gboolean z_has_flat  = (z.present && z.flat > 0)   || (rz.present && rz.flat > 0);
-            if (rx_has_flat && !z_has_flat) {
-                /* hid-playstation exposes flat deadzone on sticks only, not triggers. */
-            } else if (z_has_flat && !rx_has_flat) {
-                z_rz_stick = TRUE;
-                rx_ry_trig = TRUE;
-            } else if ((!z.present || abs_is_near_center(z)) &&
-                       (!rz.present || abs_is_near_center(rz)) &&
-                       (!rx.present || abs_is_at_minimum(rx)) &&
-                       (!ry.present || abs_is_at_minimum(ry))) {
-                /* hid-sony / generic HID DS4: Z/RZ rest at center, RX/RY rest at 0. */
-                z_rz_stick = TRUE;
-                rx_ry_trig = TRUE;
+            /* Static hints first: a deadzone marks a stick, and a wider range
+             * marks a stick against the narrower trigger range. The rest
+             * values are only consulted when both sides are indistinguishable,
+             * so holding an axis while plugging in cannot flip an otherwise
+             * statically resolved layout. */
+            gboolean z_has_flat  = abs_pair_has_deadzone(z, rz);
+            gboolean rx_has_flat = abs_pair_has_deadzone(rx, ry);
+            if (z_has_flat != rx_has_flat) {
+                z_rz_stick = z_has_flat;
+                rx_ry_trig = z_has_flat;
+            } else {
+                int64_t z_range  = abs_pair_range_width(z, rz);
+                int64_t rx_range = abs_pair_range_width(rx, ry);
+                if (z_range > 0 && rx_range > 0 && z_range != rx_range) {
+                    z_rz_stick = z_range > rx_range;
+                    rx_ry_trig = z_rz_stick;
+                } else if ((!z.present || abs_is_near_center(z)) &&
+                           (!rz.present || abs_is_near_center(rz)) &&
+                           (!rx.present || abs_is_at_minimum(rx)) &&
+                           (!ry.present || abs_is_at_minimum(ry))) {
+                    /* hid-sony / generic HID DS4: Z/RZ rest at center, RX/RY
+                     * rest at 0. Last resort when the driver exposes no static
+                     * difference between the two pairs. */
+                    z_rz_stick = TRUE;
+                    rx_ry_trig = TRUE;
+                }
             }
         }
     } else if (has_z_pair && !has_rx_pair) {
         /* E.g. DS3 via hid-sony exposes Z/RZ as right stick without RX/RY. */
         if (abs_is_signed_centered(z) || abs_is_signed_centered(rz) ||
+            abs_pair_has_deadzone(z, rz) ||
             ((!z.present || abs_is_near_center(z)) &&
              (!rz.present || abs_is_near_center(rz)))) {
             z_rz_stick = TRUE;

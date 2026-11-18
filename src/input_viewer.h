@@ -16,6 +16,12 @@ gboolean conttest_input_viewer_start(ConttestInputViewer *self, ConttestBackend 
 void conttest_input_viewer_refresh_device(ConttestInputViewer *self, const ConttestDevice *device);
 void conttest_input_viewer_stop(ConttestInputViewer *self);
 
+/* Called on the main loop when a backend reports that its device disappeared.
+ * Tears down the session if `ctx` is still current and asks the window to
+ * return to the selector. */
+void conttest_input_viewer_session_lost(ConttestInputViewer *self,
+                                        ViewerSessionContext *ctx);
+
 /* Apply a single input event directly. Only call from the main thread.
  * The SDL3 backend calls this directly since it already runs on the main thread.
  * The evdev backend pushes into the lock-free SPSC ring and coalesces

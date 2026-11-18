@@ -87,8 +87,12 @@ void controller_info_dialog_show_error(GtkWidget *toolbar_view,
     GtkWidget *status = adw_status_page_new();
     adw_status_page_set_icon_name(ADW_STATUS_PAGE(status), "dialog-error-symbolic");
     adw_status_page_set_title(ADW_STATUS_PAGE(status), title);
-    if (description && *description)
-        adw_status_page_set_description(ADW_STATUS_PAGE(status), description);
+    if (description && *description) {
+        /* Driver and device error text is untrusted; the description is Pango
+         * markup, so escape it to render literally. */
+        g_autofree char *escaped = g_markup_escape_text(description, -1);
+        adw_status_page_set_description(ADW_STATUS_PAGE(status), escaped);
+    }
     gtk_widget_add_css_class(status, "compact");
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar_view), status);
 
@@ -233,7 +237,14 @@ typedef struct {
     AdwDialog *dialog;
     GCancellable *cancellable;
     GAsyncReadyCallback user_callback;
+    guint timeout_id;
+    gboolean timed_out;
 } AsyncUiContext;
+
+/* HIDIOCGFEATURE/HIDIOCSFEATURE can block in the kernel driver and cannot be
+ * interrupted. Bound how long the dialog waits (and holds its reference) even
+ * though the worker thread may remain blocked until the driver returns. */
+#define CONTROLLER_INFO_FETCH_TIMEOUT_SEC 5
 
 static void cancel_and_unref(gpointer p) {
     GCancellable *c = G_CANCELLABLE(p);
@@ -245,6 +256,23 @@ static void async_fetch_data_free(gpointer p) {
     AsyncFetchData *d = p;
     g_free(d->evdev_syspath);
     g_free(d);
+}
+
+static gboolean on_fetch_timeout(gpointer user_data) {
+    AsyncUiContext *ui = user_data;
+    ui->timeout_id = 0;
+    ui->timed_out = TRUE;
+    g_cancellable_cancel(ui->cancellable);
+    if (ui->dialog) {
+        controller_info_dialog_show_error(
+            adw_dialog_get_child(ui->dialog),
+            _("Request Timed Out"),
+            _("The controller did not answer the hardware query in time."));
+        /* Release the dialog now; a worker stuck in the driver must not keep it
+         * alive after the user closes it. */
+        g_clear_object(&ui->dialog);
+    }
+    return G_SOURCE_REMOVE;
 }
 
 static void async_fetch_thread(GTask *task, gpointer source,
@@ -286,11 +314,16 @@ static void async_fetch_thread(GTask *task, gpointer source,
 
 static void on_async_task_done(GObject *source, GAsyncResult *result, gpointer user_data) {
     AsyncUiContext *ui = (AsyncUiContext *)user_data;
-    if (!g_cancellable_is_cancelled(ui->cancellable) && ui->user_callback)
+    if (ui->timeout_id) {
+        g_source_remove(ui->timeout_id);
+        ui->timeout_id = 0;
+    }
+    if (!ui->timed_out && ui->dialog &&
+        !g_cancellable_is_cancelled(ui->cancellable) && ui->user_callback)
         ui->user_callback(source, result, ui->dialog);
 
+    g_clear_object(&ui->dialog);
     g_object_unref(ui->cancellable);
-    g_object_unref(ui->dialog);
     g_free(ui);
 }
 
@@ -324,6 +357,10 @@ void controller_info_present_async_dialog(GtkWidget *parent,
     ui->dialog = g_object_ref(dialog);
     ui->cancellable = g_object_ref(cancellable);
     ui->user_callback = done_callback;
+    ui->timed_out = FALSE;
+    ui->timeout_id = g_timeout_add_seconds_full(G_PRIORITY_DEFAULT,
+                                                CONTROLLER_INFO_FETCH_TIMEOUT_SEC,
+                                                on_fetch_timeout, ui, NULL);
 
     GTask *task = g_task_new(NULL, cancellable, on_async_task_done, ui);
     g_task_set_task_data(task, td, async_fetch_data_free);

@@ -58,8 +58,8 @@ _Static_assert(_Alignof(ConttestInputEvent) == 16,
                "ConttestInputEvent must be 16-byte aligned");
 
 /* Fixed lock-free SPSC ring buffer (producer: evdev thread, consumer: main loop).
- * Explicit 64-byte padding cushions isolate `events`, `head`, `tail`, and
- * `scheduled` onto separate cache lines regardless of allocator alignment. */
+ * Explicit 64-byte padding cushions isolate `events`, `head`, `tail`, and the
+ * state flags onto separate cache lines regardless of allocator alignment. */
 #define CONTTEST_EVENT_RING_CAP 2048
 
 typedef struct {
@@ -69,10 +69,16 @@ typedef struct {
   uint8_t            pad_head[60];
   atomic_uint        tail;
   uint8_t            pad_tail[60];
-  atomic_bool        overflow;
-  atomic_bool        scheduled;
-  uint8_t            pad_state[62];
+  atomic_bool        overflow;   /* at least one event was dropped */
+  atomic_bool        scheduled;  /* main-thread drain is queued */
+  atomic_bool        resync;     /* consumer asks the backend to republish state */
+  uint8_t            pad_state[1];
+  atomic_uint        dropped;    /* events dropped since the last drain */
+  uint8_t            pad_dropped[56];
 } ConttestEventRing;
+
+_Static_assert(sizeof(ConttestEventRing) % 64 == 0,
+               "ring state must not share the events cache lines");
 
 struct _ViewerSessionContext {
   ConttestEventRing    ring;
@@ -85,6 +91,9 @@ struct _ViewerSessionContext {
 
 gboolean conttest_event_ring_push(ConttestEventRing *ring, const ConttestInputEvent *ev);
 gboolean conttest_event_ring_pop(ConttestEventRing *ring, ConttestInputEvent *out);
+/* Called by the consumer after draining. Returns how many events were dropped
+ * since the previous call and requests a backend state resync when any were. */
+unsigned int conttest_event_ring_note_overflow(ConttestEventRing *ring);
 void     conttest_event_ring_notify(ViewerSessionContext *ctx, GSourceFunc dispatch_func);
 
 ViewerSessionContext *viewer_session_context_new(ConttestInputViewer *viewer);
@@ -98,8 +107,13 @@ typedef struct {
   int32_t maximum;
   int32_t value;
   int32_t flat;
+  int32_t fuzz;
 } ConttestAbsAxisInfo;
 
+/* Decide the roles of the Z/RZ and RX/RY abs pairs. Signedness, deadzones and
+ * range widths decide statically where the driver exposes them; the rest values
+ * are a last resort for drivers that expose identical ranges and no deadzone.
+ * A device held off-centre at open can therefore only confuse that last case. */
 void conttest_evdev_classify_axes(ConttestAbsAxisInfo z,
                                   ConttestAbsAxisInfo rz,
                                   ConttestAbsAxisInfo rx,

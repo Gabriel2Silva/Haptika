@@ -1,4 +1,5 @@
 #include "input_session.h"
+#include "device_matching.h"
 #include "input_viewer.h"
 #include "device_manager.h"
 #include <SDL3/SDL.h>
@@ -10,11 +11,18 @@
 #define JOY_EXTRA_AXES_MAX     64
 #define TOUCHPAD_FINGERS_MAX   8
 #define AXIS_NOISE_EPSILON     (256.0 / 32768.0)
-/* Main-thread state sampling periods. GTK still paints on the frame clock;
- * active mapped windows sample at 1 kHz below GDK_PRIORITY_REDRAW so frame
- * painting is never starved, and suspended/unmapped windows back off to 50 ms. */
+/* Main-thread state sampling.
+ *
+ * Active input is sampled every millisecond so presses shorter than a display
+ * frame are not missed. After ~250 ms without any state change the sampler
+ * backs off to 4 ms, which still catches realistic presses well inside a frame
+ * and cuts idle wakeups by 4x; the first change restores the 1 ms rate.
+ * Suspended/unmapped windows back off to 50 ms. GTK paints on the frame clock,
+ * so rendering is never tied to the sampling rate. */
 #define SDL_POLL_ACTIVE_US     (1 * G_TIME_SPAN_MILLISECOND)
+#define SDL_POLL_IDLE_US       (4 * G_TIME_SPAN_MILLISECOND)
 #define SDL_POLL_SUSPENDED_US  (50 * G_TIME_SPAN_MILLISECOND)
+#define SDL_POLL_IDLE_TICKS    250
 #define SDL_POLL_PRIORITY      (GDK_PRIORITY_REDRAW + 5)
 
 static const struct {
@@ -82,10 +90,12 @@ typedef struct {
     uint8_t               sensors_probed;
     int                   joy_axis_base;
     int                   joy_extra_axes;
+    gboolean              joy_extra_unipolar[JOY_EXTRA_AXES_MAX];
     ViewerSessionContext *ctx;
     GSource              *poll_source;
     gint64                dispatch_time_us;
     gboolean              window_active;
+    guint                 idle_ticks;
     gboolean              btn_state[SDL_GAMEPAD_BUTTON_COUNT];
     double                axis_state[SDL_GAMEPAD_AXIS_COUNT];
     double                joy_axis_state[JOY_EXTRA_AXES_MAX];
@@ -135,8 +145,42 @@ static gboolean axis_value_changed(double prev, double next, double epsilon) {
 
 static void sdl3_poll_source_destroyed(gpointer user_data) {
     SdlSessionData *data = user_data;
+    /* The session keeps its own source reference until teardown, so the
+     * pointer in `data` stays valid even when the source removes itself. */
     viewer_session_context_unref(data->ctx);
     sdl_session_data_unref(data);
+}
+
+typedef struct {
+    ConttestInputViewer *viewer;
+    ViewerSessionContext *ctx;
+} SessionLostEvent;
+
+static gboolean session_lost_idle(gpointer user_data) {
+    SessionLostEvent *event = user_data;
+    conttest_input_viewer_session_lost(event->viewer, event->ctx);
+    return G_SOURCE_REMOVE;
+}
+
+static void session_lost_event_free(gpointer data) {
+    SessionLostEvent *event = data;
+    g_object_unref(event->viewer);
+    viewer_session_context_unref(event->ctx);
+    g_free(event);
+}
+
+/* The session cannot be torn down from inside the dispatch callback that
+ * detected the disconnect, so hand the loss to the viewer on the next
+ * main-loop iteration, once the source and its data are gone. */
+static void schedule_session_lost(SdlSessionData *data) {
+    ConttestInputViewer *viewer = data->ctx->viewer;
+    if (!viewer)
+        return;
+    SessionLostEvent *event = g_new(SessionLostEvent, 1);
+    event->viewer = g_object_ref(viewer);
+    event->ctx = viewer_session_context_ref(data->ctx);
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, session_lost_idle, event,
+                    session_lost_event_free);
 }
 
 static gboolean viewer_is_actively_visible(ConttestInputViewer *viewer) {
@@ -159,8 +203,10 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
         return G_SOURCE_REMOVE;
     }
 
-    if (!data->gamepad || !SDL_GamepadConnected(data->gamepad))
+    if (!data->gamepad || !SDL_GamepadConnected(data->gamepad)) {
+        schedule_session_lost(data);
         return G_SOURCE_REMOVE;
+    }
 
     ConttestInputViewer *viewer = data->ctx->viewer;
     if (!viewer)
@@ -172,6 +218,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
 
     conttest_sdl_pump_events_at(data->dispatch_time_us);
 
+    gboolean changed = FALSE;
     uint32_t btn_mask = data->button_mask;
     for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++) {
         if (!(btn_mask & (UINT32_C(1) << i)))
@@ -190,6 +237,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
             .button_pressed = (unsigned int)pressed,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
+        changed = TRUE;
     }
 
     uint8_t axis_mask = data->axis_mask;
@@ -212,6 +260,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
             .axis_value = (float)norm,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
+        changed = TRUE;
     }
 
     /* Poll raw joystick axes beyond standard gamepad axes (e.g. DS3 pressures). */
@@ -219,7 +268,13 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
     for (int i = 0; i < data->joy_extra_axes; i++) {
         int axis_idx = data->joy_axis_base + i;
         Sint16 raw   = SDL_GetJoystickAxis(data->joystick, axis_idx);
-        double norm  = CLAMP(((double)raw - (double)SDL_JOYSTICK_AXIS_MIN) / joy_span, 0.0, 1.0);
+        double norm;
+        if (data->joy_extra_unipolar[i])
+            norm = CLAMP(((double)raw - (double)SDL_JOYSTICK_AXIS_MIN) / joy_span, 0.0, 1.0);
+        else if (raw >= 0)
+            norm = (double)raw / (double)SDL_JOYSTICK_AXIS_MAX;
+        else
+            norm = (double)raw / (-(double)SDL_JOYSTICK_AXIS_MIN);
 
         if (!axis_value_changed(data->joy_axis_state[i], norm, AXIS_NOISE_EPSILON))
             continue;
@@ -232,6 +287,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
             .axis_value = (float)norm,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
+        changed = TRUE;
     }
 
     for (int f = 0; f < data->num_touchpad_fingers; f++) {
@@ -257,6 +313,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
                 .touch_y        = y,
             };
             conttest_input_viewer_apply_event(viewer, &ev);
+            changed = TRUE;
         }
     }
 
@@ -296,7 +353,14 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
             .sensor     = { vals[0], vals[1], vals[2] },
         };
         conttest_input_viewer_apply_event(viewer, &ev);
+        changed = TRUE;
     }
+
+    /* Back off only after a run of ticks that produced no state change. */
+    if (changed)
+        data->idle_ticks = 0;
+    else if (data->idle_ticks < SDL_POLL_IDLE_TICKS)
+        data->idle_ticks++;
 
     return G_SOURCE_CONTINUE;
 }
@@ -313,7 +377,13 @@ static gboolean sdl3_poll_source_dispatch(GSource *source,
         g_source_set_ready_time(source, -1);
         return G_SOURCE_REMOVE;
     }
-    gint64 delay = data->window_active ? SDL_POLL_ACTIVE_US : SDL_POLL_SUSPENDED_US;
+    gint64 delay;
+    if (!data->window_active)
+        delay = SDL_POLL_SUSPENDED_US;
+    else if (data->idle_ticks >= SDL_POLL_IDLE_TICKS)
+        delay = SDL_POLL_IDLE_US;
+    else
+        delay = SDL_POLL_ACTIVE_US;
     g_source_set_ready_time(source, now_us + delay);
     return G_SOURCE_CONTINUE;
 }
@@ -325,9 +395,11 @@ static GSourceFuncs sdl3_poll_source_funcs = {
 static void free_sdl3_session(ConttestInputSession *session) {
     SdlSessionData *data = session->impl_data;
     g_atomic_int_set(&data->stopped, 1);
-    if (data->poll_source) {
-        g_source_destroy(data->poll_source);
-        g_clear_pointer(&data->poll_source, g_source_unref);
+    GSource *src = data->poll_source;
+    if (src) {
+        g_source_destroy(src);
+        g_source_unref(src);
+        data->poll_source = NULL;
     }
     sdl_session_data_close_gamepad(data);
     sdl_session_data_unref(data);
@@ -425,13 +497,14 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
         num++;
     }
 
-    /* Extra raw joystick axes (e.g. DS3 pressure-sensitive buttons).
+    /* Extra raw joystick axes.
      *
-     * The Linux hid-sony.c kernel driver exposes 10 analog button pressures
-     * as joystick axes beyond the standard gamepad axes. SDL3 maps them
-     * starting at joystick axis index 6 (after LX, LY, RX, RY, L2, R2).
-     * Order matches the sixaxis_mapping GD Pointer usage indices in hid-sony.c:
-     *   Cross, Circle, Square, Triangle, L1, R1, Up, Down, Left, Right */
+     * The Linux hid-sony driver exposes 10 DualShock 3 button pressures as
+     * joystick axes beyond the standard gamepad axes, starting at index 6
+     * (after LX, LY, RX, RY, L2, R2). Order matches the sixaxis_mapping GD
+     * Pointer usage indices in hid-sony.c:
+     *   Cross, Circle, Square, Triangle, L1, R1, Up, Down, Left, Right
+     * Anything else keeps its native polarity and a neutral name. */
     static const char *ds3_pressure_names[] = {
         "✕", "○", "□", "△",
         "L1", "R1", "↑", "↓", "←", "→"
@@ -441,11 +514,16 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
         defs[num].domain     = CONTTEST_ELEMENT_SDL_EXTRA;
         defs[num].element_id = i;
         defs[num].is_axis    = TRUE;
-        defs[num].is_trigger = TRUE;
-        if (axis_idx >= 6 && axis_idx <= 15 && (axis_idx - 6) < (int)G_N_ELEMENTS(ds3_pressure_names))
-            defs[num].name = g_strdup(ds3_pressure_names[axis_idx - 6]);
-        else
+
+        int pressure = conttest_ds3_pressure_axis_index(vid, pid, axis_idx);
+        if (pressure >= 0 && pressure < (int)G_N_ELEMENTS(ds3_pressure_names)) {
+            data->joy_extra_unipolar[i] = TRUE;
+            defs[num].is_trigger = TRUE;
+            defs[num].name = g_strdup(ds3_pressure_names[pressure]);
+        } else {
+            defs[num].is_bipolar = TRUE;
             defs[num].name = g_strdup_printf("Axis %d", axis_idx);
+        }
         num++;
     }
 
@@ -469,6 +547,7 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
     viewer_session_context_ref(ctx);
     g_main_context_invoke(NULL, conttest_input_viewer_handle_layout, layout);
 
+    gboolean polling = FALSE;
     if (ctx->viewer) {
         GSource *src = g_source_new(&sdl3_poll_source_funcs, sizeof(GSource));
         g_source_set_priority(src, SDL_POLL_PRIORITY);
@@ -478,10 +557,19 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
         g_source_set_callback(src, sdl3_poll_timer, data, sdl3_poll_source_destroyed);
         g_source_set_ready_time(src, g_get_monotonic_time() + SDL_POLL_ACTIVE_US);
         data->poll_source = src;
-        if (g_source_attach(src, NULL) == 0) {
+        polling = g_source_attach(src, NULL) != 0;
+        if (!polling) {
             g_source_destroy(src);
-            g_clear_pointer(&data->poll_source, g_source_unref);
+            g_source_unref(src);
+            data->poll_source = NULL;
         }
+    }
+
+    if (!polling) {
+        /* Without a poll source the page would stay frozen; report the start
+         * failure so the viewer can fall back or return to the selector. */
+        conttest_input_session_stop(session);
+        return NULL;
     }
 
     return session;

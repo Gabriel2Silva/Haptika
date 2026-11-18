@@ -76,6 +76,9 @@ typedef gpointer (*ControllerInfoFetchFunc)(const char *path,
  * devnode via controller_info_find_hidraw_node() before invoking fetch_func;
  * otherwise evdev_syspath is passed directly to fetch_func.
  * Closing or destroying the dialog cancels the task and ignores late results.
+ * Hidraw feature ioctls cannot be interrupted, so the dialog also gives up
+ * after a few seconds and releases the dialog reference; a worker still blocked
+ * in the driver completes on its own and never touches the UI afterwards.
  * done_callback receives a borrowed AdwDialog* as user_data. */
 void controller_info_present_async_dialog(GtkWidget *parent,
                                           const char *title,

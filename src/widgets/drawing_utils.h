@@ -122,17 +122,4 @@ void conttest_snapshot_circular_indicator_cached(GtkWidget *widget,
                                                  float x,
                                                  float y);
 
-/**
- * conttest_snapshot_circular_indicator:
- *
- * Renders a GPU-accelerated circular crosshair indicator with a tethered,
- * clamped accent dot at normalized position (@x, @y) in [-1, 1].
- */
-void conttest_snapshot_circular_indicator(GtkWidget *widget,
-                                          GtkSnapshot *snapshot,
-                                          float canvas_w,
-                                          float canvas_h,
-                                          float x,
-                                          float y);
-
 G_END_DECLS

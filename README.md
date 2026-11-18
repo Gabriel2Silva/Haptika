@@ -1,4 +1,7 @@
-# Haptika
+# Haptika ![GitHub top language](https://img.shields.io/github/languages/top/Gabriel2Silva/Haptika)
+ <p align="center">
+  <img src="data/icons/hicolor/scalable/apps/io.github.gabriel2silva.Haptika.svg" width="128" height="128" alt="Haptika icon">
+</p>
 
 Haptika is a powerful gamepad tester for Linux. It tests and shows buttons (including
 pressure-sensitive buttons, such as DualShock 2/3), sticks, triggers, touchpads, motion

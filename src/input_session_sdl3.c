@@ -65,16 +65,26 @@ static const struct {
     { SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,  "R2",            TRUE,  FALSE, FALSE, -1 },
 };
 
+_Static_assert(SDL_GAMEPAD_BUTTON_COUNT <= 32,
+               "SDL_GamepadButton mask must fit in uint32_t");
+_Static_assert(SDL_GAMEPAD_AXIS_COUNT <= 8,
+               "SDL_GamepadAxis mask must fit in uint8_t");
+
 typedef struct {
     gint                  ref_count;     /* 1 for session + 1 while poll source is attached */
     gint                  stopped;       /* atomic boolean owned by SdlSessionData */
     SDL_JoystickID        sdl_id;
     SDL_Gamepad          *gamepad;       /* owned refcounted handle closed on cleanup */
     SDL_Joystick         *joystick;      /* borrowed from gamepad; valid until SDL_CloseGamepad */
+    uint32_t              button_mask;   /* static present-button bitmask */
+    uint8_t               axis_mask;     /* static present-axis bitmask */
+    uint8_t               sensor_mask;   /* bit 0 = ACCEL, bit 1 = GYRO */
+    uint8_t               sensors_probed;
     int                   joy_axis_base;
     int                   joy_extra_axes;
     ViewerSessionContext *ctx;
     GSource              *poll_source;
+    gint64                dispatch_time_us;
     gboolean              window_active;
     gboolean              btn_state[SDL_GAMEPAD_BUTTON_COUNT];
     double                axis_state[SDL_GAMEPAD_AXIS_COUNT];
@@ -160,12 +170,13 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
     if (!data->window_active)
         return G_SOURCE_CONTINUE;
 
-    conttest_sdl_pump_events();
+    conttest_sdl_pump_events_at(data->dispatch_time_us);
 
+    uint32_t btn_mask = data->button_mask;
     for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++) {
-        SDL_GamepadButton btn = (SDL_GamepadButton)i;
-        if (!SDL_GamepadHasButton(data->gamepad, btn))
+        if (!(btn_mask & (UINT32_C(1) << i)))
             continue;
+        SDL_GamepadButton btn = (SDL_GamepadButton)i;
 
         gboolean pressed = SDL_GetGamepadButton(data->gamepad, btn) != 0;
         if (pressed == data->btn_state[i])
@@ -176,15 +187,16 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
             .type           = INPUT_EVENT_BUTTON,
             .domain         = CONTTEST_ELEMENT_BUTTON,
             .element_id     = i,
-            .button_pressed = pressed,
+            .button_pressed = (unsigned int)pressed,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
     }
 
+    uint8_t axis_mask = data->axis_mask;
     for (int i = 0; i < SDL_GAMEPAD_AXIS_COUNT; i++) {
-        SDL_GamepadAxis axis = (SDL_GamepadAxis)i;
-        if (!SDL_GamepadHasAxis(data->gamepad, axis))
+        if (!(axis_mask & (1u << i)))
             continue;
+        SDL_GamepadAxis axis = (SDL_GamepadAxis)i;
 
         Sint16 raw = SDL_GetGamepadAxis(data->gamepad, axis);
         double norm = normalize_gamepad_axis(axis, raw);
@@ -197,7 +209,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
             .type       = INPUT_EVENT_AXIS,
             .domain     = CONTTEST_ELEMENT_SDL_AXIS,
             .element_id = i,
-            .axis_value = norm,
+            .axis_value = (float)norm,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
     }
@@ -217,7 +229,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
             .type       = INPUT_EVENT_AXIS,
             .domain     = CONTTEST_ELEMENT_SDL_EXTRA,
             .element_id = i,
-            .axis_value = norm,
+            .axis_value = (float)norm,
         };
         conttest_input_viewer_apply_event(viewer, &ev);
     }
@@ -240,7 +252,7 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
                 .type           = INPUT_EVENT_TOUCHPAD,
                 .domain         = CONTTEST_ELEMENT_TOUCHPAD_FINGER,
                 .element_id     = f,
-                .button_pressed = touched,
+                .button_pressed = (unsigned int)touched,
                 .touch_x        = x,
                 .touch_y        = y,
             };
@@ -249,11 +261,21 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
     }
 
     static const struct { SDL_SensorType type; ConttestSensorKind id; float eps; } sensors[] = {
-        { SDL_SENSOR_ACCEL, CONTTEST_SENSOR_ACCEL, 0.005f },
+        { SDL_SENSOR_ACCEL, CONTTEST_SENSOR_ACCEL, 0.015f },
         { SDL_SENSOR_GYRO,  CONTTEST_SENSOR_GYRO,  0.002f },
     };
+    if (G_UNLIKELY(!data->sensors_probed)) {
+        uint8_t smask = 0;
+        for (int s = 0; s < 2; s++) {
+            if (SDL_GamepadSensorEnabled(data->gamepad, sensors[s].type))
+                smask |= (uint8_t)(1u << s);
+        }
+        data->sensor_mask    = smask;
+        data->sensors_probed = 1;
+    }
+    uint8_t sensor_mask = data->sensor_mask;
     for (int s = 0; s < 2; s++) {
-        if (!SDL_GamepadSensorEnabled(data->gamepad, sensors[s].type))
+        if (!(sensor_mask & (1u << s)))
             continue;
         float vals[3] = {0};
         if (!SDL_GetGamepadSensorData(data->gamepad, sensors[s].type, vals, 3))
@@ -285,12 +307,14 @@ static gboolean sdl3_poll_source_dispatch(GSource *source,
     if (!callback)
         return G_SOURCE_REMOVE;
     SdlSessionData *data = user_data;
+    gint64 now_us = g_source_get_time(source);
+    data->dispatch_time_us = now_us;
     if (!callback(user_data)) {
         g_source_set_ready_time(source, -1);
         return G_SOURCE_REMOVE;
     }
     gint64 delay = data->window_active ? SDL_POLL_ACTIVE_US : SDL_POLL_SUSPENDED_US;
-    g_source_set_ready_time(source, g_source_get_time(source) + delay);
+    g_source_set_ready_time(source, now_us + delay);
     return G_SOURCE_CONTINUE;
 }
 
@@ -366,26 +390,32 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
                        (pid == DS5_PID_V1 || pid == DS5_PID_V2));
 
     for (size_t i = 0; i < G_N_ELEMENTS(SDL_BUTTONS); i++) {
-        if (!SDL_GamepadHasButton(gamepad, SDL_BUTTONS[i].btn)) continue;
+        SDL_GamepadButton btn = SDL_BUTTONS[i].btn;
+        if (!SDL_GamepadHasButton(gamepad, btn)) continue;
+        if ((int)btn >= 0 && (int)btn < SDL_GAMEPAD_BUTTON_COUNT)
+            data->button_mask |= (UINT32_C(1) << (unsigned int)btn);
         defs[num].domain     = CONTTEST_ELEMENT_BUTTON;
-        defs[num].element_id = SDL_BUTTONS[i].btn;
+        defs[num].element_id = btn;
 
         const char *name = SDL_BUTTONS[i].name;
         if (is_gc) {
-            if (SDL_BUTTONS[i].btn == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) name = "Z";
-            else if (SDL_BUTTONS[i].btn == SDL_GAMEPAD_BUTTON_MISC3)     name = "ZL Full Press";
-            else if (SDL_BUTTONS[i].btn == SDL_GAMEPAD_BUTTON_MISC4)     name = "ZR Full Press";
+            if (btn == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) name = "Z";
+            else if (btn == SDL_GAMEPAD_BUTTON_MISC3)     name = "ZL Full Press";
+            else if (btn == SDL_GAMEPAD_BUTTON_MISC4)     name = "ZR Full Press";
         } else if (is_ds5) {
-            if (SDL_BUTTONS[i].btn == SDL_GAMEPAD_BUTTON_MISC1)          name = "Mute Microphone";
+            if (btn == SDL_GAMEPAD_BUTTON_MISC1)          name = "Mute Microphone";
         }
         defs[num].name = g_strdup(name);
         num++;
     }
 
     for (size_t i = 0; i < G_N_ELEMENTS(SDL_AXES); i++) {
-        if (!SDL_GamepadHasAxis(gamepad, SDL_AXES[i].axis)) continue;
+        SDL_GamepadAxis axis = SDL_AXES[i].axis;
+        if (!SDL_GamepadHasAxis(gamepad, axis)) continue;
+        if ((int)axis >= 0 && (int)axis < SDL_GAMEPAD_AXIS_COUNT)
+            data->axis_mask |= (uint8_t)(1u << (unsigned int)axis);
         defs[num].domain     = CONTTEST_ELEMENT_SDL_AXIS;
-        defs[num].element_id = SDL_AXES[i].axis;
+        defs[num].element_id = axis;
         defs[num].name       = g_strdup(SDL_AXES[i].name);
         defs[num].is_axis    = TRUE;
         defs[num].is_trigger = SDL_AXES[i].is_trigger;

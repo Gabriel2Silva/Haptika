@@ -18,6 +18,10 @@ typedef struct {
 struct _ConttestTouchpad {
     GtkWidget           parent_instance;
     GtkWidget          *label;
+    GskPath            *plate_path;
+    GskStroke          *plate_stroke;
+    int                 cached_canvas_w;
+    int                 cached_canvas_h;
     int                 canvas_w;
     int                 canvas_h;
     TouchpadFingerState fingers[CONTTEST_TOUCHPAD_MAX_FINGERS];
@@ -27,6 +31,8 @@ G_DEFINE_TYPE(ConttestTouchpad, conttest_touchpad, GTK_TYPE_WIDGET)
 
 static void conttest_touchpad_dispose(GObject *object) {
     ConttestTouchpad *self = CONTTEST_TOUCHPAD(object);
+    g_clear_pointer(&self->plate_path, gsk_path_unref);
+    g_clear_pointer(&self->plate_stroke, gsk_stroke_free);
     g_clear_pointer(&self->label, gtk_widget_unparent);
     G_OBJECT_CLASS(conttest_touchpad_parent_class)->dispose(object);
 }
@@ -76,26 +82,33 @@ static void conttest_touchpad_snapshot(GtkWidget *widget, GtkSnapshot *snapshot)
         conttest_widget_get_accent_color(&accent);
         gboolean hc = conttest_widget_get_high_contrast();
 
-        GskRoundedRect rr;
-        gsk_rounded_rect_init_from_rect(&rr,
-                                        &GRAPHENE_RECT_INIT(x0, y0, plate_w, plate_h),
-                                        r);
+        if (!self->plate_stroke)
+            self->plate_stroke = gsk_stroke_new(1.5f);
 
-        g_autoptr(GskPathBuilder) plate_builder = gsk_path_builder_new();
-        gsk_path_builder_add_rounded_rect(plate_builder, &rr);
-        g_autoptr(GskPath) plate_path =
-            gsk_path_builder_free_to_path(g_steal_pointer(&plate_builder));
+        if (!self->plate_path ||
+            self->cached_canvas_w != self->canvas_w ||
+            self->cached_canvas_h != self->canvas_h) {
+            g_clear_pointer(&self->plate_path, gsk_path_unref);
+            GskRoundedRect rr;
+            gsk_rounded_rect_init_from_rect(&rr,
+                                            &GRAPHENE_RECT_INIT(x0, y0, plate_w, plate_h),
+                                            r);
+            GskPathBuilder *plate_builder = gsk_path_builder_new();
+            gsk_path_builder_add_rounded_rect(plate_builder, &rr);
+            self->plate_path = gsk_path_builder_free_to_path(plate_builder);
+            self->cached_canvas_w = self->canvas_w;
+            self->cached_canvas_h = self->canvas_h;
+        }
 
         GdkRGBA fill_col = fg;
         fill_col.alpha *= hc ? 0.16f : 0.10f;
-        gtk_snapshot_append_fill(snapshot, plate_path, GSK_FILL_RULE_WINDING, &fill_col);
+        gtk_snapshot_append_fill(snapshot, self->plate_path, GSK_FILL_RULE_WINDING, &fill_col);
 
         GdkRGBA stroke_col = fg;
         stroke_col.alpha *= hc ? 0.60f : 0.35f;
-        g_autoptr(GskStroke) border_stroke = gsk_stroke_new(1.5f);
-        gtk_snapshot_append_stroke(snapshot, plate_path, border_stroke, &stroke_col);
+        gtk_snapshot_append_stroke(snapshot, self->plate_path, self->plate_stroke, &stroke_col);
 
-        /* Active touch contacts (multi-finger) */
+        /* Active touch contacts (multi-finger): GPU rounded-rect clips & borders */
         float dot_r = MIN(plate_w, plate_h) * 0.12f;
         for (guint i = 0; i < CONTTEST_TOUCHPAD_MAX_FINGERS; i++) {
             const TouchpadFingerState *finger = &self->fingers[i];
@@ -105,34 +118,47 @@ static void conttest_touchpad_snapshot(GtkWidget *widget, GtkSnapshot *snapshot)
             float cx = x0 + dot_r + finger->x * (plate_w - dot_r * 2.0f);
             float cy = y0 + dot_r + finger->y * (plate_h - dot_r * 2.0f);
 
-            g_autoptr(GskPathBuilder) dot_builder = gsk_path_builder_new();
-            gsk_path_builder_add_circle(dot_builder,
-                                        &GRAPHENE_POINT_INIT(cx, cy),
-                                        dot_r);
-            g_autoptr(GskPath) dot_path =
-                gsk_path_builder_free_to_path(g_steal_pointer(&dot_builder));
+            GskRoundedRect dot_rr;
+            gsk_rounded_rect_init_from_rect(
+                &dot_rr,
+                &GRAPHENE_RECT_INIT(cx - dot_r, cy - dot_r,
+                                    dot_r * 2.0f, dot_r * 2.0f),
+                dot_r);
 
             GdkRGBA dot_col = accent;
             dot_col.alpha *= (i == 0) ? 0.85f : 0.65f;
-            gtk_snapshot_append_fill(snapshot, dot_path, GSK_FILL_RULE_WINDING, &dot_col);
+            gtk_snapshot_push_rounded_clip(snapshot, &dot_rr);
+            gtk_snapshot_append_color(snapshot, &dot_col, &dot_rr.bounds);
+            gtk_snapshot_pop(snapshot);
 
+            float sw = (i == 0) ? 1.5f : 2.0f;
+            float ring_outer_r = dot_r + sw * 0.5f;
+            GskRoundedRect ring_rr;
+            gsk_rounded_rect_init_from_rect(
+                &ring_rr,
+                &GRAPHENE_RECT_INIT(cx - ring_outer_r, cy - ring_outer_r,
+                                    ring_outer_r * 2.0f, ring_outer_r * 2.0f),
+                ring_outer_r);
             GdkRGBA ring_col = (i == 0) ? fg : accent;
             ring_col.alpha *= (i == 0) ? (hc ? 0.85f : 0.28f) : 0.95f;
-            g_autoptr(GskStroke) dot_stroke = gsk_stroke_new((i == 0) ? 1.5f : 2.0f);
-            gtk_snapshot_append_stroke(snapshot, dot_path, dot_stroke, &ring_col);
+            const float ring_widths[4] = { sw, sw, sw, sw };
+            const GdkRGBA ring_colors[4] = { ring_col, ring_col, ring_col, ring_col };
+            gtk_snapshot_append_border(snapshot, &ring_rr, ring_widths, ring_colors);
 
             if (i > 0) {
                 /* Secondary contacts get an outer concentric halo for quick disambiguation */
-                g_autoptr(GskPathBuilder) halo_builder = gsk_path_builder_new();
-                gsk_path_builder_add_circle(halo_builder,
-                                            &GRAPHENE_POINT_INIT(cx, cy),
-                                            dot_r + 3.0f);
-                g_autoptr(GskPath) halo_path =
-                    gsk_path_builder_free_to_path(g_steal_pointer(&halo_builder));
+                float halo_outer_r = dot_r + 3.5f;
+                GskRoundedRect halo_rr;
+                gsk_rounded_rect_init_from_rect(
+                    &halo_rr,
+                    &GRAPHENE_RECT_INIT(cx - halo_outer_r, cy - halo_outer_r,
+                                        halo_outer_r * 2.0f, halo_outer_r * 2.0f),
+                    halo_outer_r);
                 GdkRGBA halo_col = accent;
                 halo_col.alpha *= 0.45f;
-                g_autoptr(GskStroke) halo_stroke = gsk_stroke_new(1.0f);
-                gtk_snapshot_append_stroke(snapshot, halo_path, halo_stroke, &halo_col);
+                const float halo_widths[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+                const GdkRGBA halo_colors[4] = { halo_col, halo_col, halo_col, halo_col };
+                gtk_snapshot_append_border(snapshot, &halo_rr, halo_widths, halo_colors);
             }
         }
     }

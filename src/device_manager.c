@@ -19,9 +19,37 @@
  * active SDL3 session's 1 kHz poll source. */
 static gint64 last_sdl_pump_us = 0;
 
-void conttest_sdl_pump_events(void) {
+void conttest_sdl_configure_events(void) {
+  static const Uint32 unused_high_rate_events[] = {
+    SDL_EVENT_GAMEPAD_AXIS_MOTION,
+    SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+    SDL_EVENT_GAMEPAD_BUTTON_UP,
+    SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN,
+    SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION,
+    SDL_EVENT_GAMEPAD_TOUCHPAD_UP,
+    SDL_EVENT_GAMEPAD_SENSOR_UPDATE,
+    SDL_EVENT_GAMEPAD_UPDATE_COMPLETE,
+    SDL_EVENT_JOYSTICK_AXIS_MOTION,
+    SDL_EVENT_JOYSTICK_BUTTON_DOWN,
+    SDL_EVENT_JOYSTICK_BUTTON_UP,
+    SDL_EVENT_JOYSTICK_HAT_MOTION,
+    SDL_EVENT_JOYSTICK_BALL_MOTION,
+    SDL_EVENT_JOYSTICK_UPDATE_COMPLETE,
+  };
+  for (gsize i = 0; i < G_N_ELEMENTS(unused_high_rate_events); i++) {
+    SDL_SetEventEnabled(unused_high_rate_events[i], false);
+  }
+}
+
+void conttest_sdl_pump_events_at(gint64 monotonic_now_us) {
   SDL_PumpEvents();
-  last_sdl_pump_us = g_get_monotonic_time();
+  last_sdl_pump_us = (monotonic_now_us > 0)
+      ? monotonic_now_us
+      : g_get_monotonic_time();
+}
+
+void conttest_sdl_pump_events(void) {
+  conttest_sdl_pump_events_at(g_get_monotonic_time());
 }
 
 typedef enum {
@@ -1988,30 +2016,34 @@ static void poll_sdl_events(ConttestDeviceManager *self, gboolean force_pump) {
   gint64 now = g_get_monotonic_time();
   if (force_pump || last_sdl_pump_us == 0 ||
       (now - last_sdl_pump_us) >= SDL_PUMP_COALESCE_US) {
-    conttest_sdl_pump_events();
+    conttest_sdl_pump_events_at(now);
   }
 
   gboolean sdl_hotplug = FALSE;
-  SDL_Event event;
-  /* Drain the entire SDL event queue each tick: axis, joystick, sensor, and
-   * battery events would otherwise accumulate up to SDL's 65,535-event cap
-   * and cause future GAMEPAD_ADDED / GAMEPAD_REMOVED events to be dropped. */
+  SDL_Event events[64];
+  int n_events;
+  /* Drain the SDL event queue in batches so miscellaneous SDL events cannot
+   * accumulate up to SDL's 65,535-event cap. */
   while (!self->disposed && self->devices &&
-         SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_FIRST,
-                        SDL_EVENT_LAST) > 0) {
-    if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
-      if (!find_device_by_sdl_id(self, event.gdevice.which)) {
+         (n_events = SDL_PeepEvents(events, (int)G_N_ELEMENTS(events),
+                                    SDL_GETEVENT, SDL_EVENT_FIRST,
+                                    SDL_EVENT_LAST)) > 0) {
+    for (int i = 0; i < n_events && !self->disposed && self->devices; i++) {
+      const SDL_Event *event = &events[i];
+      if (event->type == SDL_EVENT_GAMEPAD_ADDED) {
+        if (!find_device_by_sdl_id(self, event->gdevice.which)) {
+          sdl_hotplug = TRUE;
+          handle_sdl_added(self, event->gdevice.which);
+        }
+      } else if (event->type == SDL_EVENT_GAMEPAD_REMOVED) {
         sdl_hotplug = TRUE;
-        handle_sdl_added(self, event.gdevice.which);
-      }
-    } else if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
-      sdl_hotplug = TRUE;
-      handle_sdl_removed(self, event.gdevice.which);
-    } else if (event.type == SDL_EVENT_JOYSTICK_BATTERY_UPDATED) {
-      ConttestDevice *d = find_device_by_sdl_id(self, event.jbattery.which);
-      if (d && !d->hidden && device_poll_battery(self, d)) {
-        g_autoptr(ConttestDevice) keep = g_object_ref(d);
-        g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, keep);
+        handle_sdl_removed(self, event->gdevice.which);
+      } else if (event->type == SDL_EVENT_JOYSTICK_BATTERY_UPDATED) {
+        ConttestDevice *d = find_device_by_sdl_id(self, event->jbattery.which);
+        if (d && !d->hidden && device_poll_battery(self, d)) {
+          g_autoptr(ConttestDevice) keep = g_object_ref(d);
+          g_signal_emit(self, signals[SIGNAL_DEVICE_UPDATED], 0, keep);
+        }
       }
     }
   }
@@ -2020,18 +2052,30 @@ static void poll_sdl_events(ConttestDeviceManager *self, gboolean force_pump) {
     return;
 
   /* Safety net: detach any open SDL gamepad that SDL now reports disconnected
-   * even if no removal event remained in the queue. */
-  g_autoptr(GPtrArray) snapshot = snapshot_devices(self);
-  for (guint i = 0; i < snapshot->len; i++) {
-    if (self->disposed || !self->devices)
-      return;
-    ConttestDevice *d = g_ptr_array_index(snapshot, i);
-    if (!g_ptr_array_find(self->devices, d, NULL))
-      continue;
+   * even if no removal event remained in the queue. Scan read-only first so
+   * the steady-state 20 Hz tick performs zero heap allocations or ref churn. */
+  gboolean has_disconnected_sdl = FALSE;
+  for (guint i = 0; i < self->devices->len; i++) {
+    ConttestDevice *d = g_ptr_array_index(self->devices, i);
     if (d->has_sdl && d->sdl_gamepad && !SDL_GamepadConnected(d->sdl_gamepad)) {
-      sdl_hotplug = TRUE;
-      device_detach_sdl(d);
-      check_empty_and_remove(self, d);
+      has_disconnected_sdl = TRUE;
+      break;
+    }
+  }
+
+  if (has_disconnected_sdl) {
+    g_autoptr(GPtrArray) snapshot = snapshot_devices(self);
+    for (guint i = 0; i < snapshot->len; i++) {
+      if (self->disposed || !self->devices)
+        return;
+      ConttestDevice *d = g_ptr_array_index(snapshot, i);
+      if (!g_ptr_array_find(self->devices, d, NULL))
+        continue;
+      if (d->has_sdl && d->sdl_gamepad && !SDL_GamepadConnected(d->sdl_gamepad)) {
+        sdl_hotplug = TRUE;
+        device_detach_sdl(d);
+        check_empty_and_remove(self, d);
+      }
     }
   }
 
@@ -2333,6 +2377,9 @@ static void conttest_device_manager_init(ConttestDeviceManager *self) {
       manager_weak_ref_new(self), manager_weak_ref_free);
 
   /* Initial SDL scan */
+  if (SDL_WasInit(SDL_INIT_GAMEPAD)) {
+    conttest_sdl_configure_events();
+  }
   int count = 0;
   SDL_JoystickID *gamepads = SDL_GetGamepads(&count);
   if (gamepads) {

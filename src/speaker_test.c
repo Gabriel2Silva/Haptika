@@ -541,6 +541,13 @@ static void on_state_changed(void *userdata, enum pw_stream_state old,
                 : g_strdup(_("PipeWire stream error."));
         }
         pw_main_loop_quit(ctx->loop);
+    } else if (state == PW_STREAM_STATE_STREAMING && !ctx->started_streaming) {
+        ctx->started_streaming = TRUE;
+        if (ctx->timeout_src) {
+            struct timespec play_timeout = { .tv_sec = PLAYBACK_TIMEOUT_SEC, .tv_nsec = 0 };
+            struct timespec zero = { 0, 0 };
+            pw_loop_update_timer(ctx->pw_loop, ctx->timeout_src, &play_timeout, &zero, false);
+        }
     } else if (state == PW_STREAM_STATE_UNCONNECTED && old != PW_STREAM_STATE_UNCONNECTED) {
         if (!ctx->error && !ctx->drained) {
             ctx->error = g_strdup(_("Controller speaker became unavailable."));
@@ -676,14 +683,7 @@ static void on_process(void *userdata) {
         return;
     }
 
-    if (!ctx->started_streaming) {
-        ctx->started_streaming = TRUE;
-        if (ctx->timeout_src) {
-            struct timespec play_timeout = { .tv_sec = PLAYBACK_TIMEOUT_SEC, .tv_nsec = 0 };
-            struct timespec zero = { 0, 0 };
-            pw_loop_update_timer(ctx->pw_loop, ctx->timeout_src, &play_timeout, &zero, false);
-        }
-    }
+    ctx->started_streaming = TRUE;
 
     float *dst = buf->datas[0].data;
     if (channels == 1) {

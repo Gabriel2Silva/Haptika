@@ -487,6 +487,74 @@ static void test_serial_and_candidate_corroboration(void) {
         ==, CONTTEST_MATCH_WEAK);
 }
 
+static void test_inputplumber_dbus_signal_filtering(void) {
+    gboolean ver_inv = FALSE;
+
+    /* PropertiesChanged: relevant non-manager interfaces */
+    GVariant *pc_comp = g_variant_ref_sink(g_variant_new("(sa{sv}as)",
+        "org.shadowblip.Input.CompositeDevice", NULL, NULL));
+    g_assert_true(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.Properties", "PropertiesChanged", pc_comp, &ver_inv));
+    g_assert_false(ver_inv);
+    g_variant_unref(pc_comp);
+
+    /* PropertiesChanged: InputManager marks version invalidated */
+    GVariant *pc_mgr = g_variant_ref_sink(g_variant_new("(sa{sv}as)",
+        "org.shadowblip.InputManager", NULL, NULL));
+    g_assert_true(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.Properties", "PropertiesChanged", pc_mgr, &ver_inv));
+    g_assert_true(ver_inv);
+    g_variant_unref(pc_mgr);
+
+    /* PropertiesChanged: high-rate unrelated DBus target / gamepad interfaces rejected */
+    GVariant *pc_dbus = g_variant_ref_sink(g_variant_new("(sa{sv}as)",
+        "org.shadowblip.Input.DBusDevice", NULL, NULL));
+    g_assert_false(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.Properties", "PropertiesChanged", pc_dbus, &ver_inv));
+    g_assert_false(ver_inv);
+    g_variant_unref(pc_dbus);
+
+    /* InterfacesAdded: relevant vs irrelevant */
+    GVariantBuilder added_rel;
+    g_variant_builder_init(&added_rel, G_VARIANT_TYPE("a{sa{sv}}"));
+    g_variant_builder_add(&added_rel, "{sa{sv}}", "org.shadowblip.Input.Target", NULL);
+    GVariant *ia_rel = g_variant_ref_sink(g_variant_new("(o@a{sa{sv}})",
+        "/org/shadowblip/InputPlumber/devices/target0", g_variant_builder_end(&added_rel)));
+    g_assert_true(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.ObjectManager", "InterfacesAdded", ia_rel, &ver_inv));
+    g_assert_false(ver_inv);
+    g_variant_unref(ia_rel);
+
+    GVariantBuilder added_irrel;
+    g_variant_builder_init(&added_irrel, G_VARIANT_TYPE("a{sa{sv}}"));
+    g_variant_builder_add(&added_irrel, "{sa{sv}}", "org.shadowblip.Input.DBusDevice", NULL);
+    GVariant *ia_irrel = g_variant_ref_sink(g_variant_new("(o@a{sa{sv}})",
+        "/org/shadowblip/InputPlumber/devices/dbus0", g_variant_builder_end(&added_irrel)));
+    g_assert_false(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.ObjectManager", "InterfacesAdded", ia_irrel, &ver_inv));
+    g_variant_unref(ia_irrel);
+
+    /* InterfacesRemoved: relevant vs irrelevant */
+    const char *rem_rel_list[] = { "org.shadowblip.Input.Source.UdevDevice", NULL };
+    GVariant *ir_rel = g_variant_ref_sink(g_variant_new("(o^as)",
+        "/org/shadowblip/InputPlumber/devices/source0", rem_rel_list));
+    g_assert_true(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.ObjectManager", "InterfacesRemoved", ir_rel, &ver_inv));
+    g_variant_unref(ir_rel);
+
+    const char *rem_irrel_list[] = { "org.shadowblip.Input.Gamepad", NULL };
+    GVariant *ir_irrel = g_variant_ref_sink(g_variant_new("(o^as)",
+        "/org/shadowblip/InputPlumber/devices/dbus0", rem_irrel_list));
+    g_assert_false(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.ObjectManager", "InterfacesRemoved", ir_irrel, &ver_inv));
+    g_variant_unref(ir_irrel);
+
+    /* Malformed / NULL inputs handled safely */
+    g_assert_false(conttest_inputplumber_dbus_signal_is_relevant(NULL, "PropertiesChanged", NULL, &ver_inv));
+    g_assert_false(conttest_inputplumber_dbus_signal_is_relevant(
+        "org.freedesktop.DBus.Properties", "PropertiesChanged", NULL, &ver_inv));
+}
+
 int main(int argc, char *argv[]) {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/device_match/vid_pid_predicates_and_parsing",
@@ -497,6 +565,8 @@ int main(int argc, char *argv[]) {
                     test_inputplumber_fnv1a_and_mac_uniq);
     g_test_add_func("/device_match/inputplumber_managed_objects_and_matching",
                     test_inputplumber_managed_objects_and_matching);
+    g_test_add_func("/device_match/inputplumber_dbus_signal_filtering",
+                    test_inputplumber_dbus_signal_filtering);
     g_test_add_func("/device_match/hw_keys_matching",
                     test_hw_keys_matching);
     g_test_add_func("/device_match/serial_and_candidate_corroboration",

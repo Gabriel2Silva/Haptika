@@ -4,6 +4,7 @@
 #include <SDL3/SDL.h>
 #include <stdlib.h>
 #include "window.h"
+#include "device_manager.h"
 #include "haptika-config.h"
 
 typedef struct {
@@ -50,6 +51,7 @@ static void on_startup(GtkApplication *app, gpointer user_data) {
         g_critical("Failed to initialize SDL3: %s", state->sdl_error);
     } else {
         state->sdl_initialized = TRUE;
+        conttest_sdl_configure_events();
 
         /* Custom mappings for devices SDL doesn't recognize out of the box. */
         SDL_AddGamepadMapping("03000000ff000000cb01000010010000,Sony PlayStation Portable,"

@@ -21,13 +21,21 @@ struct _ConttestTriggerBar {
 
 G_DEFINE_TYPE(ConttestTriggerBar, conttest_trigger_bar, GTK_TYPE_WIDGET)
 
-static void update_accessible_value(ConttestTriggerBar *self) {
+static void init_accessible_range(ConttestTriggerBar *self) {
     double vmin = self->bipolar ? -1.0 : 0.0;
     double vmax = 1.0;
     double vnow = !isfinite(self->value) ? 0.0 : CLAMP(self->value, vmin, vmax);
     gtk_accessible_update_property(GTK_ACCESSIBLE(self),
                                    GTK_ACCESSIBLE_PROPERTY_VALUE_MIN, vmin,
                                    GTK_ACCESSIBLE_PROPERTY_VALUE_MAX, vmax,
+                                   GTK_ACCESSIBLE_PROPERTY_VALUE_NOW, vnow,
+                                   -1);
+}
+
+static void update_accessible_value_now(ConttestTriggerBar *self) {
+    double vmin = self->bipolar ? -1.0 : 0.0;
+    double vnow = !isfinite(self->value) ? 0.0 : CLAMP(self->value, vmin, 1.0);
+    gtk_accessible_update_property(GTK_ACCESSIBLE(self),
                                    GTK_ACCESSIBLE_PROPERTY_VALUE_NOW, vnow,
                                    -1);
 }
@@ -89,26 +97,14 @@ static void conttest_trigger_bar_snapshot(GtkWidget *widget, GtkSnapshot *snapsh
                                         &GRAPHENE_RECT_INIT(x0, y0, bar_w, bar_h),
                                         radius);
 
-        g_autoptr(GskPathBuilder) track_builder = gsk_path_builder_new();
-        gsk_path_builder_add_rounded_rect(track_builder, &track_rr);
-        g_autoptr(GskPath) track_path =
-            gsk_path_builder_free_to_path(g_steal_pointer(&track_builder));
-
         GdkRGBA track_col = fg;
         track_col.alpha *= hc ? 0.22f : 0.14f;
-        gtk_snapshot_append_fill(snapshot, track_path, GSK_FILL_RULE_WINDING, &track_col);
-
-        if (hc) {
-            GdkRGBA rim_col = fg;
-            rim_col.alpha *= 0.55f;
-            g_autoptr(GskStroke) rim_stroke = gsk_stroke_new(1.0f);
-            gtk_snapshot_append_stroke(snapshot, track_path, rim_stroke, &rim_col);
-        }
 
         double vmin = self->bipolar ? -1.0 : 0.0;
         double v = !isfinite(self->value) ? 0.0 : CLAMP(self->value, vmin, 1.0);
 
         gtk_snapshot_push_rounded_clip(snapshot, &track_rr);
+        gtk_snapshot_append_color(snapshot, &track_col, &track_rr.bounds);
         if (!self->bipolar) {
             if (v > 0.001) {
                 float fill_h = (float)v * bar_h;
@@ -130,18 +126,26 @@ static void conttest_trigger_bar_snapshot(GtkWidget *widget, GtkSnapshot *snapsh
         }
         gtk_snapshot_pop(snapshot);
 
+        if (hc) {
+            GdkRGBA rim_col = fg;
+            rim_col.alpha *= 0.55f;
+            GskRoundedRect rim_rr;
+            gsk_rounded_rect_init_from_rect(
+                &rim_rr,
+                &GRAPHENE_RECT_INIT(x0 - 0.5f, y0 - 0.5f, bar_w + 1.0f, bar_h + 1.0f),
+                radius + 0.5f);
+            const float widths[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            const GdkRGBA colors[4] = { rim_col, rim_col, rim_col, rim_col };
+            gtk_snapshot_append_border(snapshot, &rim_rr, widths, colors);
+        }
+
         if (self->bipolar) {
             float mid_y = y0 + bar_h * 0.5f;
-            g_autoptr(GskPathBuilder) zero_builder = gsk_path_builder_new();
-            gsk_path_builder_move_to(zero_builder, x0 - 3.0f, mid_y);
-            gsk_path_builder_line_to(zero_builder, x0 + bar_w + 3.0f, mid_y);
-            g_autoptr(GskPath) zero_path =
-                gsk_path_builder_free_to_path(g_steal_pointer(&zero_builder));
-
             GdkRGBA zero_col = fg;
             zero_col.alpha *= hc ? 0.80f : 0.45f;
-            g_autoptr(GskStroke) zero_stroke = gsk_stroke_new(1.5f);
-            gtk_snapshot_append_stroke(snapshot, zero_path, zero_stroke, &zero_col);
+            gtk_snapshot_append_color(
+                snapshot, &zero_col,
+                &GRAPHENE_RECT_INIT(x0 - 3.0f, mid_y - 0.75f, bar_w + 6.0f, 1.5f));
         }
     }
 
@@ -153,7 +157,7 @@ static void conttest_trigger_bar_init(ConttestTriggerBar *self) {
     gtk_widget_set_vexpand(GTK_WIDGET(self), TRUE);
     self->label = conttest_captioned_widget_create_label(GTK_WIDGET(self), NULL);
     conttest_widget_connect_style_redraw(GTK_WIDGET(self));
-    update_accessible_value(self);
+    init_accessible_range(self);
 }
 
 static void conttest_trigger_bar_class_init(ConttestTriggerBarClass *klass) {
@@ -189,11 +193,10 @@ void conttest_trigger_bar_set_value(ConttestTriggerBar *self, double value) {
 
     self->value = clamped;
     gint64 now = g_get_monotonic_time();
-    if (at_boundary || clamped == 0.0 || fabs(clamped) >= 1.0 ||
-        self->last_a11y_us == 0 ||
+    if (at_boundary || self->last_a11y_us == 0 ||
         (now - self->last_a11y_us) >= TRIGGER_A11Y_INTERVAL_US) {
         self->last_a11y_us = now;
-        update_accessible_value(self);
+        update_accessible_value_now(self);
     }
     gtk_widget_queue_draw(GTK_WIDGET(self));
 }
@@ -206,6 +209,6 @@ void conttest_trigger_bar_set_bipolar(ConttestTriggerBar *self, gboolean bipolar
 
     self->bipolar = norm_bipolar;
     self->value = CLAMP(self->value, norm_bipolar ? -1.0 : 0.0, 1.0);
-    update_accessible_value(self);
+    init_accessible_range(self);
     gtk_widget_queue_draw(GTK_WIDGET(self));
 }

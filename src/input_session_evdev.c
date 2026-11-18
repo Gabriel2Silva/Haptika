@@ -4,15 +4,31 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libevdev/libevdev.h>
+#include <math.h>
 #include <poll.h>
 #include <unistd.h>
+
+/* Sub-pixel noise gate for 16-bit axes (~0.00049): lossless for 8-bit/10-bit
+ * pads and hats while suppressing +-1..8 LSB idle ADC jitter before waking GTK. */
+#define EVDEV_AXIS_NOISE_EPSILON (16.0f / 32768.0f)
+
+typedef struct {
+    double  scale;
+    double  offset;
+    float   min_clamp;
+    float   last_norm;
+    int32_t minimum;
+    int32_t maximum;
+    uint8_t valid;
+    uint8_t has_prev;
+} EvdevAbsAxisLut;
 
 typedef struct {
     struct libevdev *dev;
     int fd;
     ViewerSessionContext *ctx;
     gint *atomic_stop_flag;
-    gboolean is_trigger[ABS_CNT];
+    EvdevAbsAxisLut abs_lut[ABS_CNT];
 } EvdevThreadData;
 
 static ConttestAbsAxisInfo read_abs_axis_info(struct libevdev *dev, unsigned int code) {
@@ -37,51 +53,97 @@ static char *evdev_code_name(unsigned int type, unsigned int code, const char *p
     return g_strdup_printf("%s_0x%x", prefix, code);
 }
 
-static gboolean evdev_normalize_abs(struct libevdev *dev, const gboolean is_trigger[ABS_CNT],
-                                    unsigned int code, int value, double *out_norm) {
+static void evdev_init_abs_lut(struct libevdev *dev,
+                               unsigned int code,
+                               gboolean is_trigger,
+                               EvdevAbsAxisLut *out) {
+    if (code >= ABS_CNT)
+        return;
     const struct input_absinfo *info = libevdev_get_abs_info(dev, code);
     if (!info)
-        return FALSE;
+        return;
+
+    out->valid   = 1;
+    out->minimum = info->minimum;
+    out->maximum = info->maximum;
 
     double range = (double)info->maximum - (double)info->minimum;
     if (range <= 0.0) {
-        *out_norm = 0.0;
+        out->scale     = 0.0;
+        out->offset    = 0.0;
+        out->min_clamp = 0.0f;
+    } else if (is_trigger) {
+        out->scale     = 1.0 / range;
+        out->offset    = -(double)info->minimum / range;
+        out->min_clamp = 0.0f;
+    } else {
+        double half    = range * 0.5;
+        double center  = (double)info->minimum + half;
+        out->scale     = 1.0 / half;
+        out->offset    = -center / half;
+        out->min_clamp = -1.0f;
+    }
+}
+
+static gboolean evdev_push_event(EvdevAbsAxisLut abs_lut[ABS_CNT],
+                                 ViewerSessionContext *ctx,
+                                 unsigned int type,
+                                 unsigned int code,
+                                 int value) {
+    if (type == EV_ABS) {
+        if (code >= ABS_CNT || !abs_lut[code].valid)
+            return FALSE;
+
+        EvdevAbsAxisLut *a = &abs_lut[code];
+        float norm;
+        if (a->maximum <= a->minimum) {
+            norm = 0.0f;
+        } else if (value <= a->minimum) {
+            norm = a->min_clamp;
+        } else if (value >= a->maximum) {
+            norm = 1.0f;
+        } else {
+            double d = (double)value * a->scale + a->offset;
+            norm = (float)CLAMP(d, (double)a->min_clamp, 1.0);
+        }
+
+        if (a->has_prev) {
+            float prev = a->last_norm;
+            if (norm == prev)
+                return FALSE;
+            if (norm != 0.0f && fabsf(norm) < 1.0f &&
+                fabsf(norm - prev) <= EVDEV_AXIS_NOISE_EPSILON) {
+                return FALSE;
+            }
+        }
+        a->has_prev  = 1;
+        a->last_norm = norm;
+
+        ConttestInputEvent cev = {
+            .type       = INPUT_EVENT_AXIS,
+            .domain     = CONTTEST_ELEMENT_EVDEV_ABS,
+            .element_id = (int)code,
+            .axis_value = norm,
+        };
+        conttest_event_ring_push(&ctx->ring, &cev);
         return TRUE;
     }
 
-    if (code < ABS_CNT && is_trigger[code]) {
-        *out_norm = CLAMP(((double)value - (double)info->minimum) / range, 0.0, 1.0);
-    } else {
-        double center = (double)info->minimum + range / 2.0;
-        *out_norm = CLAMP(((double)value - center) / (range / 2.0), -1.0, 1.0);
-    }
-    return TRUE;
-}
-
-static gboolean evdev_push_event(struct libevdev *dev, const gboolean is_trigger[ABS_CNT],
-                                 ViewerSessionContext *ctx,
-                                 unsigned int type, unsigned int code, int value) {
-    ConttestInputEvent cev = {0};
-
     if (type == EV_KEY) {
-        cev.type = INPUT_EVENT_BUTTON;
-        cev.domain = CONTTEST_ELEMENT_BUTTON;
-        cev.element_id = (int)code;
-        cev.button_pressed = value != 0;
-    } else if (type == EV_ABS) {
-        double norm = 0.0;
-        if (!evdev_normalize_abs(dev, is_trigger, code, value, &norm))
+        /* Ignore kernel key-repeat events (value == 2): button is already held. */
+        if (value == 2 || code > KEY_MAX)
             return FALSE;
-        cev.type = INPUT_EVENT_AXIS;
-        cev.domain = CONTTEST_ELEMENT_EVDEV_ABS;
-        cev.element_id = (int)code;
-        cev.axis_value = norm;
-    } else {
-        return FALSE;
+        ConttestInputEvent cev = {
+            .type           = INPUT_EVENT_BUTTON,
+            .domain         = CONTTEST_ELEMENT_BUTTON,
+            .element_id     = (int)code,
+            .button_pressed = (unsigned int)(value != 0),
+        };
+        conttest_event_ring_push(&ctx->ring, &cev);
+        return TRUE;
     }
 
-    conttest_event_ring_push(&ctx->ring, &cev);
-    return TRUE;
+    return FALSE;
 }
 
 static gpointer evdev_polling_thread(gpointer user_data) {
@@ -111,14 +173,14 @@ static gpointer evdev_polling_thread(gpointer user_data) {
                 /* Drain kernel SYN_DROPPED sync stream before resuming normal reads. */
                 while ((rc = libevdev_next_event(data->dev, LIBEVDEV_READ_FLAG_SYNC, &ev)) ==
                        LIBEVDEV_READ_STATUS_SYNC) {
-                    if (evdev_push_event(data->dev, data->is_trigger, data->ctx,
+                    if (evdev_push_event(data->abs_lut, data->ctx,
                                          ev.type, ev.code, ev.value))
                         pushed = TRUE;
                 }
                 if (rc == -EAGAIN)
                     rc = LIBEVDEV_READ_STATUS_SUCCESS;
             } else if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-                if (evdev_push_event(data->dev, data->is_trigger, data->ctx,
+                if (evdev_push_event(data->abs_lut, data->ctx,
                                      ev.type, ev.code, ev.value))
                     pushed = TRUE;
             }
@@ -174,7 +236,19 @@ ConttestInputSession *conttest_input_session_evdev_start(const char *devnode,
                                  read_abs_axis_info(dev, ABS_RY),
                                  &z_rz_right_stick, &rx_ry_triggers);
 
-    ConttestInputElementDef *defs = g_new0(ConttestInputElementDef, KEY_MAX + ABS_MAX + 2);
+    int max_defs = 0;
+    for (unsigned int code = 0; code <= KEY_MAX; code++) {
+        if (libevdev_has_event_code(dev, EV_KEY, code))
+            max_defs++;
+    }
+    for (unsigned int code = 0; code <= ABS_MAX; code++) {
+        if (libevdev_has_event_code(dev, EV_ABS, code))
+            max_defs++;
+    }
+
+    ConttestInputElementDef *defs = max_defs > 0
+        ? g_new0(ConttestInputElementDef, (gsize)max_defs)
+        : NULL;
     int num = 0;
 
     for (unsigned int code = 0; code <= KEY_MAX; code++) {
@@ -223,12 +297,11 @@ ConttestInputSession *conttest_input_session_evdev_start(const char *devnode,
 
         if (is_trig) {
             defs[num].is_trigger = TRUE;
-            if (code < ABS_CNT)
-                data->is_trigger[code] = TRUE;
         } else if (!defs[num].is_stick_x && !defs[num].is_stick_y) {
             /* Generic non-stick, non-trigger axes are normalized to [-1, 1]. */
             defs[num].is_bipolar = TRUE;
         }
+        evdev_init_abs_lut(dev, code, is_trig, &data->abs_lut[code]);
         num++;
     }
 
@@ -246,14 +319,14 @@ ConttestInputSession *conttest_input_session_evdev_start(const char *devnode,
         if (!libevdev_has_event_code(dev, EV_KEY, code))
             continue;
         int val = libevdev_get_event_value(dev, EV_KEY, code);
-        if (evdev_push_event(dev, data->is_trigger, ctx, EV_KEY, code, val))
+        if (evdev_push_event(data->abs_lut, ctx, EV_KEY, code, val))
             has_initial = TRUE;
     }
     for (unsigned int code = 0; code <= ABS_MAX; code++) {
         if (!libevdev_has_event_code(dev, EV_ABS, code))
             continue;
         int val = libevdev_get_event_value(dev, EV_ABS, code);
-        if (evdev_push_event(dev, data->is_trigger, ctx, EV_ABS, code, val))
+        if (evdev_push_event(data->abs_lut, ctx, EV_ABS, code, val))
             has_initial = TRUE;
     }
     if (has_initial)

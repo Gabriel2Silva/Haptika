@@ -26,6 +26,16 @@ const char *conttest_inputplumber_target_type_virtual_bus(const char *target_typ
 
 gboolean conttest_inputplumber_is_gamepad_target_type(const char *type);
 
+/* Filter D-Bus ObjectManager / Properties signals to the 4 InputPlumber
+ * interfaces actually consumed by Haptika so high-rate telemetry or DBusTarget
+ * property updates never trigger spurious GetManagedObjects() round-trips.
+ * Sets *out_version_invalidated when InputManager properties/interfaces change. */
+gboolean conttest_inputplumber_dbus_signal_is_relevant(
+    const char *interface_name,
+    const char *signal_name,
+    GVariant *parameters,
+    gboolean *out_version_invalidated);
+
 /* Parse org.freedesktop.DBus.ObjectManager.GetManagedObjects() reply "(a{oa{sa{sv}}})"
  * into ConttestInputPlumberInfo* candidates and an optional set of source devnodes. */
 GPtrArray *conttest_inputplumber_parse_managed_objects(GVariant *reply,

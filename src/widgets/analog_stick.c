@@ -6,18 +6,20 @@
 #define STICK_NAT_SIZE 100
 
 struct _ConttestAnalogStick {
-    GtkWidget  parent_instance;
-    GtkWidget *label;
-    int        canvas_w;
-    int        canvas_h;
-    double     stick_x;
-    double     stick_y;
+    GtkWidget                      parent_instance;
+    GtkWidget                     *label;
+    ConttestCircularIndicatorCache geom_cache;
+    int                            canvas_w;
+    int                            canvas_h;
+    double                         stick_x;
+    double                         stick_y;
 };
 
 G_DEFINE_TYPE(ConttestAnalogStick, conttest_analog_stick, GTK_TYPE_WIDGET)
 
 static void conttest_analog_stick_dispose(GObject *object) {
     ConttestAnalogStick *self = CONTTEST_ANALOG_STICK(object);
+    conttest_circular_indicator_cache_clear(&self->geom_cache);
     g_clear_pointer(&self->label, gtk_widget_unparent);
     G_OBJECT_CLASS(conttest_analog_stick_parent_class)->dispose(object);
 }
@@ -49,11 +51,12 @@ static void conttest_analog_stick_size_allocate(GtkWidget *widget,
 
 static void conttest_analog_stick_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
     ConttestAnalogStick *self = CONTTEST_ANALOG_STICK(widget);
-    conttest_snapshot_circular_indicator(widget, snapshot,
-                                         (float)self->canvas_w,
-                                         (float)self->canvas_h,
-                                         (float)self->stick_x,
-                                         (float)self->stick_y);
+    conttest_snapshot_circular_indicator_cached(widget, snapshot,
+                                                &self->geom_cache,
+                                                (float)self->canvas_w,
+                                                (float)self->canvas_h,
+                                                (float)self->stick_x,
+                                                (float)self->stick_y);
     if (self->label && gtk_widget_get_visible(self->label))
         gtk_widget_snapshot_child(widget, self->label, snapshot);
 }

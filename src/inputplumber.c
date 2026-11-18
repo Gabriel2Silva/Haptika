@@ -159,6 +159,7 @@ struct _ConttestInputPlumberMonitor {
     GHashTable *pending_source_devnodes;
 
     char *daemon_version;
+    gboolean version_dirty;
     GPtrArray *candidates; /* element-type: ConttestInputPlumberInfo* */
     GHashTable *source_devnodes; /* set of active CompositeDevice SourceDevicePaths */
     gboolean disposed;
@@ -226,6 +227,7 @@ static void clear_snapshot(ConttestInputPlumberMonitor *self) {
                         (self->candidates && self->candidates->len > 0) ||
                         (self->source_devnodes && g_hash_table_size(self->source_devnodes) > 0);
     g_clear_pointer(&self->daemon_version, g_free);
+    self->version_dirty = TRUE;
     if (self->candidates) {
         g_ptr_array_set_size(self->candidates, 0);
     }
@@ -291,6 +293,7 @@ static void finish_refresh_if_complete(ConttestInputPlumberMonitor *self) {
         g_free(self->daemon_version);
         self->daemon_version = self->pending_version;
         self->pending_version = NULL;
+        self->version_dirty = FALSE;
     } else {
         g_clear_pointer(&self->pending_version, g_free);
     }
@@ -385,8 +388,9 @@ static void on_get_objects_done(GObject *source, GAsyncResult *res, gpointer use
     if (reply) {
         if (self->pending_candidates) g_ptr_array_free(self->pending_candidates, TRUE);
         g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
+        const char *ver = self->pending_version ? self->pending_version : self->daemon_version;
         self->pending_candidates = conttest_inputplumber_parse_managed_objects(
-            reply, self->pending_version, &self->pending_source_devnodes);
+            reply, ver, &self->pending_source_devnodes);
         self->pending_objects_ok = TRUE;
         g_variant_unref(reply);
     } else {
@@ -410,30 +414,34 @@ static void on_get_objects_done(GObject *source, GAsyncResult *res, gpointer use
 static void start_refresh(ConttestInputPlumberMonitor *self) {
     if (!self || self->disposed || !self->bus || !self->cancellable) return;
 
+    gboolean need_version = (self->daemon_version == NULL) || self->version_dirty;
+
     self->refresh_seq++;
-    self->pending_calls = 2;
+    self->pending_calls = need_version ? 2u : 1u;
     self->pending_version_ok = FALSE;
     self->pending_objects_ok = FALSE;
     g_clear_pointer(&self->pending_version, g_free);
     g_clear_pointer(&self->pending_candidates, g_ptr_array_unref);
     g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
 
-    RefreshCallCtx *vctx = g_new0(RefreshCallCtx, 1);
-    g_weak_ref_init(&vctx->monitor_ref, self);
-    vctx->seq = self->refresh_seq;
-    g_dbus_connection_call(
-        self->bus,
-        IP_BUS_NAME,
-        IP_MANAGER_PATH,
-        "org.freedesktop.DBus.Properties",
-        "Get",
-        g_variant_new("(ss)", IP_IFACE_MANAGER, "Version"),
-        G_VARIANT_TYPE("(v)"),
-        G_DBUS_CALL_FLAGS_NO_AUTO_START,
-        2000,
-        self->cancellable,
-        on_get_version_done,
-        vctx);
+    if (need_version) {
+        RefreshCallCtx *vctx = g_new0(RefreshCallCtx, 1);
+        g_weak_ref_init(&vctx->monitor_ref, self);
+        vctx->seq = self->refresh_seq;
+        g_dbus_connection_call(
+            self->bus,
+            IP_BUS_NAME,
+            IP_MANAGER_PATH,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            g_variant_new("(ss)", IP_IFACE_MANAGER, "Version"),
+            G_VARIANT_TYPE("(v)"),
+            G_DBUS_CALL_FLAGS_NO_AUTO_START,
+            2000,
+            self->cancellable,
+            on_get_version_done,
+            vctx);
+    }
 
     RefreshCallCtx *octx = g_new0(RefreshCallCtx, 1);
     g_weak_ref_init(&octx->monitor_ref, self);
@@ -471,6 +479,7 @@ static void on_name_owner_changed(GDBusConnection *conn,
     const char *name = NULL, *old_owner = NULL, *new_owner = NULL;
     g_variant_get(parameters, "(&s&s&s)", &name, &old_owner, &new_owner);
     if (new_owner && *new_owner) {
+        self->version_dirty = TRUE;
         schedule_refresh(self);
     } else {
         cancel_pending_refresh(self);
@@ -486,10 +495,17 @@ static void on_ip_dbus_signal(GDBusConnection *conn,
                               GVariant *parameters,
                               gpointer user_data) {
     (void)conn; (void)sender_name; (void)object_path;
-    (void)interface_name; (void)signal_name; (void)parameters;
     GWeakRef *wr = user_data;
     g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
     if (!self || self->disposed) return;
+
+    gboolean version_invalidated = FALSE;
+    if (!conttest_inputplumber_dbus_signal_is_relevant(
+            interface_name, signal_name, parameters, &version_invalidated)) {
+        return;
+    }
+    if (version_invalidated)
+        self->version_dirty = TRUE;
 
     schedule_refresh(self);
 }
@@ -602,6 +618,7 @@ static void conttest_inputplumber_monitor_class_init(ConttestInputPlumberMonitor
 
 static void conttest_inputplumber_monitor_init(ConttestInputPlumberMonitor *self) {
     self->cancellable = g_cancellable_new();
+    self->version_dirty = TRUE;
     self->candidates = g_ptr_array_new_with_free_func((GDestroyNotify)conttest_inputplumber_info_free);
     self->source_devnodes = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     g_bus_get(G_BUS_TYPE_SYSTEM, self->cancellable, on_bus_ready, monitor_weak_ref_new(self));

@@ -1,7 +1,18 @@
 #include "input_session.h"
 #include <glib.h>
+#include <stddef.h>
+#include <stdint.h>
 
 static void test_ring_empty_and_types(void) {
+    g_assert_cmpuint(sizeof(ConttestInputEvent), ==, 16u);
+    g_assert_cmpuint(_Alignof(ConttestInputEvent), ==, 16u);
+    g_assert_cmpuint(offsetof(ConttestEventRing, head) -
+                     (offsetof(ConttestEventRing, events[CONTTEST_EVENT_RING_CAP - 1]) +
+                      sizeof(ConttestInputEvent)),
+                     >=, 64u);
+    g_assert_cmpuint(offsetof(ConttestEventRing, tail) - offsetof(ConttestEventRing, head), >=, 64u);
+    g_assert_cmpuint(offsetof(ConttestEventRing, scheduled) - offsetof(ConttestEventRing, tail), >=, 64u);
+
     ConttestEventRing ring = {0};
     ConttestInputEvent out = {0};
 
@@ -240,6 +251,7 @@ static gboolean coalesce_drain_cb(gpointer data) {
         }
 
         atomic_store_explicit(&ring->scheduled, false, memory_order_seq_cst);
+        atomic_thread_fence(memory_order_seq_cst);
         unsigned int head = atomic_load_explicit(&ring->head, memory_order_relaxed);
         unsigned int tail = atomic_load_explicit(&ring->tail, memory_order_seq_cst);
         if (head == tail)
@@ -276,6 +288,7 @@ static void test_ring_notify_coalescing(void) {
         .target_count = 25000,
     };
     st.ctx = viewer_session_context_new((ConttestInputViewer *)&st);
+    g_assert_cmpuint((uintptr_t)st.ctx & 63u, ==, 0u);
 
     GThread *prod = g_thread_new("spsc-notify-prod", coalesce_producer, &st);
     g_main_loop_run(st.loop);

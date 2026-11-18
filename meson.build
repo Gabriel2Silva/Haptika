@@ -10,6 +10,13 @@ project('haptika', 'c',
 
 cc = meson.get_compiler('c')
 
+if get_option('x86_64_v1') and host_machine.cpu_family() == 'x86_64'
+  add_project_arguments(
+    cc.get_supported_arguments(['-march=x86-64', '-mtune=generic']),
+    language: 'c',
+  )
+endif
+
 # libadwaita 1.7 is required for AdwWrapBox; GTK 4.16 for the CSS color-mix()
 # used by data/style.css.
 adw_dep = dependency('libadwaita-1', version: '>=1.7')

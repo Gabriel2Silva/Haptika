@@ -35,37 +35,52 @@ typedef enum {
 } ConttestSensorKind;
 
 typedef struct {
-  ConttestInputEventType type;
-  ConttestElementDomain domain;
-  int element_id; /* Index or code within `domain` */
-  union {
-    gboolean button_pressed;
-    double axis_value;
+  _Alignas(16) struct {
+    unsigned int type : 3;        /* ConttestInputEventType */
+    unsigned int domain : 4;      /* ConttestElementDomain */
+    unsigned int button_pressed : 1;
+    signed int   element_id : 24; /* Index or code within `domain` */
   };
-  float touch_x;
-  float touch_y;
-  /* Sensor data (type == INPUT_EVENT_SENSOR) */
-  float sensor[3]; /* accel: m/s^2, gyro: rad/s */
+  union {
+    float axis_value;
+    struct {
+      float touch_x;
+      float touch_y;
+    };
+    /* Sensor data (type == INPUT_EVENT_SENSOR) */
+    float sensor[3]; /* accel: m/s^2, gyro: rad/s */
+  };
 } ConttestInputEvent;
 
-/* Fixed lock-free SPSC ring buffer (producer: evdev thread, consumer: main loop). */
+_Static_assert(sizeof(ConttestInputEvent) == 16,
+               "ConttestInputEvent must pack into a single 16-byte SSE2 register");
+_Static_assert(_Alignof(ConttestInputEvent) == 16,
+               "ConttestInputEvent must be 16-byte aligned");
+
+/* Fixed lock-free SPSC ring buffer (producer: evdev thread, consumer: main loop).
+ * Explicit 64-byte padding cushions isolate `events`, `head`, `tail`, and
+ * `scheduled` onto separate cache lines regardless of allocator alignment. */
 #define CONTTEST_EVENT_RING_CAP 2048
 
 typedef struct {
   ConttestInputEvent events[CONTTEST_EVENT_RING_CAP];
+  uint8_t            pad_events[64];
   atomic_uint        head;
-  uint8_t            pad_head[64];
+  uint8_t            pad_head[60];
   atomic_uint        tail;
-  uint8_t            pad_tail[64];
+  uint8_t            pad_tail[60];
   atomic_bool        overflow;
   atomic_bool        scheduled;
+  uint8_t            pad_state[62];
 } ConttestEventRing;
 
 struct _ViewerSessionContext {
+  ConttestEventRing    ring;
   ConttestInputViewer *viewer;
-  gint ref_count; /* atomic */
-  gint active;    /* atomic boolean */
-  ConttestEventRing ring;
+  GSource             *drain_source;
+  _Atomic GSourceFunc  dispatch_func;
+  gint                 ref_count; /* atomic */
+  gint                 active;    /* atomic boolean */
 };
 
 gboolean conttest_event_ring_push(ConttestEventRing *ring, const ConttestInputEvent *ev);

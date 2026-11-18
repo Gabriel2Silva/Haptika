@@ -1,7 +1,28 @@
+#define _POSIX_C_SOURCE 200809L
 #include "input_session.h"
+#include <stdlib.h>
+#include <string.h>
 
 _Static_assert((CONTTEST_EVENT_RING_CAP & (CONTTEST_EVENT_RING_CAP - 1)) == 0,
                "CONTTEST_EVENT_RING_CAP must be a power of two");
+
+static gboolean ring_drain_source_dispatch(GSource *source,
+                                           GSourceFunc callback,
+                                           gpointer user_data) {
+    (void)callback;
+    g_source_set_ready_time(source, -1);
+    ViewerSessionContext *ctx = user_data;
+    GSourceFunc fn = atomic_load_explicit(&ctx->dispatch_func, memory_order_acquire);
+    if (fn)
+        fn(ctx);
+    /* Do not dereference `ctx` after `fn(ctx)`: `fn` drops the in-flight
+     * dispatch reference, which may destroy `source` and free `ctx`. */
+    return G_SOURCE_CONTINUE;
+}
+
+static GSourceFuncs ring_drain_source_funcs = {
+    .dispatch = ring_drain_source_dispatch,
+};
 
 gboolean conttest_event_ring_push(ConttestEventRing *ring, const ConttestInputEvent *ev) {
     unsigned int tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
@@ -14,7 +35,7 @@ gboolean conttest_event_ring_push(ConttestEventRing *ring, const ConttestInputEv
     }
 
     ring->events[tail] = *ev;
-    atomic_store_explicit(&ring->tail, next, memory_order_seq_cst);
+    atomic_store_explicit(&ring->tail, next, memory_order_release);
     return TRUE;
 }
 
@@ -32,14 +53,36 @@ gboolean conttest_event_ring_pop(ConttestEventRing *ring, ConttestInputEvent *ou
 }
 
 ViewerSessionContext *viewer_session_context_new(ConttestInputViewer *viewer) {
-    ViewerSessionContext *ctx = g_new0(ViewerSessionContext, 1);
+    void *mem = NULL;
+    if (posix_memalign(&mem, 64, sizeof(ViewerSessionContext)) != 0 || !mem) {
+        mem = calloc(1, sizeof(ViewerSessionContext));
+        if (!mem)
+            g_error("Failed to allocate ViewerSessionContext");
+    } else {
+        memset(mem, 0, sizeof(ViewerSessionContext));
+    }
+
+    ViewerSessionContext *ctx = mem;
     ctx->viewer = viewer;
     ctx->active = 1;
     ctx->ref_count = 1;
+    atomic_init(&ctx->dispatch_func, NULL);
     atomic_init(&ctx->ring.head, 0u);
     atomic_init(&ctx->ring.tail, 0u);
     atomic_init(&ctx->ring.overflow, false);
     atomic_init(&ctx->ring.scheduled, false);
+
+    GSource *src = g_source_new(&ring_drain_source_funcs, sizeof(GSource));
+    g_source_set_priority(src, G_PRIORITY_DEFAULT);
+    g_source_set_name(src, "haptika-ring-drain");
+    g_source_set_callback(src, NULL, ctx, NULL);
+    g_source_set_ready_time(src, -1);
+    if (g_source_attach(src, NULL) != 0) {
+        ctx->drain_source = src;
+    } else {
+        g_source_unref(src);
+    }
+
     return ctx;
 }
 
@@ -51,8 +94,14 @@ ViewerSessionContext *viewer_session_context_ref(ViewerSessionContext *ctx) {
 
 void viewer_session_context_unref(ViewerSessionContext *ctx) {
     if (!ctx) return;
-    if (g_atomic_int_dec_and_test(&ctx->ref_count))
-        g_free(ctx);
+    if (g_atomic_int_dec_and_test(&ctx->ref_count)) {
+        if (ctx->drain_source) {
+            g_source_destroy(ctx->drain_source);
+            g_source_unref(ctx->drain_source);
+            ctx->drain_source = NULL;
+        }
+        free(ctx);
+    }
 }
 
 static gboolean abs_is_signed_centered(ConttestAbsAxisInfo a) {
@@ -131,9 +180,19 @@ void conttest_evdev_classify_axes(ConttestAbsAxisInfo z,
 }
 
 void conttest_event_ring_notify(ViewerSessionContext *ctx, GSourceFunc dispatch_func) {
-    if (!atomic_exchange_explicit(&ctx->ring.scheduled, true, memory_order_seq_cst)) {
+    if (atomic_load_explicit(&ctx->dispatch_func, memory_order_relaxed) != dispatch_func) {
+        atomic_store_explicit(&ctx->dispatch_func, dispatch_func, memory_order_release);
+    }
+    /* Order prior release stores to `ring->tail` before testing `scheduled`. */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (!atomic_load_explicit(&ctx->ring.scheduled, memory_order_seq_cst) &&
+        !atomic_exchange_explicit(&ctx->ring.scheduled, true, memory_order_seq_cst)) {
         viewer_session_context_ref(ctx);
-        g_idle_add_full(G_PRIORITY_DEFAULT, dispatch_func, ctx, NULL);
+        if (ctx->drain_source) {
+            g_source_set_ready_time(ctx->drain_source, 0);
+        } else {
+            g_idle_add_full(G_PRIORITY_DEFAULT, dispatch_func, ctx, NULL);
+        }
     }
 }
 

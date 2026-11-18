@@ -227,6 +227,85 @@ gboolean conttest_inputplumber_is_gamepad_target_type(const char *type) {
     return TRUE;
 }
 
+static gboolean is_relevant_ip_iface(const char *iface, gboolean *out_is_manager) {
+    if (!iface || !*iface)
+        return FALSE;
+    if (strcmp(iface, "org.shadowblip.InputManager") == 0) {
+        if (out_is_manager)
+            *out_is_manager = TRUE;
+        return TRUE;
+    }
+    return strcmp(iface, "org.shadowblip.Input.CompositeDevice") == 0 ||
+           strcmp(iface, "org.shadowblip.Input.Target") == 0 ||
+           strcmp(iface, "org.shadowblip.Input.Source.UdevDevice") == 0;
+}
+
+gboolean conttest_inputplumber_dbus_signal_is_relevant(
+    const char *interface_name,
+    const char *signal_name,
+    GVariant *parameters,
+    gboolean *out_version_invalidated) {
+    if (out_version_invalidated)
+        *out_version_invalidated = FALSE;
+    if (!interface_name || !signal_name)
+        return FALSE;
+
+    if (strcmp(interface_name, "org.freedesktop.DBus.Properties") == 0 &&
+        strcmp(signal_name, "PropertiesChanged") == 0) {
+        if (!parameters || !g_variant_is_of_type(parameters, G_VARIANT_TYPE("(sa{sv}as)")))
+            return FALSE;
+        const char *changed_iface = NULL;
+        g_variant_get_child(parameters, 0, "&s", &changed_iface);
+        gboolean is_mgr = FALSE;
+        gboolean rel = is_relevant_ip_iface(changed_iface, &is_mgr);
+        if (is_mgr && out_version_invalidated)
+            *out_version_invalidated = TRUE;
+        return rel;
+    }
+
+    if (strcmp(interface_name, "org.freedesktop.DBus.ObjectManager") == 0 &&
+        strcmp(signal_name, "InterfacesAdded") == 0) {
+        if (!parameters || !g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oa{sa{sv}})")))
+            return FALSE;
+        GVariant *ifaces = g_variant_get_child_value(parameters, 1);
+        GVariantIter iter;
+        const char *iface = NULL;
+        gboolean relevant = FALSE;
+        g_variant_iter_init(&iter, ifaces);
+        while (g_variant_iter_next(&iter, "{&s@a{sv}}", &iface, NULL)) {
+            gboolean is_mgr = FALSE;
+            if (is_relevant_ip_iface(iface, &is_mgr)) {
+                relevant = TRUE;
+                if (is_mgr && out_version_invalidated)
+                    *out_version_invalidated = TRUE;
+            }
+        }
+        g_variant_unref(ifaces);
+        return relevant;
+    }
+
+    if (strcmp(interface_name, "org.freedesktop.DBus.ObjectManager") == 0 &&
+        strcmp(signal_name, "InterfacesRemoved") == 0) {
+        if (!parameters || !g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oas)")))
+            return FALSE;
+        GVariant *ifaces = g_variant_get_child_value(parameters, 1);
+        GVariantIter iter;
+        const char *iface = NULL;
+        gboolean relevant = FALSE;
+        g_variant_iter_init(&iter, ifaces);
+        while (g_variant_iter_next(&iter, "&s", &iface)) {
+            if (is_relevant_ip_iface(iface, NULL)) {
+                relevant = TRUE;
+                break;
+            }
+        }
+        g_variant_unref(ifaces);
+        return relevant;
+    }
+
+    return FALSE;
+}
+
 /* --- ManagedObjects parser --- */
 
 typedef struct {

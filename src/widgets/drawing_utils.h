@@ -84,6 +84,45 @@ void conttest_captioned_widget_allocate(GtkWidget *label,
                                         int *out_canvas_h);
 
 /**
+ * ConttestCircularIndicatorCache:
+ *
+ * Per-widget cached static GSK paths and strokes for circular crosshair
+ * indicators, rebuilt only when canvas dimensions change so GSK can reuse
+ * tessellated GPU path masks across frames with zero per-frame path/stroke
+ * heap allocations.
+ */
+typedef struct {
+    float      canvas_w;
+    float      canvas_h;
+    GskPath   *ring_path;
+    GskPath   *cross_path;
+    GskStroke *stroke_1_5;
+    GskStroke *stroke_1_0;
+} ConttestCircularIndicatorCache;
+
+/**
+ * conttest_circular_indicator_cache_clear:
+ *
+ * Releases any cached GskPath and GskStroke instances owned by @cache.
+ */
+void conttest_circular_indicator_cache_clear(ConttestCircularIndicatorCache *cache);
+
+/**
+ * conttest_snapshot_circular_indicator_cached:
+ *
+ * Renders a GPU-accelerated circular crosshair indicator with a tethered,
+ * clamped accent dot at normalized position (@x, @y) in [-1, 1], reusing
+ * static geometry in @cache across frames.
+ */
+void conttest_snapshot_circular_indicator_cached(GtkWidget *widget,
+                                                 GtkSnapshot *snapshot,
+                                                 ConttestCircularIndicatorCache *cache,
+                                                 float canvas_w,
+                                                 float canvas_h,
+                                                 float x,
+                                                 float y);
+
+/**
  * conttest_snapshot_circular_indicator:
  *
  * Renders a GPU-accelerated circular crosshair indicator with a tethered,

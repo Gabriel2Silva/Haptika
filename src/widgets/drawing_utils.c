@@ -2,29 +2,67 @@
 #include <adwaita.h>
 #include <math.h>
 
+static gboolean style_cache_connected = FALSE;
+static gboolean style_cache_dirty     = TRUE;
+static GdkRGBA  cached_accent_color   = { 0.2078f, 0.5176f, 0.8941f, 1.0f };
+static gboolean cached_high_contrast  = FALSE;
+
+static void on_style_cache_invalidated(GObject *sm, GParamSpec *pspec, gpointer user_data) {
+    (void)sm;
+    (void)pspec;
+    (void)user_data;
+    style_cache_dirty = TRUE;
+}
+
+static void ensure_style_cache(void) {
+    AdwStyleManager *sm = adw_style_manager_get_default();
+    if (!sm) {
+        cached_accent_color  = (GdkRGBA){ 0.2078f, 0.5176f, 0.8941f, 1.0f };
+        cached_high_contrast = FALSE;
+        return;
+    }
+
+    if (!style_cache_connected) {
+        style_cache_connected = TRUE;
+        style_cache_dirty     = TRUE;
+        g_signal_connect(sm, "notify::accent-color",
+                         G_CALLBACK(on_style_cache_invalidated), NULL);
+        g_signal_connect(sm, "notify::dark",
+                         G_CALLBACK(on_style_cache_invalidated), NULL);
+        g_signal_connect(sm, "notify::high-contrast",
+                         G_CALLBACK(on_style_cache_invalidated), NULL);
+    }
+
+    if (style_cache_dirty) {
+        GdkRGBA *accent = adw_style_manager_get_accent_color_rgba(sm);
+        if (accent) {
+            cached_accent_color = *accent;
+            gdk_rgba_free(accent);
+        } else {
+            /* Fallback to Adwaita Blue (#3584e4) */
+            cached_accent_color = (GdkRGBA){ 0.2078f, 0.5176f, 0.8941f, 1.0f };
+        }
+        cached_high_contrast = adw_style_manager_get_high_contrast(sm);
+        style_cache_dirty    = FALSE;
+    }
+}
+
 static void on_style_manager_changed(GObject *sm, GParamSpec *pspec, gpointer user_data) {
     (void)sm;
     (void)pspec;
+    style_cache_dirty = TRUE;
     gtk_widget_queue_draw(GTK_WIDGET(user_data));
 }
 
 void conttest_widget_get_accent_color(GdkRGBA *out) {
     g_return_if_fail(out != NULL);
-
-    AdwStyleManager *sm = adw_style_manager_get_default();
-    GdkRGBA *accent = sm ? adw_style_manager_get_accent_color_rgba(sm) : NULL;
-    if (accent) {
-        *out = *accent;
-        gdk_rgba_free(accent);
-    } else {
-        /* Fallback to Adwaita Blue (#3584e4) */
-        *out = (GdkRGBA){ 0.2078f, 0.5176f, 0.8941f, 1.0f };
-    }
+    ensure_style_cache();
+    *out = cached_accent_color;
 }
 
 gboolean conttest_widget_get_high_contrast(void) {
-    AdwStyleManager *sm = adw_style_manager_get_default();
-    return sm ? adw_style_manager_get_high_contrast(sm) : FALSE;
+    ensure_style_cache();
+    return cached_high_contrast;
 }
 
 void conttest_widget_connect_style_redraw(GtkWidget *widget) {
@@ -155,12 +193,58 @@ void conttest_captioned_widget_allocate(GtkWidget *label,
     }
 }
 
-void conttest_snapshot_circular_indicator(GtkWidget *widget,
-                                          GtkSnapshot *snapshot,
-                                          float canvas_w,
-                                          float canvas_h,
-                                          float x,
-                                          float y) {
+void conttest_circular_indicator_cache_clear(ConttestCircularIndicatorCache *cache) {
+    if (!cache)
+        return;
+    g_clear_pointer(&cache->ring_path, gsk_path_unref);
+    g_clear_pointer(&cache->cross_path, gsk_path_unref);
+    g_clear_pointer(&cache->stroke_1_5, gsk_stroke_free);
+    g_clear_pointer(&cache->stroke_1_0, gsk_stroke_free);
+    cache->canvas_w = 0.0f;
+    cache->canvas_h = 0.0f;
+}
+
+static void ensure_circular_cache(ConttestCircularIndicatorCache *cache,
+                                  float canvas_w,
+                                  float canvas_h,
+                                  float cx,
+                                  float cy,
+                                  float radius) {
+    if (!cache->stroke_1_5)
+        cache->stroke_1_5 = gsk_stroke_new(1.5f);
+    if (!cache->stroke_1_0)
+        cache->stroke_1_0 = gsk_stroke_new(1.0f);
+
+    if (cache->ring_path && cache->cross_path &&
+        cache->canvas_w == canvas_w && cache->canvas_h == canvas_h) {
+        return;
+    }
+
+    g_clear_pointer(&cache->ring_path, gsk_path_unref);
+    g_clear_pointer(&cache->cross_path, gsk_path_unref);
+
+    GskPathBuilder *ring_builder = gsk_path_builder_new();
+    gsk_path_builder_add_circle(ring_builder, &GRAPHENE_POINT_INIT(cx, cy), radius);
+    cache->ring_path = gsk_path_builder_free_to_path(ring_builder);
+
+    GskPathBuilder *cross_builder = gsk_path_builder_new();
+    gsk_path_builder_move_to(cross_builder, cx, cy - radius);
+    gsk_path_builder_line_to(cross_builder, cx, cy + radius);
+    gsk_path_builder_move_to(cross_builder, cx - radius, cy);
+    gsk_path_builder_line_to(cross_builder, cx + radius, cy);
+    cache->cross_path = gsk_path_builder_free_to_path(cross_builder);
+
+    cache->canvas_w = canvas_w;
+    cache->canvas_h = canvas_h;
+}
+
+void conttest_snapshot_circular_indicator_cached(GtkWidget *widget,
+                                                 GtkSnapshot *snapshot,
+                                                 ConttestCircularIndicatorCache *cache,
+                                                 float canvas_w,
+                                                 float canvas_h,
+                                                 float x,
+                                                 float y) {
     g_return_if_fail(GTK_IS_WIDGET(widget));
     g_return_if_fail(snapshot != NULL);
 
@@ -177,32 +261,23 @@ void conttest_snapshot_circular_indicator(GtkWidget *widget,
     conttest_widget_get_accent_color(&accent);
     gboolean hc = conttest_widget_get_high_contrast();
 
-    /* Trough disk and outer rim */
-    g_autoptr(GskPathBuilder) ring_builder = gsk_path_builder_new();
-    gsk_path_builder_add_circle(ring_builder, &GRAPHENE_POINT_INIT(cx, cy), radius);
-    g_autoptr(GskPath) ring_path = gsk_path_builder_free_to_path(g_steal_pointer(&ring_builder));
+    ConttestCircularIndicatorCache temp_cache = {0};
+    ConttestCircularIndicatorCache *c = cache ? cache : &temp_cache;
+    ensure_circular_cache(c, canvas_w, canvas_h, cx, cy, radius);
 
+    /* Trough disk and outer rim */
     GdkRGBA bg_col = fg;
     bg_col.alpha *= hc ? 0.14f : 0.06f;
-    gtk_snapshot_append_fill(snapshot, ring_path, GSK_FILL_RULE_WINDING, &bg_col);
+    gtk_snapshot_append_fill(snapshot, c->ring_path, GSK_FILL_RULE_WINDING, &bg_col);
 
     GdkRGBA rim_col = fg;
     rim_col.alpha *= hc ? 0.55f : 0.30f;
-    g_autoptr(GskStroke) rim_stroke = gsk_stroke_new(1.5f);
-    gtk_snapshot_append_stroke(snapshot, ring_path, rim_stroke, &rim_col);
+    gtk_snapshot_append_stroke(snapshot, c->ring_path, c->stroke_1_5, &rim_col);
 
     /* Crosshair axes */
-    g_autoptr(GskPathBuilder) cross_builder = gsk_path_builder_new();
-    gsk_path_builder_move_to(cross_builder, cx, cy - radius);
-    gsk_path_builder_line_to(cross_builder, cx, cy + radius);
-    gsk_path_builder_move_to(cross_builder, cx - radius, cy);
-    gsk_path_builder_line_to(cross_builder, cx + radius, cy);
-    g_autoptr(GskPath) cross_path = gsk_path_builder_free_to_path(g_steal_pointer(&cross_builder));
-
     GdkRGBA cross_col = fg;
     cross_col.alpha *= hc ? 0.32f : 0.14f;
-    g_autoptr(GskStroke) cross_stroke = gsk_stroke_new(1.0f);
-    gtk_snapshot_append_stroke(snapshot, cross_path, cross_stroke, &cross_col);
+    gtk_snapshot_append_stroke(snapshot, c->cross_path, c->stroke_1_0, &cross_col);
 
     /* Moving dot clamped cleanly within the boundary rim */
     float dot_r = radius * 0.15f;
@@ -226,33 +301,56 @@ void conttest_snapshot_circular_indicator(GtkWidget *widget,
     } else if (dist > travel && dist > 0.0f) {
         dx *= travel / dist;
         dy *= travel / dist;
+        dist = travel;
     }
 
     if (dist > 1.0f) {
-        g_autoptr(GskPathBuilder) tether_builder = gsk_path_builder_new();
-        gsk_path_builder_move_to(tether_builder, cx, cy);
-        gsk_path_builder_line_to(tether_builder, cx + dx, cy + dy);
-        g_autoptr(GskPath) tether_path =
-            gsk_path_builder_free_to_path(g_steal_pointer(&tether_builder));
-
         GdkRGBA tether_col = accent;
         tether_col.alpha *= 0.45f;
-        g_autoptr(GskStroke) tether_stroke = gsk_stroke_new(1.5f);
-        gtk_snapshot_append_stroke(snapshot, tether_path, tether_stroke, &tether_col);
+        float angle_deg = atan2f(dy, dx) * (180.0f / (float)G_PI);
+        gtk_snapshot_save(snapshot);
+        gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(cx, cy));
+        gtk_snapshot_rotate(snapshot, angle_deg);
+        gtk_snapshot_append_color(snapshot, &tether_col,
+                                  &GRAPHENE_RECT_INIT(0.0f, -0.75f, dist, 1.5f));
+        gtk_snapshot_restore(snapshot);
     }
 
-    g_autoptr(GskPathBuilder) dot_builder = gsk_path_builder_new();
-    gsk_path_builder_add_circle(dot_builder,
-                                &GRAPHENE_POINT_INIT(cx + dx, cy + dy),
-                                dot_r);
-    g_autoptr(GskPath) dot_path = gsk_path_builder_free_to_path(g_steal_pointer(&dot_builder));
+    GskRoundedRect dot_rr;
+    gsk_rounded_rect_init_from_rect(
+        &dot_rr,
+        &GRAPHENE_RECT_INIT(cx + dx - dot_r, cy + dy - dot_r,
+                            dot_r * 2.0f, dot_r * 2.0f),
+        dot_r);
 
     GdkRGBA dot_col = accent;
     dot_col.alpha *= 0.90f;
-    gtk_snapshot_append_fill(snapshot, dot_path, GSK_FILL_RULE_WINDING, &dot_col);
+    gtk_snapshot_push_rounded_clip(snapshot, &dot_rr);
+    gtk_snapshot_append_color(snapshot, &dot_col, &dot_rr.bounds);
+    gtk_snapshot_pop(snapshot);
 
     if (hc) {
-        g_autoptr(GskStroke) dot_rim = gsk_stroke_new(1.0f);
-        gtk_snapshot_append_stroke(snapshot, dot_path, dot_rim, &fg);
+        GskRoundedRect rim_rr;
+        gsk_rounded_rect_init_from_rect(
+            &rim_rr,
+            &GRAPHENE_RECT_INIT(cx + dx - dot_r - 0.5f, cy + dy - dot_r - 0.5f,
+                                dot_r * 2.0f + 1.0f, dot_r * 2.0f + 1.0f),
+            dot_r + 0.5f);
+        const float widths[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        const GdkRGBA colors[4] = { fg, fg, fg, fg };
+        gtk_snapshot_append_border(snapshot, &rim_rr, widths, colors);
     }
+
+    if (!cache)
+        conttest_circular_indicator_cache_clear(&temp_cache);
+}
+
+void conttest_snapshot_circular_indicator(GtkWidget *widget,
+                                          GtkSnapshot *snapshot,
+                                          float canvas_w,
+                                          float canvas_h,
+                                          float x,
+                                          float y) {
+    conttest_snapshot_circular_indicator_cached(widget, snapshot, NULL,
+                                                canvas_w, canvas_h, x, y);
 }

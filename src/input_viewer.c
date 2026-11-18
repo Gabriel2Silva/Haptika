@@ -20,15 +20,21 @@
 #define CONTTEST_MAX_SDL_EXTRA  64
 #define CONTTEST_MAX_EVDEV_ABS  (ABS_MAX + 1)
 
+typedef enum {
+    AXIS_SLOT_NONE = 0,
+    AXIS_SLOT_TRIGGER,
+    AXIS_SLOT_STICK_X,
+    AXIS_SLOT_STICK_Y,
+} AxisSlotRole;
+
 typedef struct {
     GtkWidget *widget;
-    gboolean   is_axis;
-    gboolean   is_trigger;
-    gboolean   is_bipolar;
-    gboolean   is_stick_x;
-    gboolean   is_stick_y;
-    int        stick_id;
-} ElementWidgetSlot;
+    uint8_t    role;      /* AxisSlotRole */
+    int8_t     stick_id;
+} AxisWidgetSlot;
+
+_Static_assert(sizeof(AxisWidgetSlot) == 16,
+               "AxisWidgetSlot must remain 16 bytes for L1D cache density");
 
 struct _ConttestInputViewer {
     GtkBox parent_instance;
@@ -44,12 +50,13 @@ struct _ConttestInputViewer {
     ConttestBackend active_api;
 
     /* Flat O(1) lookup tables partitioned by ConttestElementDomain so IDs
-     * from different domains never collide. */
-    ElementWidgetSlot buttons[CONTTEST_MAX_BUTTONS];
-    ElementWidgetSlot touchpad_buttons[CONTTEST_TOUCHPAD_MAX_FINGERS];
-    ElementWidgetSlot sdl_axes[CONTTEST_MAX_SDL_AXES];
-    ElementWidgetSlot sdl_extra_axes[CONTTEST_MAX_SDL_EXTRA];
-    ElementWidgetSlot evdev_abs_axes[CONTTEST_MAX_EVDEV_ABS];
+     * from different domains never collide. Button domains store bare widget
+     * pointers (saving ~21 KiB of unused axis metadata). */
+    GtkWidget     *buttons[CONTTEST_MAX_BUTTONS];
+    GtkWidget     *touchpad_buttons[CONTTEST_TOUCHPAD_MAX_FINGERS];
+    AxisWidgetSlot sdl_axes[CONTTEST_MAX_SDL_AXES];
+    AxisWidgetSlot sdl_extra_axes[CONTTEST_MAX_SDL_EXTRA];
+    AxisWidgetSlot evdev_abs_axes[CONTTEST_MAX_EVDEV_ABS];
 
     GtkWidget *touchpad_widget;                     /* NULL if no touchpad */
     double stick_positions[CONTTEST_MAX_STICKS][2]; /* [stick_id][axis (0=x, 1=y)] */
@@ -83,7 +90,7 @@ struct _ConttestInputViewer {
 
 G_DEFINE_TYPE(ConttestInputViewer, conttest_input_viewer, GTK_TYPE_BOX)
 
-static inline ElementWidgetSlot *lookup_slot(ConttestInputViewer *self,
+static inline GtkWidget **lookup_button_slot(ConttestInputViewer *self,
                                              ConttestElementDomain domain,
                                              int element_id) {
     if (element_id < 0)
@@ -93,6 +100,17 @@ static inline ElementWidgetSlot *lookup_slot(ConttestInputViewer *self,
         return (element_id < CONTTEST_MAX_BUTTONS) ? &self->buttons[element_id] : NULL;
     case CONTTEST_ELEMENT_TOUCHPAD_FINGER:
         return (element_id < CONTTEST_TOUCHPAD_MAX_FINGERS) ? &self->touchpad_buttons[element_id] : NULL;
+    default:
+        return NULL;
+    }
+}
+
+static inline AxisWidgetSlot *lookup_axis_slot(ConttestInputViewer *self,
+                                               ConttestElementDomain domain,
+                                               int element_id) {
+    if (element_id < 0)
+        return NULL;
+    switch (domain) {
     case CONTTEST_ELEMENT_SDL_AXIS:
         return (element_id < CONTTEST_MAX_SDL_AXES) ? &self->sdl_axes[element_id] : NULL;
     case CONTTEST_ELEMENT_SDL_EXTRA:
@@ -546,7 +564,21 @@ gboolean conttest_input_viewer_handle_layout(gpointer data) {
             continue;
         }
 
-        ElementWidgetSlot *slot = lookup_slot(self, def->domain, def->element_id);
+        if (!def->is_axis) {
+            GtkWidget **btn_slot = lookup_button_slot(self, def->domain, def->element_id);
+            if (!btn_slot) {
+                g_warning("Element (%d, %d) outside flat lookup bounds, skipping",
+                          def->domain, def->element_id);
+                continue;
+            }
+            GtkWidget *widget = conttest_button_indicator_new(def->name);
+            adw_wrap_box_append(ADW_WRAP_BOX(self->buttons_flow), widget);
+            gtk_widget_set_visible(self->buttons_flow, TRUE);
+            *btn_slot = widget;
+            continue;
+        }
+
+        AxisWidgetSlot *slot = lookup_axis_slot(self, def->domain, def->element_id);
         if (!slot) {
             g_warning("Element (%d, %d) outside flat lookup bounds, skipping",
                       def->domain, def->element_id);
@@ -554,13 +586,9 @@ gboolean conttest_input_viewer_handle_layout(gpointer data) {
         }
 
         GtkWidget *widget = NULL;
-        gboolean slot_is_trigger = def->is_trigger;
+        AxisSlotRole role = AXIS_SLOT_TRIGGER;
 
-        if (!def->is_axis) {
-            widget = conttest_button_indicator_new(def->name);
-            adw_wrap_box_append(ADW_WRAP_BOX(self->buttons_flow), widget);
-            gtk_widget_set_visible(self->buttons_flow, TRUE);
-        } else if (def->is_trigger) {
+        if (def->is_trigger) {
             widget = conttest_trigger_bar_new(def->name);
             adw_wrap_box_append(ADW_WRAP_BOX(self->triggers_box), widget);
             gtk_widget_set_visible(self->triggers_box, TRUE);
@@ -575,13 +603,13 @@ gboolean conttest_input_viewer_handle_layout(gpointer data) {
                     gtk_widget_set_visible(self->sticks_box, TRUE);
                 }
                 widget = stick_widgets[def->stick_id];
+                role = def->is_stick_x ? AXIS_SLOT_STICK_X : AXIS_SLOT_STICK_Y;
             } else {
                 g_warning("Stick id %d exceeds CONTTEST_MAX_STICKS (%d), skipping", def->stick_id, CONTTEST_MAX_STICKS);
                 continue;
             }
         } else {
             /* Generic axis: render as a trigger bar (bipolar if signed range) */
-            slot_is_trigger = TRUE;
             widget = conttest_trigger_bar_new(def->name);
             if (def->is_bipolar)
                 conttest_trigger_bar_set_bipolar(CONTTEST_TRIGGER_BAR(widget), TRUE);
@@ -589,13 +617,9 @@ gboolean conttest_input_viewer_handle_layout(gpointer data) {
             gtk_widget_set_visible(self->triggers_box, TRUE);
         }
 
-        slot->widget = widget;
-        slot->is_axis = def->is_axis;
-        slot->is_trigger = slot_is_trigger;
-        slot->is_bipolar = def->is_bipolar;
-        slot->is_stick_x = def->is_stick_x;
-        slot->is_stick_y = def->is_stick_y;
-        slot->stick_id = def->stick_id;
+        slot->widget   = widget;
+        slot->role     = (uint8_t)role;
+        slot->stick_id = (int8_t)def->stick_id;
     }
 
     for (int i = 0; i < layout->num_elements; ++i) {
@@ -627,39 +651,40 @@ static void apply_input_event(ConttestInputViewer *self, const ConttestInputEven
                                            CLAMP((double)ev->sensor[2] / GYRO_MAX, -1.0, 1.0));
         }
     } else if (ev->type == INPUT_EVENT_TOUCHPAD) {
-        ElementWidgetSlot *slot = lookup_slot(self, ev->domain, ev->element_id);
-        if (slot) {
-            if (slot->widget && !slot->is_axis)
-                conttest_button_indicator_set_pressed(CONTTEST_BUTTON_INDICATOR(slot->widget),
-                                                      ev->button_pressed);
+        GtkWidget **btn_slot = lookup_button_slot(self, ev->domain, ev->element_id);
+        if (btn_slot) {
+            if (*btn_slot)
+                conttest_button_indicator_set_pressed(CONTTEST_BUTTON_INDICATOR(*btn_slot),
+                                                      (gboolean)ev->button_pressed);
             if (self->touchpad_widget)
                 conttest_touchpad_set_finger_indexed(CONTTEST_TOUCHPAD(self->touchpad_widget),
                                                      (guint)ev->element_id,
-                                                     ev->button_pressed,
+                                                     (gboolean)ev->button_pressed,
                                                      ev->touch_x,
                                                      ev->touch_y);
         }
     } else if (ev->type == INPUT_EVENT_BUTTON) {
-        ElementWidgetSlot *slot = lookup_slot(self, ev->domain, ev->element_id);
-        if (slot && slot->widget && !slot->is_axis) {
-            conttest_button_indicator_set_pressed(CONTTEST_BUTTON_INDICATOR(slot->widget),
-                                                  ev->button_pressed);
+        GtkWidget **btn_slot = lookup_button_slot(self, ev->domain, ev->element_id);
+        if (btn_slot && *btn_slot) {
+            conttest_button_indicator_set_pressed(CONTTEST_BUTTON_INDICATOR(*btn_slot),
+                                                  (gboolean)ev->button_pressed);
         }
     } else if (ev->type == INPUT_EVENT_AXIS) {
-        ElementWidgetSlot *slot = lookup_slot(self, ev->domain, ev->element_id);
-        if (slot && slot->widget && slot->is_axis) {
-            if (slot->is_trigger) {
-                conttest_trigger_bar_set_value(CONTTEST_TRIGGER_BAR(slot->widget), ev->axis_value);
-            } else if (slot->is_stick_x) {
+        AxisWidgetSlot *slot = lookup_axis_slot(self, ev->domain, ev->element_id);
+        if (slot && slot->widget) {
+            double val = (double)ev->axis_value;
+            if (slot->role == AXIS_SLOT_TRIGGER) {
+                conttest_trigger_bar_set_value(CONTTEST_TRIGGER_BAR(slot->widget), val);
+            } else if (slot->role == AXIS_SLOT_STICK_X) {
                 if (slot->stick_id >= 0 && slot->stick_id < CONTTEST_MAX_STICKS) {
-                    self->stick_positions[slot->stick_id][0] = ev->axis_value;
+                    self->stick_positions[slot->stick_id][0] = val;
                     conttest_analog_stick_set_position(CONTTEST_ANALOG_STICK(slot->widget),
                                                        self->stick_positions[slot->stick_id][0],
                                                        self->stick_positions[slot->stick_id][1]);
                 }
-            } else if (slot->is_stick_y) {
+            } else if (slot->role == AXIS_SLOT_STICK_Y) {
                 if (slot->stick_id >= 0 && slot->stick_id < CONTTEST_MAX_STICKS) {
-                    self->stick_positions[slot->stick_id][1] = ev->axis_value;
+                    self->stick_positions[slot->stick_id][1] = val;
                     conttest_analog_stick_set_position(CONTTEST_ANALOG_STICK(slot->widget),
                                                        self->stick_positions[slot->stick_id][0],
                                                        self->stick_positions[slot->stick_id][1]);
@@ -696,13 +721,14 @@ gboolean conttest_input_viewer_drain_ring(gpointer data) {
         /* Re-arm coalescing flag under seq_cst, then verify no producer pushed
          * between the final empty pop() and clearing scheduled. */
         atomic_store_explicit(&ring->scheduled, false, memory_order_seq_cst);
+        atomic_thread_fence(memory_order_seq_cst);
         unsigned int head = atomic_load_explicit(&ring->head, memory_order_relaxed);
         unsigned int tail = atomic_load_explicit(&ring->tail, memory_order_seq_cst);
         if (head == tail)
             break;
 
         /* Another event landed in the window: reclaim ownership unless the
-         * producer already queued a fresh idle source. */
+         * producer already queued a fresh wakeup. */
         if (atomic_exchange_explicit(&ring->scheduled, true, memory_order_seq_cst))
             break;
     }

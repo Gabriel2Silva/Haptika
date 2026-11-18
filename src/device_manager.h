@@ -58,8 +58,15 @@ void conttest_device_manager_foreach(ConttestDeviceManager *self,
                                      ConttestDeviceForeachFunc func,
                                      gpointer user_data);
 
+/* Disable unused high-frequency SDL input event types (axis, button, touchpad,
+ * sensor, update-complete) while preserving hotplug, remap, and battery events.
+ * Haptika samples SDL state directly at 1 kHz, so suppressing unused per-sample
+ * queue events avoids thousands of mutex-locked SDL_Event queue operations/sec. */
+void conttest_sdl_configure_events(void);
+
 /* Pump the SDL event queue and record the pump timestamp so periodic
  * hotplug timers can skip redundant back-to-back pumps on active frames. */
 void conttest_sdl_pump_events(void);
+void conttest_sdl_pump_events_at(gint64 monotonic_now_us);
 
 G_END_DECLS

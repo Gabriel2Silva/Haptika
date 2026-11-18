@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "ds4_info.h"
 #include "device_manager.h"
 #include "controller_info_parsers.h"
@@ -26,7 +27,7 @@ static gpointer fetch_ds4_info(const char *hidraw_node,
     DS4InfoData *info = g_new0(DS4InfoData, 1);
     info->is_bt = is_bt;
 
-    int fd = open(hidraw_node, O_RDONLY | O_NONBLOCK);
+    int fd = open(hidraw_node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         int saved_errno = errno;
         char *msg = g_strdup_printf(_("Cannot open %s: %s"), hidraw_node, g_strerror(saved_errno));
@@ -96,8 +97,10 @@ static void on_fetch_done(GObject *source, GAsyncResult *result, gpointer user_d
 
         AdwPreferencesGroup *hw_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
         adw_preferences_group_set_title(hw_group, _("Hardware"));
-        if (!info->ok && info->error_msg[0] != '\0')
-            adw_preferences_group_set_description(hw_group, info->error_msg);
+        if (!info->ok && info->error_msg[0] != '\0') {
+            g_autofree char *escaped = g_markup_escape_text(info->error_msg, -1);
+            adw_preferences_group_set_description(hw_group, escaped);
+        }
         gtk_box_append(GTK_BOX(box), GTK_WIDGET(hw_group));
 
         const char *auth;

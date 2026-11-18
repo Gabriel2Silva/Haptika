@@ -29,6 +29,14 @@ static void test_vid_pid_predicates_and_parsing(void) {
     g_assert_false(conttest_parse_vid_pid("", '/', &v, &p));
     g_assert_false(conttest_parse_vid_pid("3/54c", '/', &v, &p));
     g_assert_false(conttest_parse_vid_pid("3/54c/ce6", ':', &v, &p));
+    g_assert_false(conttest_parse_vid_pid("3/54c/ce6", ';', &v, &p));
+    /* Reject >16-bit overflow, signed tokens, and trailing garbage */
+    g_assert_false(conttest_parse_vid_pid("3/1054c/ce6/8111", '/', &v, &p));
+    g_assert_false(conttest_parse_vid_pid("3/54c/10ce6/8111", '/', &v, &p));
+    g_assert_false(conttest_parse_vid_pid("0005:0001054C:000009CC", ':', &v, &p));
+    g_assert_false(conttest_parse_vid_pid("3/-1/ce6", '/', &v, &p));
+    g_assert_false(conttest_parse_vid_pid("3/+54c/ce6", '/', &v, &p));
+    g_assert_false(conttest_parse_vid_pid("3/54c/ce6xyz", '/', &v, &p));
 }
 
 static void test_connection_state_classification(void) {
@@ -308,6 +316,25 @@ static void test_inputplumber_managed_objects_and_matching(void) {
     g_hash_table_destroy(source_devnodes);
 }
 
+typedef struct {
+    const char *syspath;
+    const char *subsystem;
+    const char *devtype;
+} MockAncestor;
+
+static char **collect_mock_hw_keys(const MockAncestor *chain, gsize len) {
+    GPtrArray *keys = g_ptr_array_new();
+    gboolean saw_bt = FALSE;
+    for (gsize i = 0; i < len; i++) {
+        if (conttest_udev_ancestor_is_hw_key(chain[i].subsystem,
+                                             chain[i].devtype, &saw_bt)) {
+            g_ptr_array_add(keys, g_strdup(chain[i].syspath));
+        }
+    }
+    g_ptr_array_add(keys, NULL);
+    return (char **)g_ptr_array_free(keys, FALSE);
+}
+
 static void test_hw_keys_matching(void) {
     /* Identical syspaths match even without ancestor keys */
     g_assert_true(conttest_hw_keys_match(
@@ -367,6 +394,97 @@ static void test_hw_keys_matching(void) {
     g_assert_true(conttest_hw_keys_match(
         "/sys/devices/virtual/input/input99/event9", keys_child_with_parent,
         "/sys/devices/virtual/input/input99", keys_parent_self));
+
+    /* Classic Bluetooth HIDP: two distinct controllers paired to the same USB
+     * Bluetooth adapter (1-14:1.0 -> bluetooth/hci0) must NOT coalesce via the
+     * shared host radio or USB Bluetooth interface, while event* and hidraw*
+     * of the same ACL link (hci0:256) DO match. */
+    static const MockAncestor bt_pad1_evdev[] = {
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:256/0005:054C:09CC.0001/input/input30/event20", "input", NULL },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:256/0005:054C:09CC.0001/input/input30", "input", NULL },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:256/0005:054C:09CC.0001", "hid", NULL },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:256", "bluetooth", "link" },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0", "bluetooth", "host" },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0", "usb", "usb_interface" },
+        { "/sys/devices/pci0/usb1/1-14", "usb", "usb_device" },
+    };
+    static const MockAncestor bt_pad1_hidraw[] = {
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:256/0005:054C:09CC.0001/hidraw/hidraw4", "hidraw", NULL },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:256/0005:054C:09CC.0001", "hid", NULL },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:256", "bluetooth", "link" },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0", "bluetooth", "host" },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0", "usb", "usb_interface" },
+        { "/sys/devices/pci0/usb1/1-14", "usb", "usb_device" },
+    };
+    static const MockAncestor bt_pad2_hidraw[] = {
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:257/0005:054C:0CE6.0002/hidraw/hidraw5", "hidraw", NULL },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:257/0005:054C:0CE6.0002", "hid", NULL },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0/hci0:257", "bluetooth", "link" },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0/bluetooth/hci0", "bluetooth", "host" },
+        { "/sys/devices/pci0/usb1/1-14/1-14:1.0", "usb", "usb_interface" },
+        { "/sys/devices/pci0/usb1/1-14", "usb", "usb_device" },
+    };
+
+    g_auto(GStrv) bt1_ev_keys = collect_mock_hw_keys(bt_pad1_evdev, G_N_ELEMENTS(bt_pad1_evdev));
+    g_auto(GStrv) bt1_hr_keys = collect_mock_hw_keys(bt_pad1_hidraw, G_N_ELEMENTS(bt_pad1_hidraw));
+    g_auto(GStrv) bt2_hr_keys = collect_mock_hw_keys(bt_pad2_hidraw, G_N_ELEMENTS(bt_pad2_hidraw));
+
+    g_assert_true(conttest_hw_keys_match(
+        bt_pad1_evdev[0].syspath, (const char * const *)bt1_ev_keys,
+        bt_pad1_hidraw[0].syspath, (const char * const *)bt1_hr_keys));
+    g_assert_false(conttest_hw_keys_match(
+        bt_pad1_evdev[0].syspath, (const char * const *)bt1_ev_keys,
+        bt_pad2_hidraw[0].syspath, (const char * const *)bt2_hr_keys));
+}
+
+static void test_serial_and_candidate_corroboration(void) {
+    g_assert_false(conttest_serial_is_usable(NULL));
+    g_assert_false(conttest_serial_is_usable(""));
+    g_assert_false(conttest_serial_is_usable("0"));
+    g_assert_false(conttest_serial_is_usable("00:00:00:00:00:00"));
+    g_assert_false(conttest_serial_is_usable("abc"));
+    g_assert_true(conttest_serial_is_usable("00:1a:7d:da:71:13"));
+    g_assert_true(conttest_serial_is_usable("1000"));
+
+    g_assert_true(conttest_serial_matches("aa:bb:cc:dd:ee:ff", "AA-BB-CC-DD-EE-FF"));
+    g_assert_true(conttest_serial_matches("aabbccddeeff", "AA:BB:CC:DD:EE:FF"));
+    g_assert_false(conttest_serial_matches("aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ee:00"));
+    g_assert_false(conttest_serial_matches(NULL, "aabb"));
+
+    g_assert_false(conttest_conn_contradicts(SDL_JOYSTICK_CONNECTION_UNKNOWN,
+                                             SDL_JOYSTICK_CONNECTION_WIRED));
+    g_assert_true(conttest_conn_contradicts(SDL_JOYSTICK_CONNECTION_WIRELESS,
+                                            SDL_JOYSTICK_CONNECTION_WIRED));
+
+    /* Matching usable serials yield STRONG even if connection types disagree */
+    g_assert_cmpint(
+        conttest_classify_candidate_pair("aa:bb:cc:dd:ee:ff",
+                                         SDL_JOYSTICK_CONNECTION_WIRED,
+                                         "AABBCCDDEEFF",
+                                         SDL_JOYSTICK_CONNECTION_WIRELESS),
+        ==, CONTTEST_MATCH_STRONG);
+
+    /* Distinct usable serials always REJECT */
+    g_assert_cmpint(
+        conttest_classify_candidate_pair("aa:bb:cc:dd:ee:01",
+                                         SDL_JOYSTICK_CONNECTION_WIRED,
+                                         "aa:bb:cc:dd:ee:02",
+                                         SDL_JOYSTICK_CONNECTION_WIRED),
+        ==, CONTTEST_MATCH_REJECT);
+
+    /* Unusable/missing serials fall back to connection compatibility */
+    g_assert_cmpint(
+        conttest_classify_candidate_pair("0000",
+                                         SDL_JOYSTICK_CONNECTION_WIRED,
+                                         NULL,
+                                         SDL_JOYSTICK_CONNECTION_WIRELESS),
+        ==, CONTTEST_MATCH_REJECT);
+    g_assert_cmpint(
+        conttest_classify_candidate_pair(NULL,
+                                         SDL_JOYSTICK_CONNECTION_WIRED,
+                                         NULL,
+                                         SDL_JOYSTICK_CONNECTION_UNKNOWN),
+        ==, CONTTEST_MATCH_WEAK);
 }
 
 int main(int argc, char *argv[]) {
@@ -381,5 +499,7 @@ int main(int argc, char *argv[]) {
                     test_inputplumber_managed_objects_and_matching);
     g_test_add_func("/device_match/hw_keys_matching",
                     test_hw_keys_matching);
+    g_test_add_func("/device_match/serial_and_candidate_corroboration",
+                    test_serial_and_candidate_corroboration);
     return g_test_run();
 }

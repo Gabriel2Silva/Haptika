@@ -1,9 +1,11 @@
+#define _POSIX_C_SOURCE 200809L
 #include "device_manager.h"
 #include "device_matching.h"
+#include <fcntl.h>
 #include <gio/gio.h>
 #include <glib-unix.h>
 #include <libudev.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -13,8 +15,8 @@
 #define BATTERY_POLL_INTERVAL_SEC 5
 
 /* Main-thread monotonic timestamp of the most recent SDL_PumpEvents() call,
- * used to coalesce back-to-back pumps between the 50 ms poll timer and the
- * viewer's GdkFrameClock tick callback. */
+ * used to coalesce back-to-back pumps between the 50 ms hotplug timer and the
+ * active SDL3 session's 1 kHz poll source. */
 static gint64 last_sdl_pump_us = 0;
 
 void conttest_sdl_pump_events(void) {
@@ -420,6 +422,22 @@ static char *probe_ds3_battery_syspath(struct udev *udev,
   return resolved_path;
 }
 
+static gboolean read_sysfs_attr_line(const char *syspath, const char *attr,
+                                     char *buf, size_t buf_size) {
+  if (!syspath || !attr || !buf || buf_size < 2)
+    return FALSE;
+  g_autofree char *path = g_build_filename(syspath, attr, NULL);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return FALSE;
+  ssize_t n = read(fd, buf, buf_size - 1);
+  close(fd);
+  if (n <= 0)
+    return FALSE;
+  buf[n] = '\0';
+  return TRUE;
+}
+
 static gboolean poll_ds3_battery_sysfs(const char *syspath,
                                        SDL_PowerState *state,
                                        int *percent) {
@@ -430,40 +448,29 @@ static gboolean poll_ds3_battery_sysfs(const char *syspath,
     return FALSE;
 
   char buf[64];
-  FILE *f;
 
   /* Read capacity */
-  g_autofree char *cap_path = g_build_filename(syspath, "capacity", NULL);
-  f = fopen(cap_path, "r");
-  if (f) {
-    if (fgets(buf, sizeof(buf), f)) {
-      char *end;
-      long val = strtol(buf, &end, 10);
-      if (end != buf && val >= 0 && val <= 100) {
-        *percent = (int)val;
-      }
+  if (read_sysfs_attr_line(syspath, "capacity", buf, sizeof(buf))) {
+    char *end = NULL;
+    long val = strtol(buf, &end, 10);
+    if (end != buf && val >= 0 && val <= 100) {
+      *percent = (int)val;
     }
-    fclose(f);
   }
 
   /* Read status */
-  g_autofree char *status_path = g_build_filename(syspath, "status", NULL);
-  f = fopen(status_path, "r");
-  if (f) {
-    if (fgets(buf, sizeof(buf), f)) {
-      g_strstrip(buf);
-      if (g_strcmp0(buf, "Charging") == 0) {
-        *state = SDL_POWERSTATE_CHARGING;
-        *percent = -1; /* Suppress unreliable DS3 charging percentage */
-      } else if (g_strcmp0(buf, "Full") == 0) {
-        *state = SDL_POWERSTATE_CHARGED;
-        *percent = 100;
-      } else if (g_strcmp0(buf, "Discharging") == 0 ||
-                 g_strcmp0(buf, "Not charging") == 0) {
-        *state = SDL_POWERSTATE_ON_BATTERY;
-      }
+  if (read_sysfs_attr_line(syspath, "status", buf, sizeof(buf))) {
+    g_strstrip(buf);
+    if (g_strcmp0(buf, "Charging") == 0) {
+      *state = SDL_POWERSTATE_CHARGING;
+      *percent = -1; /* Suppress unreliable DS3 charging percentage */
+    } else if (g_strcmp0(buf, "Full") == 0) {
+      *state = SDL_POWERSTATE_CHARGED;
+      *percent = 100;
+    } else if (g_strcmp0(buf, "Discharging") == 0 ||
+               g_strcmp0(buf, "Not charging") == 0) {
+      *state = SDL_POWERSTATE_ON_BATTERY;
     }
-    fclose(f);
   }
   return TRUE;
 }
@@ -510,77 +517,6 @@ static ConttestDevice *find_device_by_evdev_syspath(ConttestDeviceManager *self,
     }
   }
   return NULL;
-}
-
-typedef enum {
-  MATCH_REJECT,
-  MATCH_WEAK,
-  MATCH_STRONG,
-} CandidateMatch;
-
-/* Serial numbers are only useful for identity when they are non-trivial.
- * Some drivers expose placeholders such as "0". */
-static gboolean serial_is_usable(const char *serial) {
-  if (!serial || !*serial)
-    return FALSE;
-
-  guint chars = 0;
-  gboolean nonzero = FALSE;
-  for (const unsigned char *p = (const unsigned char *)serial; *p; p++) {
-    if (!g_ascii_isalnum(*p))
-      continue;
-    chars++;
-    if (*p != '0')
-      nonzero = TRUE;
-  }
-  return chars >= 4 && nonzero;
-}
-
-/* Compare serials ignoring separators and case, so MAC addresses and UIDs
- * written as "aa:bb:..." or "AABB..." still match. */
-static gboolean serial_matches(const char *a, const char *b) {
-  if (!a || !b)
-    return FALSE;
-
-  while (*a || *b) {
-    while (*a && !g_ascii_isalnum((guchar)*a))
-      a++;
-    while (*b && !g_ascii_isalnum((guchar)*b))
-      b++;
-    if (g_ascii_tolower((guchar)*a) != g_ascii_tolower((guchar)*b))
-      return FALSE;
-    if (*a)
-      a++;
-    if (*b)
-      b++;
-  }
-  return TRUE;
-}
-
-static gboolean conn_contradicts(SDL_JoystickConnectionState a,
-                                 SDL_JoystickConnectionState b) {
-  if (a == SDL_JOYSTICK_CONNECTION_UNKNOWN ||
-      a == SDL_JOYSTICK_CONNECTION_INVALID ||
-      b == SDL_JOYSTICK_CONNECTION_UNKNOWN ||
-      b == SDL_JOYSTICK_CONNECTION_INVALID)
-    return FALSE;
-  return a != b;
-}
-
-static CandidateMatch classify_pair(const char *serial_a,
-                                    SDL_JoystickConnectionState conn_a,
-                                    const char *serial_b,
-                                    SDL_JoystickConnectionState conn_b) {
-  /* A serial is the strongest identity available; a matching serial is
-   * preferred over a connection-type disagreement, which can come from
-   * different reporting layers for the same link. */
-  if (serial_is_usable(serial_a) && serial_is_usable(serial_b))
-    return serial_matches(serial_a, serial_b) ? MATCH_STRONG : MATCH_REJECT;
-
-  if (conn_contradicts(conn_a, conn_b))
-    return MATCH_REJECT;
-
-  return MATCH_WEAK;
 }
 
 static ConttestDevice *find_device_by_hardware_for_sdl(
@@ -633,13 +569,13 @@ static ConttestDevice *find_device_by_hardware_for_sdl(
       if (d->has_evdev && !d->has_sdl && !d->evdev_meta.is_virtual &&
           d->virtual_kind == CONTTEST_VIRTUAL_NONE &&
           d->vendor_id == sdl_vid && d->product_id == sdl_pid) {
-        CandidateMatch score = classify_pair(sdl_serial, sdl_conn,
-                                             d->evdev_meta.serial,
-                                             d->evdev_meta.udev_conn);
-        if (score == MATCH_STRONG) {
+        ConttestCandidateMatch score = conttest_classify_candidate_pair(
+            sdl_serial, sdl_conn,
+            d->evdev_meta.serial, d->evdev_meta.udev_conn);
+        if (score == CONTTEST_MATCH_STRONG) {
           strong_match = d;
           strong_count++;
-        } else if (score == MATCH_WEAK) {
+        } else if (score == CONTTEST_MATCH_WEAK) {
           weak_match = d;
           weak_count++;
         }
@@ -717,12 +653,12 @@ static ConttestDevice *find_device_by_hardware_for_evdev(
               ? SDL_GetGamepadConnectionState(d->sdl_gamepad)
               : SDL_JOYSTICK_CONNECTION_UNKNOWN;
 
-          CandidateMatch score = classify_pair(udev_serial, udev_conn,
-                                               sdl_serial, sdl_conn);
-          if (score == MATCH_STRONG) {
+          ConttestCandidateMatch score = conttest_classify_candidate_pair(
+              udev_serial, udev_conn, sdl_serial, sdl_conn);
+          if (score == CONTTEST_MATCH_STRONG) {
             strong_match = d;
             strong_count++;
-          } else if (score == MATCH_WEAK) {
+          } else if (score == CONTTEST_MATCH_WEAK) {
             weak_match = d;
             weak_count++;
           }
@@ -1588,7 +1524,7 @@ static void on_sdl_udev_probe_done(GObject *source, GAsyncResult *res,
     d->sdl_udev_seq++;
 
     ConttestDevice *existing = NULL;
-    if (!d->has_evdev) {
+    if (was_pending && !d->has_evdev) {
       const char *sdl_serial = d->sdl_gamepad
           ? SDL_GetGamepadSerial(d->sdl_gamepad) : NULL;
       SDL_JoystickConnectionState sdl_conn = d->sdl_gamepad
@@ -2119,7 +2055,7 @@ static gboolean on_sdl_sync_idle(gpointer user_data) {
 static void schedule_sdl_sync(ConttestDeviceManager *self) {
   if (!self->disposed && !self->sdl_sync_idle_id) {
     self->sdl_sync_idle_id = g_idle_add_full(
-        G_PRIORITY_DEFAULT_IDLE, on_sdl_sync_idle, manager_weak_ref_new(self),
+        G_PRIORITY_HIGH_IDLE, on_sdl_sync_idle, manager_weak_ref_new(self),
         manager_weak_ref_free);
   }
 }

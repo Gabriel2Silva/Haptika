@@ -145,6 +145,8 @@ static gboolean name_contains_ci(const char *name, const char *keyword) {
 }
 
 static const char *get_icon_for_name(const char *name) {
+    if (!name)
+        return "stadia-symbolic";
     char *lower = g_ascii_strdown(name, -1);
     const char *result = "stadia-symbolic";
 
@@ -262,6 +264,7 @@ static void update_row_battery(RowContext *ctx, const ConttestDevice *device) {
 
 static GtkWidget *create_row_for_device(ConttestSelectorView *self, ConttestDevice *device) {
     GtkWidget *row = adw_action_row_new();
+    adw_preferences_row_set_use_markup(ADW_PREFERENCES_ROW(row), FALSE);
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), conttest_device_get_name(device));
     char *subtitle = format_device_subtitle(device);
     adw_action_row_set_subtitle(ADW_ACTION_ROW(row), subtitle);

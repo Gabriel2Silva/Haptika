@@ -7,12 +7,15 @@
 #include <stdint.h>
 #include <string.h>
 
-#define JOY_EXTRA_AXES_MAX   64
-#define TOUCHPAD_FINGERS_MAX 8
-#define AXIS_NOISE_EPSILON   (256.0 / 32768.0)
-/* Main-thread state sampling period. GTK still paints on the frame clock;
- * this only controls how often SDL state is read and pushed to the widgets. */
-#define SDL_POLL_INTERVAL_MS 1
+#define JOY_EXTRA_AXES_MAX     64
+#define TOUCHPAD_FINGERS_MAX   8
+#define AXIS_NOISE_EPSILON     (256.0 / 32768.0)
+/* Main-thread state sampling periods. GTK still paints on the frame clock;
+ * active mapped windows sample at 1 kHz below GDK_PRIORITY_REDRAW so frame
+ * painting is never starved, and suspended/unmapped windows back off to 50 ms. */
+#define SDL_POLL_ACTIVE_US     (1 * G_TIME_SPAN_MILLISECOND)
+#define SDL_POLL_SUSPENDED_US  (50 * G_TIME_SPAN_MILLISECOND)
+#define SDL_POLL_PRIORITY      (GDK_PRIORITY_REDRAW + 5)
 
 static const struct {
     SDL_GamepadButton btn;
@@ -63,15 +66,16 @@ static const struct {
 };
 
 typedef struct {
-    gint                  ref_count;  /* 1 for session + 1 while poll source is attached */
+    gint                  ref_count;     /* 1 for session + 1 while poll source is attached */
+    gint                  stopped;       /* atomic boolean owned by SdlSessionData */
     SDL_JoystickID        sdl_id;
-    SDL_Gamepad          *gamepad;    /* owned refcounted handle closed on cleanup */
-    SDL_Joystick         *joystick;   /* borrowed from gamepad; valid until SDL_CloseGamepad */
+    SDL_Gamepad          *gamepad;       /* owned refcounted handle closed on cleanup */
+    SDL_Joystick         *joystick;      /* borrowed from gamepad; valid until SDL_CloseGamepad */
     int                   joy_axis_base;
     int                   joy_extra_axes;
     ViewerSessionContext *ctx;
-    gint                 *atomic_stop_flag;
-    guint                 timer_id;
+    GSource              *poll_source;
+    gboolean              window_active;
     gboolean              btn_state[SDL_GAMEPAD_BUTTON_COUNT];
     double                axis_state[SDL_GAMEPAD_AXIS_COUNT];
     double                joy_axis_state[JOY_EXTRA_AXES_MAX];
@@ -119,11 +123,19 @@ static gboolean axis_value_changed(double prev, double next, double epsilon) {
     return fabs(next - prev) > epsilon;
 }
 
-static void sdl3_poll_timer_destroyed(gpointer user_data) {
+static void sdl3_poll_source_destroyed(gpointer user_data) {
     SdlSessionData *data = user_data;
-    data->timer_id = 0;
     viewer_session_context_unref(data->ctx);
     sdl_session_data_unref(data);
+}
+
+static gboolean viewer_is_actively_visible(ConttestInputViewer *viewer) {
+    if (!gtk_widget_get_mapped(GTK_WIDGET(viewer)))
+        return FALSE;
+    GtkRoot *root = gtk_widget_get_root(GTK_WIDGET(viewer));
+    if (GTK_IS_WINDOW(root) && gtk_window_is_suspended(GTK_WINDOW(root)))
+        return FALSE;
+    return TRUE;
 }
 
 /* Main-thread ~1 ms state sampler. Only widget state is updated here; the
@@ -132,19 +144,23 @@ static void sdl3_poll_timer_destroyed(gpointer user_data) {
 static gboolean sdl3_poll_timer(gpointer user_data) {
     SdlSessionData *data = user_data;
 
-    if (g_atomic_int_get(data->atomic_stop_flag) ||
+    if (g_atomic_int_get(&data->stopped) ||
         !g_atomic_int_get(&data->ctx->active)) {
         return G_SOURCE_REMOVE;
     }
 
-    if (!SDL_GamepadConnected(data->gamepad))
+    if (!data->gamepad || !SDL_GamepadConnected(data->gamepad))
         return G_SOURCE_REMOVE;
-
-    conttest_sdl_pump_events();
 
     ConttestInputViewer *viewer = data->ctx->viewer;
     if (!viewer)
         return G_SOURCE_REMOVE;
+
+    data->window_active = viewer_is_actively_visible(viewer);
+    if (!data->window_active)
+        return G_SOURCE_CONTINUE;
+
+    conttest_sdl_pump_events();
 
     for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++) {
         SDL_GamepadButton btn = (SDL_GamepadButton)i;
@@ -263,12 +279,31 @@ static gboolean sdl3_poll_timer(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
+static gboolean sdl3_poll_source_dispatch(GSource *source,
+                                          GSourceFunc callback,
+                                          gpointer user_data) {
+    if (!callback)
+        return G_SOURCE_REMOVE;
+    SdlSessionData *data = user_data;
+    if (!callback(user_data)) {
+        g_source_set_ready_time(source, -1);
+        return G_SOURCE_REMOVE;
+    }
+    gint64 delay = data->window_active ? SDL_POLL_ACTIVE_US : SDL_POLL_SUSPENDED_US;
+    g_source_set_ready_time(source, g_source_get_time(source) + delay);
+    return G_SOURCE_CONTINUE;
+}
+
+static GSourceFuncs sdl3_poll_source_funcs = {
+    .dispatch = sdl3_poll_source_dispatch,
+};
+
 static void free_sdl3_session(ConttestInputSession *session) {
     SdlSessionData *data = session->impl_data;
-    if (data->timer_id != 0) {
-        /* Invokes sdl3_poll_timer_destroyed synchronously, clearing timer_id
-         * and releasing the poll source's ctx/data refs. */
-        g_source_remove(data->timer_id);
+    g_atomic_int_set(&data->stopped, 1);
+    if (data->poll_source) {
+        g_source_destroy(data->poll_source);
+        g_clear_pointer(&data->poll_source, g_source_unref);
     }
     sdl_session_data_close_gamepad(data);
     sdl_session_data_unref(data);
@@ -295,7 +330,7 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
     data->gamepad          = gamepad;
     data->joystick         = SDL_GetGamepadJoystick(gamepad);
     data->ctx              = ctx;
-    data->atomic_stop_flag = &session->atomic_stop_flag;
+    data->window_active    = TRUE;
     session->impl_data     = data;
 
     /* Detect raw joystick axes beyond what the gamepad abstraction exposes.
@@ -405,15 +440,17 @@ ConttestInputSession *conttest_input_session_sdl3_start(uint32_t sdl_id, ViewerS
     g_main_context_invoke(NULL, conttest_input_viewer_handle_layout, layout);
 
     if (ctx->viewer) {
+        GSource *src = g_source_new(&sdl3_poll_source_funcs, sizeof(GSource));
+        g_source_set_priority(src, SDL_POLL_PRIORITY);
+        g_source_set_name(src, "haptika-sdl3-poll");
         viewer_session_context_ref(ctx);
         g_atomic_int_inc(&data->ref_count);
-        data->timer_id = g_timeout_add_full(G_PRIORITY_DEFAULT,
-                                            SDL_POLL_INTERVAL_MS,
-                                            sdl3_poll_timer, data,
-                                            sdl3_poll_timer_destroyed);
-        if (data->timer_id == 0) {
-            sdl_session_data_unref(data);
-            viewer_session_context_unref(ctx);
+        g_source_set_callback(src, sdl3_poll_timer, data, sdl3_poll_source_destroyed);
+        g_source_set_ready_time(src, g_get_monotonic_time() + SDL_POLL_ACTIVE_US);
+        data->poll_source = src;
+        if (g_source_attach(src, NULL) == 0) {
+            g_source_destroy(src);
+            g_clear_pointer(&data->poll_source, g_source_unref);
         }
     }
 

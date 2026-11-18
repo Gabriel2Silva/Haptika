@@ -206,6 +206,20 @@ static void schedule_refresh(ConttestInputPlumberMonitor *self) {
         monitor_weak_ref_new(self), monitor_weak_ref_free);
 }
 
+static void cancel_pending_refresh(ConttestInputPlumberMonitor *self) {
+    self->refresh_seq++;
+    self->pending_calls = 0;
+    self->pending_version_ok = FALSE;
+    self->pending_objects_ok = FALSE;
+    if (self->refresh_debounce_id) {
+        g_source_remove(self->refresh_debounce_id);
+        self->refresh_debounce_id = 0;
+    }
+    g_clear_pointer(&self->pending_version, g_free);
+    g_clear_pointer(&self->pending_candidates, g_ptr_array_unref);
+    g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
+}
+
 static void clear_snapshot(ConttestInputPlumberMonitor *self) {
     if (!self || self->disposed) return;
     gboolean had_data = (self->daemon_version != NULL) ||
@@ -383,11 +397,7 @@ static void on_get_objects_done(GObject *source, GAsyncResult *res, gpointer use
         g_clear_pointer(&self->pending_candidates, g_ptr_array_unref);
         g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
         if (no_owner) {
-            self->refresh_seq++;
-            self->pending_calls = 0;
-            self->pending_version_ok = FALSE;
-            self->pending_objects_ok = FALSE;
-            g_clear_pointer(&self->pending_version, g_free);
+            cancel_pending_refresh(self);
             clear_snapshot(self);
             return;
         }
@@ -455,13 +465,15 @@ static void on_name_owner_changed(GDBusConnection *conn,
     g_autoptr(ConttestInputPlumberMonitor) self = g_weak_ref_get(wr);
     if (!self || self->disposed) return;
 
+    if (!parameters || !g_variant_is_of_type(parameters, G_VARIANT_TYPE("(sss)")))
+        return;
+
     const char *name = NULL, *old_owner = NULL, *new_owner = NULL;
     g_variant_get(parameters, "(&s&s&s)", &name, &old_owner, &new_owner);
     if (new_owner && *new_owner) {
         schedule_refresh(self);
     } else {
-        self->refresh_seq++;
-        self->pending_calls = 0;
+        cancel_pending_refresh(self);
         clear_snapshot(self);
     }
 }
@@ -553,18 +565,11 @@ static void conttest_inputplumber_monitor_dispose(GObject *object) {
     ConttestInputPlumberMonitor *self = CONTTEST_INPUTPLUMBER_MONITOR(object);
 
     self->disposed = TRUE;
-    self->refresh_seq++;
-    self->pending_calls = 0;
-    self->pending_version_ok = FALSE;
-    self->pending_objects_ok = FALSE;
+    cancel_pending_refresh(self);
 
     if (self->cancellable) {
         g_cancellable_cancel(self->cancellable);
         g_clear_object(&self->cancellable);
-    }
-    if (self->refresh_debounce_id) {
-        g_source_remove(self->refresh_debounce_id);
-        self->refresh_debounce_id = 0;
     }
     if (self->bus) {
         if (self->sub_name_owner)
@@ -579,9 +584,6 @@ static void conttest_inputplumber_monitor_dispose(GObject *object) {
         g_clear_object(&self->bus);
     }
 
-    g_clear_pointer(&self->pending_version, g_free);
-    g_clear_pointer(&self->pending_candidates, g_ptr_array_unref);
-    g_clear_pointer(&self->pending_source_devnodes, g_hash_table_destroy);
     g_clear_pointer(&self->daemon_version, g_free);
     g_clear_pointer(&self->candidates, g_ptr_array_unref);
     g_clear_pointer(&self->source_devnodes, g_hash_table_destroy);

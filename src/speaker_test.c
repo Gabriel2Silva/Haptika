@@ -271,7 +271,7 @@ static void on_registry_global(void *userdata, uint32_t id, uint32_t permissions
                                const struct spa_dict *props) {
     (void)permissions; (void)version;
     DiscoveryCtx *disc = userdata;
-    if (!props || strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
+    if (!props || g_strcmp0(type, PW_TYPE_INTERFACE_Node) != 0)
         return;
 
     const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
@@ -565,9 +565,24 @@ static void on_param_changed(void *userdata, uint32_t id, const struct spa_pod *
         return;
     }
 
-    if (info.channels > 0) {
-        ctx->channels = MIN(info.channels, (uint32_t)SPA_AUDIO_MAX_CHANNELS);
+    if (info.channels == 0 || info.channels > SPA_AUDIO_MAX_CHANNELS) {
+        if (!ctx->error)
+            ctx->error = g_strdup_printf(
+                _("Unsupported PipeWire channel count: %u"), info.channels);
+        pw_main_loop_quit(ctx->loop);
+        return;
+    }
+
+    if (!ctx->started_streaming) {
+        ctx->channels = info.channels;
         conttest_speaker_build_channel_mask(&info, ctx->active_ch);
+    } else if (info.channels != ctx->channels ||
+               (info.rate > 0 && info.rate != ctx->rate)) {
+        if (!ctx->error)
+            ctx->error = g_strdup(
+                _("PipeWire audio format changed unexpectedly during playback."));
+        pw_main_loop_quit(ctx->loop);
+        return;
     }
 
     if (info.rate > 0 && !ctx->started_streaming) {
@@ -653,7 +668,7 @@ static void on_process(void *userdata) {
     uint32_t n = max_frames;
     if (b->requested > 0 && b->requested < (uint64_t)n)
         n = (uint32_t)b->requested;
-    if ((int)n > rem)
+    if (n > (uint32_t)rem)
         n = (uint32_t)rem;
 
     if (n == 0) {

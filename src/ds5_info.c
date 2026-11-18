@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "ds5_info.h"
 #include "controller_info_parsers.h"
 #include "controller_info_utils.h"
@@ -66,9 +67,9 @@ static gpointer fetch_ds5_info(const char *hidraw_node,
     DS5InfoData *info = g_new0(DS5InfoData, 1);
     info->is_bt = is_bt;
 
-    int fd = open(hidraw_node, O_RDWR | O_NONBLOCK);
+    int fd = open(hidraw_node, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0 && (errno == EACCES || errno == EPERM))
-        fd = open(hidraw_node, O_RDONLY | O_NONBLOCK);
+        fd = open(hidraw_node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         int saved_errno = errno;
         char *msg = g_strdup_printf(_("Cannot open %s: %s"), hidraw_node, g_strerror(saved_errno));

@@ -36,6 +36,10 @@ ViewerSessionContext *viewer_session_context_new(ConttestInputViewer *viewer) {
     ctx->viewer = viewer;
     ctx->active = 1;
     ctx->ref_count = 1;
+    atomic_init(&ctx->ring.head, 0u);
+    atomic_init(&ctx->ring.tail, 0u);
+    atomic_init(&ctx->ring.overflow, false);
+    atomic_init(&ctx->ring.scheduled, false);
     return ctx;
 }
 

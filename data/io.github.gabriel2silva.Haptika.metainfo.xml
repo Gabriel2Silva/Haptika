@@ -23,6 +23,7 @@
       <li>Motion sensor (accelerometer and gyroscope) visualization</li>
       <li>Touchpad finger tracking for DualShock 4 and DualSense</li>
       <li>Support for both SDL3 and evdev backends with one-click switching</li>
+      <li>InputPlumber virtual controller detection and source device inspection</li>
     </ul>
   </description>
 

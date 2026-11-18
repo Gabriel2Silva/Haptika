@@ -145,7 +145,7 @@ guint8 *controller_info_hidraw_get_feature(int fd, guint8 report_id,
                                            gsize *out_len) {
     if (out_len)
         *out_len = 0;
-    if (fd < 0 || buf_size == 0 || min_len > buf_size)
+    if (fd < 0 || buf_size == 0 || buf_size > 4096 || min_len > buf_size)
         return NULL;
 
     guint8 *buf = g_malloc0(buf_size);
@@ -306,7 +306,8 @@ void controller_info_present_async_dialog(GtkWidget *parent,
                                           GAsyncReadyCallback done_callback) {
     AdwDialog *dialog = controller_info_dialog_new(title, width, height, TRUE, NULL);
     GCancellable *cancellable = g_cancellable_new();
-    g_signal_connect_swapped(dialog, "closed", G_CALLBACK(g_cancellable_cancel), cancellable);
+    g_signal_connect_object(dialog, "closed", G_CALLBACK(g_cancellable_cancel),
+                            cancellable, G_CONNECT_SWAPPED);
     g_object_set_data_full(G_OBJECT(dialog), "conttest-async-cancellable",
                            g_object_ref(cancellable), cancel_and_unref);
 
@@ -344,6 +345,7 @@ void controller_info_add_status_row(AdwPreferencesGroup *group,
         return;
 
     AdwActionRow *row = ADW_ACTION_ROW(adw_action_row_new());
+    adw_preferences_row_set_use_markup(ADW_PREFERENCES_ROW(row), FALSE);
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(row), title);
     adw_action_row_set_subtitle(row, value);
     adw_action_row_set_subtitle_selectable(row, TRUE);

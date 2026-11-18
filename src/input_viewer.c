@@ -489,19 +489,19 @@ void conttest_input_viewer_stop(ConttestInputViewer *self) {
     if (self->actions_box)
         gtk_widget_set_visible(self->actions_box, FALSE);
     if (self->current_ctx) {
-        /* Signal all in-flight callbacks to discard their work. Must happen
-         * before releasing our ref so that callbacks reading ctx->viewer
-         * (which points to us) do so while we are still alive. */
+        /* Signal all in-flight callbacks to discard their work and clear the
+         * main-thread viewer pointer before releasing our ref. */
         g_atomic_int_set(&self->current_ctx->active, 0);
+        self->current_ctx->viewer = NULL;
 
         /* Release the viewer's ref (ref #1, set to 1 at allocation). */
         g_clear_pointer(&self->current_ctx, viewer_session_context_unref);
     }
     if (self->active_session) {
-        /* SDL3: removes the tick callback → sdl3_tick_destroyed releases ref #2.
-         * evdev: joins the thread → thread-exit path releases ref #2.
-         * In both cases, if the backend already released ref #2 before stop
-         * was called, the cleanup path is a no-op (tick_id==0 / thread done). */
+        /* SDL3: destroys the poll GSource -> destroy notify releases ref #2.
+         * evdev: joins the polling thread -> thread-exit path releases ref #2.
+         * In both cases, if the backend already stopped before stop() was
+         * called, the cleanup path is idempotent. */
         conttest_input_session_stop(self->active_session);
         self->active_session = NULL;
     }
@@ -521,7 +521,7 @@ gboolean conttest_input_viewer_handle_layout(gpointer data) {
     ConttestInputLayout *layout = (ConttestInputLayout *)data;
     ViewerSessionContext *ctx = layout->ctx;
 
-    if (!g_atomic_int_get(&ctx->active) || ctx->viewer->current_ctx != ctx) {
+    if (!g_atomic_int_get(&ctx->active) || !ctx->viewer || ctx->viewer->current_ctx != ctx) {
         for (int i=0; i < layout->num_elements; ++i) g_free(layout->elements[i].name);
         g_free(layout->elements);
         g_free(layout);

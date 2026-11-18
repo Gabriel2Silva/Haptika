@@ -218,12 +218,86 @@ static void test_evdev_axis_classification(void) {
     g_assert_false(rx_ry_trig);
 }
 
+typedef struct {
+    ViewerSessionContext *ctx;
+    GMainLoop *loop;
+    int target_count;
+    int received_count;
+    int expected_next;
+} CoalesceTestState;
+
+static gboolean coalesce_drain_cb(gpointer data) {
+    ViewerSessionContext *ctx = data;
+    ConttestEventRing *ring = &ctx->ring;
+    CoalesceTestState *st = (CoalesceTestState *)ctx->viewer;
+
+    for (;;) {
+        ConttestInputEvent ev;
+        while (conttest_event_ring_pop(ring, &ev)) {
+            g_assert_cmpint(ev.element_id, ==, st->expected_next);
+            st->expected_next++;
+            st->received_count++;
+        }
+
+        atomic_store_explicit(&ring->scheduled, false, memory_order_seq_cst);
+        unsigned int head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+        unsigned int tail = atomic_load_explicit(&ring->tail, memory_order_seq_cst);
+        if (head == tail)
+            break;
+        if (atomic_exchange_explicit(&ring->scheduled, true, memory_order_seq_cst))
+            break;
+    }
+
+    if (st->received_count >= st->target_count)
+        g_main_loop_quit(st->loop);
+
+    viewer_session_context_unref(ctx);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer coalesce_producer(gpointer data) {
+    CoalesceTestState *st = data;
+    for (int i = 0; i < st->target_count; i++) {
+        ConttestInputEvent ev = {
+            .type = INPUT_EVENT_BUTTON,
+            .element_id = i,
+        };
+        while (!conttest_event_ring_push(&st->ctx->ring, &ev)) {
+            g_thread_yield();
+        }
+        conttest_event_ring_notify(st->ctx, coalesce_drain_cb);
+    }
+    return NULL;
+}
+
+static void test_ring_notify_coalescing(void) {
+    CoalesceTestState st = {
+        .loop = g_main_loop_new(NULL, FALSE),
+        .target_count = 25000,
+    };
+    st.ctx = viewer_session_context_new((ConttestInputViewer *)&st);
+
+    GThread *prod = g_thread_new("spsc-notify-prod", coalesce_producer, &st);
+    g_main_loop_run(st.loop);
+    g_thread_join(prod);
+
+    /* Drain any leftover idle source that raced on the final item */
+    while (g_main_context_iteration(NULL, FALSE)) {
+    }
+
+    g_assert_cmpint(st.received_count, ==, st.target_count);
+    g_assert_cmpint(st.ctx->ref_count, ==, 1);
+    viewer_session_context_unref(st.ctx);
+    g_main_loop_unref(st.loop);
+}
+
 int main(int argc, char *argv[]) {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/ring/empty_and_types", test_ring_empty_and_types);
     g_test_add_func("/ring/capacity_and_overflow", test_ring_capacity_and_overflow);
     g_test_add_func("/ring/wraparound", test_ring_wraparound);
     g_test_add_func("/ring/concurrent_spsc", test_ring_concurrent_spsc);
+    g_test_add_func("/ring/notify_coalescing", test_ring_notify_coalescing);
     g_test_add_func("/evdev/axis_classification", test_evdev_axis_classification);
     return g_test_run();
 }

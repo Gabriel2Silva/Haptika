@@ -16,8 +16,16 @@ static char *ds3_get_bt_address(struct udev *udev, const char *evdev_syspath) {
     struct udev_device *hid = udev_device_get_parent_with_subsystem_devtype(evdev, "hid", NULL);
     if (hid) {
         const char *uniq = udev_device_get_property_value(hid, "HID_UNIQ");
-        if (uniq && strlen(uniq) >= 17)
-            result = g_strdup(uniq);
+        if (uniq) {
+            char *clean = controller_info_sanitize_hid_string(uniq, -1);
+            if (clean) {
+                g_strstrip(clean);
+                if (strlen(clean) >= 17)
+                    result = clean;
+                else
+                    g_free(clean);
+            }
+        }
     }
 
     udev_device_unref(evdev);

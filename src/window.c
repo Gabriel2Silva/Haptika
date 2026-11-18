@@ -547,6 +547,7 @@ void conttest_window_show_input_viewer(ConttestWindow *self, ConttestDevice *dev
 
 void conttest_window_show_toast(ConttestWindow *self, const char *message) {
     AdwToast *toast = adw_toast_new(message);
+    adw_toast_set_use_markup(toast, FALSE);
     adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), toast);
 }
 

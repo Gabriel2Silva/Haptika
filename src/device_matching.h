@@ -16,9 +16,17 @@ gboolean conttest_extract_udev_vid_pid(struct udev_device *dev,
                                        uint16_t *vid,
                                        uint16_t *pid);
 
-/* Collect qualifying ancestor hardware keys (hid, bluetooth, input,
- * usb/usb_interface) from an already-opened udev device, plus its own syspath
- * in out_own_syspath. Caller frees returned strv with g_strfreev() and
+/* Pure predicate deciding whether an ancestor (subsystem, devtype) in a
+ * bottom-up udev parent walk qualifies as a per-controller hardware key.
+ * Updates *inout_saw_bluetooth so shared Bluetooth host adapters (DEVTYPE=host)
+ * and their parent USB Bluetooth dongle interfaces are never collected. */
+gboolean conttest_udev_ancestor_is_hw_key(const char *subsystem,
+                                          const char *devtype,
+                                          gboolean *inout_saw_bluetooth);
+
+/* Collect qualifying ancestor hardware keys (hid, bluetooth link, input,
+ * non-Bluetooth usb_interface) from an already-opened udev device, plus its own
+ * syspath in out_own_syspath. Caller frees returned strv with g_strfreev() and
  * *out_own_syspath with g_free(). */
 char **conttest_udev_collect_hw_keys(struct udev_device *dev,
                                      char **out_own_syspath);
@@ -36,6 +44,22 @@ gboolean conttest_hw_keys_match(const char *own_a,
 gboolean conttest_udev_is_same_hardware(struct udev *udev,
                                         const char *sdl_path,
                                         const char *evdev_syspath);
+
+typedef enum {
+    CONTTEST_MATCH_REJECT = 0,
+    CONTTEST_MATCH_WEAK,
+    CONTTEST_MATCH_STRONG,
+} ConttestCandidateMatch;
+
+gboolean conttest_serial_is_usable(const char *serial);
+gboolean conttest_serial_matches(const char *a, const char *b);
+gboolean conttest_conn_contradicts(SDL_JoystickConnectionState a,
+                                   SDL_JoystickConnectionState b);
+ConttestCandidateMatch conttest_classify_candidate_pair(
+    const char *serial_a,
+    SDL_JoystickConnectionState conn_a,
+    const char *serial_b,
+    SDL_JoystickConnectionState conn_b);
 
 /* Pure classification of Linux input bustype hex string + parent subsystem flags. */
 SDL_JoystickConnectionState conttest_resolve_connection_state_from_props(

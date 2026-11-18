@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "input_session.h"
 #include "input_viewer.h"
 #include <errno.h>
@@ -145,7 +146,7 @@ ConttestInputSession *conttest_input_session_evdev_start(const char *devnode,
     if (!devnode || !ctx)
         return NULL;
 
-    int fd = open(devnode, O_RDONLY | O_NONBLOCK);
+    int fd = open(devnode, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
         return NULL;
 

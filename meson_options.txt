@@ -1,0 +1,5 @@
+option('pipewire',
+  type: 'feature',
+  value: 'auto',
+  description: 'Controller speaker testing via PipeWire'
+)

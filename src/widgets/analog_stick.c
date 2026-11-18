@@ -85,7 +85,14 @@ void conttest_analog_stick_set_position(ConttestAnalogStick *self, double x, dou
     g_return_if_fail(CONTTEST_IS_ANALOG_STICK(self));
     if (!isfinite(x) || !isfinite(y))
         return;
-    if (fabs(x - self->stick_x) < 0.005 && fabs(y - self->stick_y) < 0.005)
+    gboolean boundary =
+        (x == 0.0 && self->stick_x != 0.0) ||
+        (y == 0.0 && self->stick_y != 0.0) ||
+        (fabs(x) >= 1.0 && fabs(self->stick_x) < 1.0) ||
+        (fabs(y) >= 1.0 && fabs(self->stick_y) < 1.0);
+    if (!boundary &&
+        fabs(x - self->stick_x) < 0.005 &&
+        fabs(y - self->stick_y) < 0.005)
         return;
     self->stick_x = x;
     self->stick_y = y;

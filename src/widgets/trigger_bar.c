@@ -2,11 +2,12 @@
 #include "drawing_utils.h"
 #include <math.h>
 
-#define TRIGGER_MIN_WIDTH  40
-#define TRIGGER_MIN_HEIGHT 124
-#define TRIGGER_NAT_WIDTH  40
-#define TRIGGER_NAT_HEIGHT 124
-#define TRIGGER_BAR_WIDTH  6.0f
+#define TRIGGER_MIN_WIDTH        40
+#define TRIGGER_MIN_HEIGHT       124
+#define TRIGGER_NAT_WIDTH        40
+#define TRIGGER_NAT_HEIGHT       124
+#define TRIGGER_BAR_WIDTH        6.0f
+#define TRIGGER_A11Y_INTERVAL_US (50 * G_TIME_SPAN_MILLISECOND)
 
 struct _ConttestTriggerBar {
     GtkWidget  parent_instance;
@@ -15,6 +16,7 @@ struct _ConttestTriggerBar {
     int        canvas_h;
     double     value;
     gboolean   bipolar;
+    gint64     last_a11y_us;
 };
 
 G_DEFINE_TYPE(ConttestTriggerBar, conttest_trigger_bar, GTK_TYPE_WIDGET)
@@ -179,11 +181,20 @@ void conttest_trigger_bar_set_value(ConttestTriggerBar *self, double value) {
 
     double vmin = self->bipolar ? -1.0 : 0.0;
     double clamped = CLAMP(value, vmin, 1.0);
-    if (fabs(clamped - self->value) < 0.001)
+    gboolean at_boundary =
+        (clamped == 0.0 && self->value != 0.0) ||
+        (fabs(clamped) >= 1.0 && fabs(self->value) < 1.0);
+    if (!at_boundary && fabs(clamped - self->value) < 0.001)
         return;
 
     self->value = clamped;
-    update_accessible_value(self);
+    gint64 now = g_get_monotonic_time();
+    if (at_boundary || clamped == 0.0 || fabs(clamped) >= 1.0 ||
+        self->last_a11y_us == 0 ||
+        (now - self->last_a11y_us) >= TRIGGER_A11Y_INTERVAL_US) {
+        self->last_a11y_us = now;
+        update_accessible_value(self);
+    }
     gtk_widget_queue_draw(GTK_WIDGET(self));
 }
 

@@ -21,7 +21,7 @@ evdev_dep = dependency('libevdev', version: '>=1.11.0')
 udev_dep = dependency('libudev', version: '>=249')
 threads_dep = dependency('threads')
 m_dep = cc.find_library('m', required : false)
-pipewire_dep = dependency('libpipewire-0.3', required: false)
+pipewire_dep = dependency('libpipewire-0.3', required: get_option('pipewire'))
 
 gnome = import('gnome')
 i18n = import('i18n')
@@ -59,7 +59,6 @@ src_files = [
   'src/input_session_sdl3.c',
   'src/battery.c',
   'src/dsp_oscillator.c',
-  'src/speaker_routing.c',
   'src/speaker_test.c',
   'src/widgets/analog_stick.c',
   'src/widgets/button_indicator.c',
@@ -71,6 +70,7 @@ src_files = [
 
 haptika_deps = [adw_dep, gtk_dep, sdl3_dep, evdev_dep, udev_dep, threads_dep, m_dep]
 if pipewire_dep.found()
+  src_files += 'src/speaker_routing.c'
   haptika_deps += pipewire_dep
 endif
 
